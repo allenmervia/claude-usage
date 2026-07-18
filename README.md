@@ -75,7 +75,7 @@ After that, every account shows on every run and in the menu bar — you never n
 to repeat this. (There's no API that lists "every account you own," so the tool
 can only learn an account after its token has passed through the CLI once.)
 
-Two rules that matter, both learned the hard way:
+Two things to know:
 
 - **Switch accounts with `/login`, not `/logout` + `/login`.** `/login` just swaps
   which account the CLI holds; the account you leave keeps its session, so the tool

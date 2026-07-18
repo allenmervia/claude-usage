@@ -420,9 +420,11 @@ def render_table(rows):
         return
     rows = sort_rows(rows)
     rec_uuid, reason = recommend(rows)
+    active_uuid = next((r["uuid"] for r in rows if r.get("active")), None)
+    on_best = rec_uuid is not None and rec_uuid == active_uuid   # already on the pick — nothing to switch to
     print(f"\n{C['b']}Claude usage{C['x']}  {C['dim']}· {datetime.now().astimezone().strftime('%-I:%M %p')}{C['x']}\n")
     for r in rows:
-        mark = f"{C['g']}▶{C['x']}" if r["uuid"] == rec_uuid else " "
+        mark = f"{C['g']}▶{C['x']}" if (r["uuid"] == rec_uuid and not on_best) else " "
         tag  = plan_name(r)
         head = (f"{mark} {C['b']}{r['label']:<12}{C['x']} {C['dim']}{r['email']}{C['x']}"
                 f"  {C['cyan']}{tag}{C['x']}")
@@ -445,7 +447,9 @@ def render_table(rows):
         if sp.get("enabled") and sp.get("limit"):   # extra-usage credits, only when turned on
             print(f"    {C['dim']}extra   {usd(sp['used'])} / {usd(sp['limit'])} used{C['x']}")
         print()
-    if rec_uuid:
+    if on_best:
+        print(f"{C['g']}✓ You're on the right account{C['x']} — {reason}.\n")
+    elif rec_uuid:
         rec = next(r for r in rows if r["uuid"] == rec_uuid)
         print(f"{C['g']}▶ Use {rec['label']} now{C['x']} — {reason}.\n")
     else:
@@ -474,6 +478,8 @@ def render_xbar(rows):
     rows = sort_rows(rows)
     rec_uuid, reason = recommend(rows)
     rec = next((r for r in rows if r["uuid"] == rec_uuid), None)
+    active_uuid = next((r["uuid"] for r in rows if r.get("active")), None)
+    on_best = rec_uuid is not None and rec_uuid == active_uuid   # already on the pick — no switch to suggest
     # menu-bar title: the account you're on (CLI-active) with its 5h%/weekly%, colored by severity.
     # Falls back to the recommended account when there's no usable active one (e.g. desktop-only).
     def has_usage(r): return not r.get("error") and (r.get("five_hour") or {}).get("pct") is not None
@@ -494,7 +500,7 @@ def render_xbar(rows):
         tail = f"  · {meta}" if meta else ""
         print(f"    {label:<6} {bar(pct)} {int(pct):>3}%{tail} | color={hexcol(pct)} font=Menlo size=12")
     for r in rows:
-        star = "▶ " if r["uuid"] == rec_uuid else "  "
+        star = "▶ " if (r["uuid"] == rec_uuid and not on_best) else "  "
         act  = " ·active" if r.get("active") else ""
         print(f"{star}{r['label']}  {plan_name(r)}{act} | font=Menlo size=13")
         if r.get("error"):
@@ -510,7 +516,9 @@ def render_xbar(rows):
         if sp.get("enabled") and sp.get("limit"):
             print(f"    extra  {usd(sp['used'])} / {usd(sp['limit'])} used | color=#8b949e font=Menlo size=12")
         print("---")
-    if rec:
+    if on_best:
+        print(f"✓ On the right account · {reason} | color=#3fb950 font=Menlo size=12")
+    elif rec:
         print(f"→ Use {rec['label']} · {reason} | color=#3fb950 font=Menlo size=12")
     else:
         print(f"{reason} | color=#d9a13b font=Menlo size=12")
