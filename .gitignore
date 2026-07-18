@@ -1,0 +1,6 @@
+# This tool keeps secrets in the macOS Keychain and non-secret state in
+# ~/.claude-usage/ — nothing sensitive is written into the repo. These entries
+# just keep stray local files out.
+__pycache__/
+*.pyc
+.DS_Store
