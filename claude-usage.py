@@ -29,9 +29,11 @@ Usage:
   claude-usage --xbar     xbar/SwiftBar menu-bar format
   claude-usage capture    explicitly ingest the active account (same as a run)
   claude-usage list       list registered accounts
+  claude-usage switch X   point the CLI at account X (email / label / uuid)
+  claude-usage switch --undo   restore the account that was active before the last switch
   claude-usage forget X   drop account by email or uuid
 """
-import sys, os, json, time, subprocess, shutil, urllib.request, urllib.error
+import sys, os, json, time, getpass, subprocess, shutil, urllib.request, urllib.error
 from datetime import datetime, timezone
 
 CLIENT_ID   = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
@@ -148,11 +150,15 @@ def read_live():
     except Exception:
         return None
 
-def store_secret(uuid, refresh, access=None, expires_at=None, host=None):
-    keychain_write(STORE_SVC, uuid, json.dumps({
-        "refreshToken": refresh, "accessToken": access,
-        "expiresAt": expires_at, "tokenHost": host,
-    }))
+BLOB_META = ("scopes", "subscriptionType", "rateLimitTier")   # non-token fields a written blob needs
+
+def store_secret(uuid, refresh, access=None, expires_at=None, host=None, meta=None):
+    # merge over any existing record so BLOB_META survives token rotations
+    rec = load_secret(uuid) or {}
+    rec.update({"refreshToken": refresh, "accessToken": access,
+                "expiresAt": expires_at, "tokenHost": host})
+    if meta: rec.update({k: v for k, v in meta.items() if v is not None})
+    keychain_write(STORE_SVC, uuid, json.dumps(rec))
 
 def load_secret(uuid):
     raw = keychain_read(STORE_SVC, uuid)
@@ -208,10 +214,12 @@ def ingest_live(idx):
         "org_type": org.get("organization_type"),     # claude_max / claude_team / claude_enterprise
         "seat_tier": org.get("seat_tier"),            # non-null => a team/enterprise seat
     })
-    # keep this account's stored refresh token current from the live keychain
+    # keep this account's stored credentials current from the live keychain (full blob, so we can
+    # write a faithful one back when switching to it)
     prev = load_secret(uuid)
     store_secret(uuid, live.get("refreshToken"), live.get("accessToken"),
-                 live.get("expiresAt"), prev.get("tokenHost") if prev else None)
+                 live.get("expiresAt"), prev.get("tokenHost") if prev else None,
+                 meta={k: live.get(k) for k in BLOB_META})
     save_index(idx)
     return uuid
 
@@ -255,6 +263,11 @@ def save_cache(rows, ts):
         with open(CACHE, "w") as f: json.dump({"ts": ts, "rows": rows}, f)
     except Exception:
         pass
+
+def clear_cache():
+    """Drop the debounce cache so the next render fetches fresh (e.g. right after a switch)."""
+    try: os.remove(CACHE)
+    except Exception: pass
 
 def data_ts():
     """Epoch seconds of the last real fetch (cache timestamp), or None."""
@@ -502,7 +515,17 @@ def render_xbar(rows):
     for r in rows:
         star = "▶ " if (r["uuid"] == rec_uuid and not on_best) else "  "
         act  = " ·active" if r.get("active") else ""
-        print(f"{star}{r['label']}  {plan_name(r)}{act} | font=Menlo size=13")
+        # PREVIEW: click-to-switch, no confirm — the account row itself is the target. Wired to a
+        # no-op that only refreshes, so the click feels real (menu closes, bar redraws) without switching.
+        switchable = not r.get("active") and not r.get("error")
+        hint = "  ⇄" if switchable else ""      # the only thing marking a row as clickable
+        params = "font=Menlo size=13"
+        if switchable:
+            params += (f' bash="{os.path.realpath(__file__)}" param1=switch param2={r["uuid"]}'
+                       f" terminal=false refresh=true")
+        print(f"{star}{r['label']}  {plan_name(r)}{act}{hint} | {params}")
+        if switchable:   # holding ⌥ swaps the row for what the click actually does
+            print(f"{star}⇄ Switch to {r['label']} | alternate=true {params}")
         if r.get("error"):
             print(f"    {r['error']} | color=#e5534b font=Menlo size=12"); print("---"); continue
         fh, wk = r["five_hour"], r["seven_day"]
@@ -526,10 +549,106 @@ def render_xbar(rows):
         print("⚠ last known values — rate-limited; updates on the next refresh | color=#d9a13b font=Menlo size=12")
     if len([r for r in rows if not r.get("is_team")]) <= 1:
         print("＋ Log into another account with the claude CLI (claude → /login) to track it | color=#8b949e font=Menlo size=12")
+    act_res = last_action()
+    if act_res:
+        col = "#3fb950" if act_res.get("ok") else "#d9a13b"
+        print(f"{'✓' if act_res.get('ok') else '⚠'} {act_res.get('msg','')} "
+              f"| color={col} font=Menlo size=11")
     ts = data_ts()
     upd = datetime.fromtimestamp(ts).strftime("%-I:%M:%S %p") if ts else "—"
     print(f"Updated {upd} · auto-refreshes on a timer | color=#8b949e font=Menlo size=11")
     print("↻ Refresh now | refresh=true")
+
+# ---- account switching ------------------------------------------------------
+
+# the pre-switch credential lives in the Keychain like every other secret — never in a file
+PREV_KEY = "__previous__"
+ACTION   = os.path.join(STATE_DIR, "last-action.json")   # non-secret: just an outcome message
+
+def record_action(ok, msg):
+    """Clicked menu items can't print and notifications may be suppressed — leave the result
+    where the next render can show it (the click refreshes, so it appears immediately)."""
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(ACTION, "w") as f: json.dump({"ts": time.time(), "ok": ok, "msg": msg}, f)
+    except Exception:
+        pass
+
+def last_action(max_age=90):
+    try:
+        with open(ACTION) as f: a = json.load(f)
+        return a if time.time() - a.get("ts", 0) < max_age else None
+    except Exception:
+        return None
+
+def _fail(msg):
+    record_action(False, msg)          # surfaced in the menu on the next render
+    print(msg, file=sys.stderr); sys.exit(1)
+
+def live_account_attr():
+    """The Keychain 'account' attribute on Claude Code's item, so a write updates the SAME item."""
+    r = _sec(["find-generic-password", "-s", LIVE_SVC])
+    for line in (r.stdout + "\n" + r.stderr).splitlines():
+        if '"acct"' in line and "=" in line:
+            return line.split("=", 1)[1].strip().strip('"')
+    return getpass.getuser()      # Claude Code uses the macOS username
+
+def write_live(blob):
+    """Replace only the claudeAiOauth key — anything else Claude Code keeps in that item survives."""
+    try:
+        cur = json.loads(keychain_read(LIVE_SVC) or "{}")
+        if not isinstance(cur, dict): cur = {}
+    except Exception:
+        cur = {}
+    cur["claudeAiOauth"] = blob
+    keychain_write(LIVE_SVC, live_account_attr(), json.dumps(cur))
+
+def resolve_account(key):
+    k = (key or "").lower()
+    if not k: return None
+    for e in load_index():
+        if k in (e["uuid"].lower(), e["email"].lower(), (e.get("label") or "").lower()):
+            return e
+    return None
+
+def cmd_switch(target):
+    if target == "--undo":
+        prev = keychain_read(STORE_SVC, PREV_KEY)
+        if not prev:
+            print("nothing to undo", file=sys.stderr); sys.exit(1)
+        keychain_write(LIVE_SVC, live_account_attr(), prev)
+        keychain_delete(STORE_SVC, PREV_KEY)
+        clear_cache()
+        record_action(True, "Restored the previous account")
+        print("restored the previous account"); return
+
+    e = resolve_account(target)
+    if not e:
+        _fail(f"unknown account: {target}")
+    sec = load_secret(e["uuid"])
+    if not sec or not sec.get("refreshToken"):
+        _fail(f"{e['email']} isn't captured — log into it once with the claude CLI")
+    if not sec.get("scopes"):
+        # captured before we stored the full blob; writing a partial one could break the CLI login
+        _fail(f"{e['email']} needs one login with the claude CLI to store its full credentials, "
+              f"then switching will work")
+
+    token, err = token_for_parked(e["uuid"])          # refreshes if the cached token is stale
+    if err:
+        _fail(f"can't switch to {e['email']}: {err}")
+    sec = load_secret(e["uuid"])                      # re-read: the refresh may have rotated it
+
+    blob = {"accessToken": sec.get("accessToken") or token,
+            "refreshToken": sec.get("refreshToken"),
+            "expiresAt": sec.get("expiresAt")}
+    blob.update({k: sec[k] for k in BLOB_META if sec.get(k) is not None})   # never write nulls
+
+    cur = keychain_read(LIVE_SVC)                     # back up (to the Keychain) before overwriting
+    if cur: keychain_write(STORE_SVC, PREV_KEY, cur)
+    write_live(blob)
+    clear_cache()                                     # so the post-switch refresh shows the new active account
+    record_action(True, f"Switched to {e['email']}")
+    print(f"switched to {e['email']}")
 
 # ---- menu-bar install -------------------------------------------------------
 
@@ -661,6 +780,8 @@ def main():
         cmd_setup(); return
     if arg == "install":
         cmd_install(); return
+    if arg == "switch":
+        cmd_switch(sys.argv[2] if len(sys.argv) > 2 else ""); return
     if arg == "capture":
         idx = load_index(); u = ingest_live(idx)
         if u:

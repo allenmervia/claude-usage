@@ -97,8 +97,35 @@ claude-usage --json     machine-readable JSON
 claude-usage --xbar     xbar / SwiftBar menu-bar format
 claude-usage capture    register the active account now (same as any run)
 claude-usage list       list registered accounts
+claude-usage switch X   switch the CLI to that account (see below)
+claude-usage switch --undo   put the previous account back
 claude-usage forget X   drop an account by email or uuid (and delete its stored token)
 ```
+
+## Switching accounts
+
+Click an account in the menu and the CLI switches to it — no browser, no
+`/logout`+`/login`. Rows you can switch to are marked `⇄`; hold **⌥** and the row
+spells out what the click will do. The result appears at the bottom of the menu
+(`✓ Switched to …`), and the bar redraws with the new account marked `·active`.
+
+It works by minting a fresh access token from that account's stored refresh token and
+writing it into Claude Code's Keychain item, so your next `claude` run *is* that
+account. The account you leave keeps its session — it just becomes a parked account
+you can switch back to.
+
+```bash
+claude-usage switch allen-1@example.com   # or its label / uuid
+claude-usage switch --undo                # restore the previous account
+```
+
+Two things to know:
+
+- **An account must be logged into once (with the `claude` CLI) before you can switch
+  to it**, so the tool has its full credentials stored. Until then the menu says so
+  rather than writing a partial credential.
+- **This switches the CLI account**, not the desktop app — the desktop app keeps its
+  credentials in its own sandbox, out of reach (see [Registering your accounts](#registering-your-accounts)).
 
 ## Menu-bar view (xbar / SwiftBar)
 
@@ -190,19 +217,26 @@ item, `claude-usage/<uuid>`. With a stored refresh token it mints a short-lived
 access token for a **parked** account and reads that account's usage — which is
 what lets it show every account without a login swap.
 
-Two properties keep this safe:
+Two properties keep the reporting side safe:
 
-- The **active** account is always read live from Claude Code's own Keychain item
-  and is never independently refreshed, so the tool cannot invalidate or desync the
-  session you are actually logged into.
+- **Reading never touches your session.** For the active account the tool only reads
+  Claude Code's Keychain item and never refreshes that token itself, so simply showing
+  your usage cannot invalidate or desync the session you're logged into. Only *parked*
+  accounts get refreshed, using their own stored tokens.
 - The tool is a **live mirror** of the usage endpoint. It stores no usage numbers
-  and no reset schedule — only refresh tokens and account identity. So if Anthropic
+  and no reset schedule — only credentials and account identity. So if Anthropic
   issues an out-of-band usage reset, it simply appears as lower usage on the next
   refresh; there is nothing cached to fall out of sync.
 
+**Switching is the one exception, by design.** [Switching accounts](#switching-accounts)
+deliberately *writes* Claude Code's Keychain item — that's the whole mechanism. It
+replaces only the `claudeAiOauth` value (anything else in that item is preserved) and
+saves the previous credential first, so `claude-usage switch --undo` puts it back.
+
 Nothing sensitive is written into the repo or into `~/.claude-usage/` — that
-directory holds only non-secret identity (uuid, email, label, plan tier). All
-tokens live in the Keychain.
+directory holds only non-secret state (account identity, cached usage numbers, the
+last action's outcome). **Every credential, including the pre-switch backup, lives in
+the Keychain.**
 
 ## Caveats
 
