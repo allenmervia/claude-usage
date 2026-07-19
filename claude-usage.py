@@ -25,6 +25,8 @@ Usage:
   claude-usage setup      guided first-time setup (register account, optional menu bar + PATH)
   claude-usage            table of all known accounts (default)
   claude-usage install    add the menu-bar view (installs xbar if needed, links + launches it)
+  claude-usage doctor     check the setup and report what needs fixing
+  claude-usage interval N set the menu-bar refresh cadence (1m / 5m / 10m / 30m)
   claude-usage --json     machine-readable JSON
   claude-usage --xbar     xbar/SwiftBar menu-bar format
   claude-usage capture    explicitly ingest the active account (same as a run)
@@ -33,7 +35,7 @@ Usage:
   claude-usage switch --undo   restore the account that was active before the last switch
   claude-usage forget X   drop account by email or uuid
 """
-import sys, os, json, time, getpass, subprocess, shutil, urllib.request, urllib.error
+import sys, os, re, json, glob, time, getpass, subprocess, shutil, urllib.request, urllib.error
 from datetime import datetime, timezone
 
 CLIENT_ID   = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
@@ -53,6 +55,12 @@ CACHE = os.path.join(STATE_DIR, "cache.json")
 FH_NEAR = 90   # at/above this 5-hour %, an account is treated as unusable *right now*
 WK_NEAR = 90   # at/above this weekly %, an account has too little runway to recommend
 COOLDOWN = 30  # s — rapid re-refreshes within this window reuse the last result, sparing the API
+# The menu-bar host reads the refresh cadence from the "5m" in the plugin filename; we own the
+# symlink in its folder, so changing the interval is a rename of that link. PLUGIN_FILE is the
+# wrapper's fixed name in the repo — only the link's name carries the cadence.
+PLUGIN_FILE = "claude-usage.5m.sh"
+DEFAULT_INTERVAL = "5m"
+INTERVALS = ["1m", "5m", "10m", "30m"]
 
 # ---- keychain helpers -------------------------------------------------------
 
@@ -66,12 +74,17 @@ def keychain_read(service, account=None):
     return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
 
 def keychain_write(service, account, secret):
-    # Note: the secret is passed as an argv value, briefly visible to `ps`. `security` has no
-    # non-interactive stdin path for this, and we stay stdlib-only, so this is a deliberate tradeoff.
-    _sec(["add-generic-password", "-U", "-s", service, "-a", account, "-w", secret])
+    """True if the secret landed. Callers must check: a silent failure (Keychain locked, the user
+    denying the access prompt) would otherwise leave a rotated token unsaved and the account
+    permanently unrefreshable, with nothing shown anywhere.
+
+    Note: the secret is passed as an argv value, briefly visible to `ps`. `security` has no
+    non-interactive stdin path for this, and we stay stdlib-only, so this is a deliberate tradeoff.
+    """
+    return _sec(["add-generic-password", "-U", "-s", service, "-a", account, "-w", secret]).returncode == 0
 
 def keychain_delete(service, account):
-    _sec(["delete-generic-password", "-s", service, "-a", account])
+    return _sec(["delete-generic-password", "-s", service, "-a", account]).returncode == 0
 
 # ---- index (non-secret account metadata) -----------------------------------
 
@@ -155,14 +168,18 @@ BLOB_META = ("scopes", "subscriptionType", "rateLimitTier")   # non-token fields
 def store_secret(uuid, refresh, access=None, expires_at=None, host=None, meta=None):
     # merge over any existing record so BLOB_META survives token rotations
     rec = load_secret(uuid) or {}
-    rec.update({"refreshToken": refresh, "accessToken": access,
+    # keep the existing refresh token if the caller has none: it is the account's only durable
+    # credential, and overwriting it with None costs a re-login with no way back
+    rec.update({"refreshToken": refresh or rec.get("refreshToken"), "accessToken": access,
                 "expiresAt": expires_at, "tokenHost": host})
     if meta: rec.update({k: v for k, v in meta.items() if v is not None})
-    keychain_write(STORE_SVC, uuid, json.dumps(rec))
+    return keychain_write(STORE_SVC, uuid, json.dumps(rec))
 
 def load_secret(uuid):
     raw = keychain_read(STORE_SVC, uuid)
-    return json.loads(raw) if raw else None
+    if not raw: return None
+    try: return json.loads(raw)
+    except Exception: return None      # corrupt value: treat as uncaptured, don't take the tool down
 
 def token_for_parked(uuid, force=False):
     """Valid access token for a parked account, refreshing + rotating if needed.
@@ -171,7 +188,7 @@ def token_for_parked(uuid, force=False):
     sec = load_secret(uuid)
     if not sec: return None, "not captured — sign into it once and re-run"
     now_ms = time.time() * 1000
-    if not force and sec.get("accessToken") and sec.get("expiresAt", 0) > now_ms + 60_000:
+    if not force and sec.get("accessToken") and (sec.get("expiresAt") or 0) > now_ms + 60_000:
         return sec["accessToken"], None
     if not sec.get("refreshToken"):
         return None, "no refresh token — sign into it once and re-run"
@@ -182,11 +199,43 @@ def token_for_parked(uuid, force=False):
     access  = data["access_token"]
     newref  = data.get("refresh_token", sec["refreshToken"])
     exp     = int((time.time() + data.get("expires_in", 3600)) * 1000)
-    store_secret(uuid, newref, access, exp, host)   # persist rotated refresh token
+    if not store_secret(uuid, newref, access, exp, host):   # persist rotated refresh token
+        # the server already rotated: our stored copy is now the dead one, so say so rather than
+        # hand back a token that works once and leaves the account unrefreshable afterwards
+        return access, "couldn't save the rotated token to the Keychain — unlock it and re-run"
     return access, None
 
 def is_team_entry(e):
     return bool(e.get("seat_tier")) or e.get("org_type") in ("claude_team", "claude_enterprise")
+
+def match_live_uuid():
+    """Which known account holds the live credential, by matching stored refresh tokens.
+
+    No network and no writes, so it still identifies the session when /profile can't be reached
+    or its token has expired. That matters beyond the ·active label: an unidentified active
+    account is treated as parked and refreshed from its stored token — the one thing reading
+    must never do to the live session, since a rotation there invalidates Claude Code's own copy.
+    """
+    live = read_live()
+    if not live: return None
+    for e in load_index():
+        sec = load_secret(e["uuid"]) or {}
+        if sec.get("refreshToken") and sec["refreshToken"] == live.get("refreshToken"):
+            return e["uuid"]
+    return None
+
+def active_uuid_only():
+    """Which account is signed in, identified but not registered — /profile with the live token,
+    without ingest_live's writes to the index and Keychain."""
+    live = read_live()
+    if not live: return None
+    try:
+        uuid = api_get(PROFILE_URL, live["accessToken"]).get("account", {}).get("uuid")
+        if uuid and any(e["uuid"] == uuid for e in load_index()):
+            return uuid
+    except Exception:
+        pass
+    return match_live_uuid()
 
 def ingest_live(idx):
     """Register/refresh whichever account is currently active in Claude Code."""
@@ -274,13 +323,17 @@ def data_ts():
     c = load_cache()
     return c.get("ts") if c else None
 
-def collect():
-    """Cached wrapper: debounce rapid refreshes, and fall back to last-known values on a rate-limit."""
+def collect(ingest=True):
+    """Cached wrapper: debounce rapid refreshes, and fall back to last-known values on a rate-limit.
+
+    ingest=False reports on the accounts already known without registering the live one — for
+    diagnostics, which should describe the current state rather than change it.
+    """
     now = time.time()
     cache = load_cache()
     if cache and 0 <= now - cache.get("ts", 0) < COOLDOWN:
         return cache["rows"]                                  # rapid re-refresh → reuse, don't hit the API
-    rows = _collect_live()
+    rows = _collect_live(ingest)
     if any(not r.get("error") for r in rows):                 # got fresh data → this is the new truth
         save_cache(rows, now)
         return rows
@@ -290,9 +343,13 @@ def collect():
         return stale
     return rows
 
-def _collect_live():
+def _collect_live(ingest=True):
     idx = load_index()
-    active_uuid = ingest_live(idx)
+    active_uuid = ingest_live(idx) if ingest else active_uuid_only()
+    if active_uuid is None:
+        # /profile couldn't place the session (expired live token, offline). Fall back to matching
+        # the stored credential: leaving it unidentified would refresh the live account as parked.
+        active_uuid = match_live_uuid()
     idx = load_index()
     live = read_live()
     rows = []
@@ -309,21 +366,24 @@ def _collect_live():
             u, uerr = fetch_usage(uuid, token, row["active"])
             if uerr:
                 row["error"] = uerr
-            if u:
-                row["five_hour"] = {"pct": u.get("five_hour", {}).get("utilization"),
-                                    "resets_at": u.get("five_hour", {}).get("resets_at")}
-                row["seven_day"] = {"pct": u.get("seven_day", {}).get("utilization"),
-                                    "resets_at": u.get("seven_day", {}).get("resets_at")}
+            if u is not None:
+                # every window is `or {}`-guarded: these are undocumented endpoints, and a null or
+                # absent window must degrade to an error row rather than crash the whole render
+                fh_u, wk_u = (u or {}).get("five_hour") or {}, (u or {}).get("seven_day") or {}
+                if not fh_u and not wk_u and not row.get("error"):
+                    row["error"] = "usage response had no windows"
+                row["five_hour"] = {"pct": fh_u.get("utilization"), "resets_at": fh_u.get("resets_at")}
+                row["seven_day"] = {"pct": wk_u.get("utilization"), "resets_at": wk_u.get("resets_at")}
                 # dollar spend is a SEPARATE, opt-in thing (extra-usage credits / usage-based billing).
                 # It is disabled on most plans incl. standard team seats, so only surface it when enabled.
-                sp = u.get("spend") or {}
+                sp = (u or {}).get("spend") or {}
                 row["spend"] = {"enabled": bool(sp.get("enabled")),
                                 "used": (sp.get("used") or {}).get("amount_minor"),
                                 "limit": (sp.get("limit") or {}).get("amount_minor"),
                                 "percent": sp.get("percent")}
                 # scoped weekly limits (e.g. Opus) if present
                 scoped = []
-                for lim in u.get("limits", []) or []:
+                for lim in (u or {}).get("limits") or []:
                     if lim.get("kind") == "weekly_scoped" and lim.get("scope"):
                         m = (lim["scope"].get("model") or {}).get("display_name")
                         scoped.append({"model": m, "pct": lim.get("percent"),
@@ -506,19 +566,21 @@ def render_xbar(rows):
         have = any(has_usage(r) for r in rows)
         print("🔴 capped" if have else "Claude · ⏳")
     print("---")
-    def hexcol(p):
-        p = p or 0
-        return "#e5534b" if p >= 90 else ("#d9a13b" if p >= 65 else "#3fb950")
     def barline(label, pct, meta=""):
+        # Severity belongs to the gauge, not the clock: the bar and % carry the red/amber/green,
+        # while the label and the reset text stay the menu's default color. That needs two colors on
+        # one line, which `color=` can't do (it paints the whole item) — hence ANSI spans.
         tail = f"  · {meta}" if meta else ""
-        print(f"    {label:<6} {bar(pct)} {int(pct):>3}%{tail} | color={hexcol(pct)} font=Menlo size=12")
+        print(f"    {label:<6} {color(pct)}{bar(pct)} {int(pct):>3}%{C['x']}{tail} "
+              f"| font=Menlo size=12 ansi=true")
     for r in rows:
         star = "▶ " if (r["uuid"] == rec_uuid and not on_best) else "  "
         act  = " ·active" if r.get("active") else ""
-        # PREVIEW: click-to-switch, no confirm — the account row itself is the target. Wired to a
-        # no-op that only refreshes, so the click feels real (menu closes, bar redraws) without switching.
+        # Click-to-switch, no confirm — the account row itself is the target.
         switchable = not r.get("active") and not r.get("error")
         hint = "  ⇄" if switchable else ""      # the only thing marking a row as clickable
+        # macOS draws an actionless menu item at reduced alpha, so the active row reads dimmer than
+        # the switchable ones. `·active` and the menu-bar title carry the signal instead.
         params = "font=Menlo size=13"
         if switchable:
             params += (f' bash="{os.path.realpath(__file__)}" param1=switch param2={r["uuid"]}'
@@ -549,40 +611,63 @@ def render_xbar(rows):
         print("⚠ last known values — rate-limited; updates on the next refresh | color=#d9a13b font=Menlo size=12")
     if len([r for r in rows if not r.get("is_team")]) <= 1:
         print("＋ Log into another account with the claude CLI (claude → /login) to track it | color=#8b949e font=Menlo size=12")
-    act_res = last_action()
-    if act_res:
-        col = "#3fb950" if act_res.get("ok") else "#d9a13b"
-        print(f"{'✓' if act_res.get('ok') else '⚠'} {act_res.get('msg','')} "
-              f"| color={col} font=Menlo size=11")
+    prob = last_problem()      # only failures reach the menu; success is visible in the bar itself
+    if prob:
+        print(f"⚠ {prob.get('msg','')} | color=#d9a13b font=Menlo size=11")
     ts = data_ts()
     upd = datetime.fromtimestamp(ts).strftime("%-I:%M:%S %p") if ts else "—"
-    print(f"Updated {upd} · auto-refreshes on a timer | color=#8b949e font=Menlo size=11")
+    _, iv = find_plugin_link()
+    cadence = f"every {iv}" if iv else "on a timer"
+    print(f"Updated {upd} · auto-refreshes {cadence} | color=#8b949e font=Menlo size=11")
     print("↻ Refresh now | refresh=true")
+    if iv:
+        print(f"⏱ Refresh every · {iv} | font=Menlo size=11 refresh=true")
+        for opt in INTERVALS:
+            mark = "✓" if opt == iv else "  "
+            print(f'--{mark} {opt} | bash="{os.path.realpath(__file__)}" param1=interval param2={opt}'
+                  f" terminal=false refresh=true font=Menlo size=11")
 
 # ---- account switching ------------------------------------------------------
 
 # the pre-switch credential lives in the Keychain like every other secret — never in a file
 PREV_KEY = "__previous__"
-ACTION   = os.path.join(STATE_DIR, "last-action.json")   # non-secret: just an outcome message
+ACTION   = os.path.join(STATE_DIR, "last-problem.json")   # non-secret: just an error message
+LEGACY_ACTION = os.path.join(STATE_DIR, "last-action.json")   # pre-rename name; swept on write
 
-def record_action(ok, msg):
-    """Clicked menu items can't print and notifications may be suppressed — leave the result
-    where the next render can show it (the click refreshes, so it appears immediately)."""
+def record_problem(msg, kind="action"):
+    """Clicked menu items can't print and notifications may be suppressed — leave a *failure*
+    where the next render can show it (the click refreshes, so it appears immediately).
+
+    Only failures: a success already shows in the bar itself — the account row gains ·active,
+    the title changes, the interval tick moves — so echoing it adds nothing.
+    """
     try:
         os.makedirs(STATE_DIR, exist_ok=True)
-        with open(ACTION, "w") as f: json.dump({"ts": time.time(), "ok": ok, "msg": msg}, f)
+        with open(ACTION, "w") as f: json.dump({"ts": time.time(), "kind": kind, "msg": msg}, f)
     except Exception:
         pass
+    try: os.remove(LEGACY_ACTION)      # left by versions that wrote successes here too
+    except Exception: pass
 
-def last_action(max_age=90):
+def clear_problem(kind="action"):
+    """Drop the stale note once *that same* action succeeds. Scoped by kind: a working interval
+    change says nothing about a failed switch, and clearing it would erase a message the user
+    hasn't read yet."""
+    cur = last_problem(max_age=float("inf"))
+    if cur and cur.get("kind", "action") != kind:
+        return
+    try: os.remove(ACTION)
+    except Exception: pass
+
+def last_problem(max_age=90):
     try:
         with open(ACTION) as f: a = json.load(f)
         return a if time.time() - a.get("ts", 0) < max_age else None
     except Exception:
         return None
 
-def _fail(msg):
-    record_action(False, msg)          # surfaced in the menu on the next render
+def _fail(msg, kind="action"):
+    record_problem(msg, kind)          # surfaced in the menu on the next render
     print(msg, file=sys.stderr); sys.exit(1)
 
 def live_account_attr():
@@ -593,15 +678,45 @@ def live_account_attr():
             return line.split("=", 1)[1].strip().strip('"')
     return getpass.getuser()      # Claude Code uses the macOS username
 
-def write_live(blob):
-    """Replace only the claudeAiOauth key — anything else Claude Code keeps in that item survives."""
+CRED_FILE = os.path.expanduser("~/.claude/.credentials.json")
+
+def live_store():
+    """Where Claude Code keeps the live credential on this machine: 'keychain' or 'file'.
+
+    Writing to the store it does *not* read is worse than not writing at all — it would leave the
+    CLI on the old account while this tool reports the new one as active, permanently.
+    """
+    if keychain_read(LIVE_SVC): return "keychain"
+    if os.path.exists(CRED_FILE): return "file"
+    return None
+
+def read_live_raw():
+    if keychain_read(LIVE_SVC): return keychain_read(LIVE_SVC)
     try:
-        cur = json.loads(keychain_read(LIVE_SVC) or "{}")
+        with open(CRED_FILE) as f: return f.read()
+    except Exception:
+        return None
+
+def write_live(blob):
+    """Replace only the claudeAiOauth key — anything else Claude Code keeps survives. Writes back
+    to whichever store the credential was read from. Returns True on success."""
+    store = live_store()
+    if store is None:
+        return False
+    try:
+        cur = json.loads(read_live_raw() or "{}")
         if not isinstance(cur, dict): cur = {}
     except Exception:
         cur = {}
     cur["claudeAiOauth"] = blob
-    keychain_write(LIVE_SVC, live_account_attr(), json.dumps(cur))
+    if store == "keychain":
+        return keychain_write(LIVE_SVC, live_account_attr(), json.dumps(cur))
+    try:                              # 0600: the file holds a live OAuth token
+        fd = os.open(CRED_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f: json.dump(cur, f)
+        return True
+    except Exception:
+        return False
 
 def resolve_account(key):
     k = (key or "").lower()
@@ -616,26 +731,31 @@ def cmd_switch(target):
         prev = keychain_read(STORE_SVC, PREV_KEY)
         if not prev:
             print("nothing to undo", file=sys.stderr); sys.exit(1)
-        keychain_write(LIVE_SVC, live_account_attr(), prev)
+        try:
+            blob = json.loads(prev).get("claudeAiOauth")
+        except Exception:
+            blob = None
+        if not blob or not write_live(blob):
+            _fail("couldn't restore the previous account — no writable credential store", "switch")
         keychain_delete(STORE_SVC, PREV_KEY)
         clear_cache()
-        record_action(True, "Restored the previous account")
+        clear_problem("switch")
         print("restored the previous account"); return
 
     e = resolve_account(target)
     if not e:
-        _fail(f"unknown account: {target}")
+        _fail(f"unknown account: {target}", "switch")
     sec = load_secret(e["uuid"])
     if not sec or not sec.get("refreshToken"):
-        _fail(f"{e['email']} isn't captured — log into it once with the claude CLI")
+        _fail(f"{e['email']} isn't captured — log into it once with the claude CLI", "switch")
     if not sec.get("scopes"):
         # captured before we stored the full blob; writing a partial one could break the CLI login
         _fail(f"{e['email']} needs one login with the claude CLI to store its full credentials, "
-              f"then switching will work")
+              f"then switching will work", "switch")
 
     token, err = token_for_parked(e["uuid"])          # refreshes if the cached token is stale
     if err:
-        _fail(f"can't switch to {e['email']}: {err}")
+        _fail(f"can't switch to {e['email']}: {err}", "switch")
     sec = load_secret(e["uuid"])                      # re-read: the refresh may have rotated it
 
     blob = {"accessToken": sec.get("accessToken") or token,
@@ -643,11 +763,14 @@ def cmd_switch(target):
             "expiresAt": sec.get("expiresAt")}
     blob.update({k: sec[k] for k in BLOB_META if sec.get(k) is not None})   # never write nulls
 
-    cur = keychain_read(LIVE_SVC)                     # back up (to the Keychain) before overwriting
+    if live_store() is None:
+        _fail("no Claude Code credential store found — sign in with the claude CLI first", "switch")
+    cur = read_live_raw()                             # back up (to the Keychain) before overwriting
     if cur: keychain_write(STORE_SVC, PREV_KEY, cur)
-    write_live(blob)
+    if not write_live(blob):
+        _fail(f"couldn't write the credential — switch to {e['email']} did not happen", "switch")
     clear_cache()                                     # so the post-switch refresh shows the new active account
-    record_action(True, f"Switched to {e['email']}")
+    clear_problem("switch")
     print(f"switched to {e['email']}")
 
 # ---- menu-bar install -------------------------------------------------------
@@ -678,30 +801,87 @@ def ensure_xbar():
         return False
     return True
 
+_HOST_CACHE = []      # memo: the lookup forks `defaults`, and a render asks for it repeatedly
+
+def host_and_plugin_dir():
+    """(host name, its plugin folder) for the installed menu-bar host. Either may be None.
+
+    Memoized per process: neither the installed host nor its plugin folder changes during a
+    run, and the `defaults` fork is otherwise repeated on every render.
+    """
+    if _HOST_CACHE:
+        return _HOST_CACHE[0]
+    if _app_installed("xbar.app"):
+        res = ("xbar", (_read_default("com.xbarapp.app", "pluginsDirectory")
+                        or os.path.expanduser("~/Library/Application Support/xbar/plugins")))
+    elif _app_installed("SwiftBar.app"):
+        res = ("SwiftBar", _read_default("com.ameba.SwiftBar", "PluginDirectory"))
+    else:
+        res = (None, None)
+    _HOST_CACHE.append(res)
+    return res
+
+def plugin_source():
+    here = os.path.dirname(os.path.realpath(__file__))     # realpath: works via a PATH symlink too
+    return os.path.join(here, PLUGIN_FILE)
+
+def wrapper_path():
+    """The PATH the plugin wrapper exports, read from the wrapper itself. The menu-bar host runs
+    the plugin with a bare environment, so that line — not this process's PATH — decides which
+    python3 the bar gets. Reading it keeps the check honest if the wrapper is ever edited."""
+    try:
+        with open(plugin_source()) as f:
+            m = re.search(r'^export PATH="([^"]*)"', f.read(), re.M)
+        return m.group(1).split(":") if m else None
+    except Exception:
+        return None
+
+def plugin_python():
+    """The python3 the wrapper will actually find, or None."""
+    for d in wrapper_path() or []:
+        p = os.path.join(d, "python3")
+        if os.path.exists(p):
+            return p
+    return None
+
+def find_plugin_links():
+    """Every (link, interval) in the host's folder pointing at our plugin. The interval is the
+    '.5m.' in the *link's* name, which is what the host reads. More than one means the host is
+    running the plugin twice — two icons in the bar."""
+    _, d = host_and_plugin_dir()
+    if not d or not os.path.isdir(d):
+        return []
+    src = os.path.realpath(plugin_source())
+    out = []
+    for p in sorted(glob.glob(os.path.join(d, "claude-usage.*.sh"))):
+        if os.path.realpath(p) == src:
+            m = re.match(r"claude-usage\.([^.]+)\.sh$", os.path.basename(p))
+            out.append((p, m.group(1) if m else None))
+    return out
+
+def find_plugin_link():
+    """(link path, interval) of our plugin, or (None, None)."""
+    links = find_plugin_links()
+    return links[0] if links else (None, None)
+
 def install_plugin():
     """Symlink the plugin into the host's folder (host must already exist). Returns 'xbar'/'SwiftBar' or None."""
-    here = os.path.dirname(os.path.realpath(__file__))     # realpath: works via a PATH symlink too
-    plugin = os.path.join(here, "claude-usage.5m.sh")
+    plugin = plugin_source()
     if not os.path.exists(plugin):
         print(f"  plugin not found next to the script: {plugin}"); return None
     os.chmod(plugin, 0o755)
 
-    if _app_installed("xbar.app"):
-        app = "xbar"
-        target = (_read_default("com.xbarapp.app", "pluginsDirectory")
-                  or os.path.expanduser("~/Library/Application Support/xbar/plugins"))
-    elif _app_installed("SwiftBar.app"):
-        app = "SwiftBar"
-        target = _read_default("com.ameba.SwiftBar", "PluginDirectory")
-        if not target:
-            print("  SwiftBar is installed but no plugin folder is set.")
-            print("  Open SwiftBar → Preferences, choose a plugin folder, then re-run.")
-            return None
-    else:
+    app, target = host_and_plugin_dir()
+    if not app:
         print("  No menu-bar host found."); return None
+    if not target:
+        print(f"  {app} is installed but no plugin folder is set.")
+        print(f"  Open {app} → Preferences, choose a plugin folder, then re-run.")
+        return None
 
     os.makedirs(target, exist_ok=True)
-    link = os.path.join(target, "claude-usage.5m.sh")
+    existing, _ = find_plugin_link()      # keep whatever interval the user already chose
+    link = existing or os.path.join(target, f"claude-usage.{DEFAULT_INTERVAL}.sh")
     if os.path.islink(link) or os.path.exists(link):
         if os.path.realpath(link) == os.path.realpath(plugin):
             print(f"  ✓ already linked → {link}")
@@ -724,6 +904,162 @@ def setup_menu_bar():
 
 def cmd_install():
     sys.exit(0 if setup_menu_bar() else 1)
+
+def restart_host(app):
+    """Bounce the menu-bar host so it re-scans the plugin folder.
+
+    Detached and in its own session: this usually runs as a child of the host itself (a menu
+    click), so it has to outlive the quit it just issued.
+
+    The relaunch waits for the process to actually be gone rather than sleeping a fixed
+    interval — `open -a` against a still-quitting app can be swallowed as "already running",
+    which would leave no bar and, since the plugin link is already renamed, no menu to fix it
+    from. The final `open` is unconditional so a hung quit still gets a running host.
+    """
+    script = (f'osascript -e \'quit app "{app}"\' >/dev/null 2>&1; '
+              f'for i in $(seq 30); do pgrep -x {app} >/dev/null 2>&1 || break; sleep 0.2; done; '
+              f'open -a "{app}"')
+    subprocess.Popen(["/bin/sh", "-c", script], start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def cmd_interval(val):
+    if val not in INTERVALS:
+        _fail(f"interval must be one of: {', '.join(INTERVALS)}", "interval")
+    app, _ = host_and_plugin_dir()
+    links = find_plugin_links()
+    if not links:
+        _fail("the menu-bar plugin isn't linked — run `claude-usage install` first", "interval")
+    if len(links) > 1:
+        # renaming one of several would leave the rest running at their own cadences
+        _fail("the plugin is linked more than once (" +
+              ", ".join(os.path.basename(p) for p, _ in links) +
+              ") — delete all but one, then set the interval", "interval")
+    link, cur = links[0]
+    if cur == val:
+        clear_problem("interval")
+        print(f"already refreshing every {val}"); return
+    dest = os.path.join(os.path.dirname(link), f"claude-usage.{val}.sh")
+    if os.path.lexists(dest):          # lexists: a dangling link still occupies the name
+        if os.path.realpath(dest) != os.path.realpath(plugin_source()):
+            _fail(f"{dest} already exists and isn't ours — move it aside and retry", "interval")
+        os.remove(dest)                # a duplicate link of our own; the rename replaces it
+    os.rename(link, dest)
+    # The host keeps the plugin's path in memory and doesn't notice a rename — it would keep
+    # exec'ing the old name and show a ⚠ icon. Restart it so it picks the new cadence up.
+    clear_problem("interval")
+    print(f"refreshing every {val} (restarting {app})")
+    restart_host(app)      # a link was found, so a host exists
+
+# ---- doctor -----------------------------------------------------------------
+
+def cmd_doctor():
+    """Check everything that has to line up for the bar to work, and name the fix for whatever doesn't."""
+    counts = {"warn": 0, "bad": 0}
+    def say(state, text, hint=None):
+        icon, col = {"ok": ("✓", C["g"]), "warn": ("⚠", C["y"]), "bad": ("✗", C["r"])}[state]
+        counts[state] = counts.get(state, 0) + 1
+        print(f"  {col}{icon}{C['x']} {text}")
+        if hint: print(f"      {C['dim']}{hint}{C['x']}")
+    def section(name): print(f"\n{C['b']}{name}{C['x']}")
+
+    print(f"\n{C['b']}claude-usage doctor{C['x']}")
+
+    section("Environment")
+    if shutil.which("security"):
+        say("ok", "macOS Keychain (`security`) available")
+    else:
+        say("bad", "`security` not found — Keychain access won't work", "claude-usage is macOS-only.")
+    v = sys.version_info
+    if v >= (3, 8):
+        say("ok", f"python3 {v.major}.{v.minor}.{v.micro}")
+    else:
+        say("bad", f"python3 {v.major}.{v.minor} is too old", "3.8 or newer is required.")
+
+    section("Claude Code session")
+    live = read_live()
+    if not live:
+        say("bad", "no signed-in account found",
+            "run `claude` → /login, then re-run this.")
+    else:
+        src = ('Keychain item "Claude Code-credentials"' if keychain_read(LIVE_SVC)
+               else "~/.claude/.credentials.json")
+        say("ok", f"signed-in account found in {src}")
+        if (live.get("expiresAt") or 0) < time.time() * 1000:
+            say("warn", "its access token has expired",
+                "Claude Code mints a new one on your next `claude` run.")
+
+    section("Accounts")
+    # ingest=False: a diagnostic reports the current state, it doesn't register the live account
+    # or rewrite the index. Reading a parked account can still rotate its refresh token — that is
+    # inherent to reading its usage at all.
+    rows = collect(ingest=False)
+    if not rows:
+        say("warn", "no accounts registered yet",
+            "sign into each account once with `claude` → /login.")
+    for r in sort_rows(rows):
+        if r.get("error"):
+            say("bad", f"{r['email']}: {r['error']}")
+        elif r.get("active"):
+            say("ok", f"{r['email']}: usage reads OK (active)")
+        elif not (load_secret(r["uuid"]) or {}).get("scopes"):
+            say("warn", f"{r['email']}: usage reads OK, but switching to it won't work",
+                "sign into it once with `claude` → /login to store its full credentials.")
+        else:
+            say("ok", f"{r['email']}: usage + switching OK")
+    ts = data_ts()
+    if ts and time.time() - ts > 3600:
+        age = int((time.time() - ts) // 60)
+        say("warn", f"usage numbers last fetched {age // 60}h {age % 60}m ago",
+            "the menu-bar host may not be running.")
+
+    section("Menu bar")
+    app, pdir = host_and_plugin_dir()
+    if not app:
+        say("warn", "no menu-bar host installed", "run `claude-usage install` to add xbar.")
+    elif not pdir:
+        say("warn", f"{app} is installed but has no plugin folder set",
+            f"open {app} → Preferences and choose one, then run `claude-usage install`.")
+    else:
+        links = find_plugin_links()
+        if not links:
+            say("warn", f"{app} is installed but the plugin isn't linked", "run `claude-usage install`.")
+        elif len(links) > 1:
+            say("warn", f"{len(links)} links to the plugin — {app} is running it once per link",
+                "delete all but one: " + ", ".join(os.path.basename(p) for p, _ in links))
+        else:
+            say("ok", f"{app}: plugin linked, refreshing every {links[0][1]}", links[0][0])
+        if subprocess.run(["pgrep", "-x", app], capture_output=True).returncode != 0:
+            say("warn", f"{app} isn't running — the bar won't update", f"run: open -a {app}")
+    py = plugin_python()
+    if py:
+        say("ok", f"the plugin's python3 resolves to {py}")
+    elif wrapper_path() is None:
+        say("bad", f"can't read the plugin's PATH from {PLUGIN_FILE}",
+            "the wrapper is missing or unreadable; re-clone or restore it.")
+    else:
+        say("bad", "no python3 on the plugin's PATH — the bar will render empty")
+
+    section("Shell")
+    cu = os.path.expanduser("~/.local/bin/claude-usage")
+    if os.path.islink(cu) and os.path.realpath(cu) == os.path.realpath(__file__):
+        if os.path.dirname(cu) in os.environ.get("PATH", "").split(os.pathsep):
+            say("ok", f"`claude-usage` on PATH → {cu}")
+        else:
+            say("warn", f"{cu} exists but ~/.local/bin isn't on PATH",
+                'add to your shell rc:  export PATH="$HOME/.local/bin:$PATH"')
+    else:
+        say("warn", "`claude-usage` isn't linked into ~/.local/bin",
+            "run `claude-usage setup` to add it.")
+
+    bad, warn = counts["bad"], counts["warn"]
+    tail = f", {warn} warning(s)" if warn else ""
+    print()
+    if bad:
+        print(f"{C['r']}{bad} problem(s){tail}.{C['x']}\n"); sys.exit(1)
+    if warn:
+        print(f"{C['y']}No problems{tail}.{C['x']}\n")
+    else:
+        print(f"{C['g']}Everything checks out.{C['x']}\n")
 
 # ---- guided setup -----------------------------------------------------------
 
@@ -780,6 +1116,10 @@ def main():
         cmd_setup(); return
     if arg == "install":
         cmd_install(); return
+    if arg == "doctor":
+        cmd_doctor(); return
+    if arg == "interval":
+        cmd_interval(sys.argv[2] if len(sys.argv) > 2 else ""); return
     if arg == "switch":
         cmd_switch(sys.argv[2] if len(sys.argv) > 2 else ""); return
     if arg == "capture":
@@ -797,10 +1137,14 @@ def main():
     if arg == "forget":
         key = sys.argv[2] if len(sys.argv) > 2 else ""
         idx = load_index()
-        gone = [e for e in idx if key and key in (e["uuid"], e["email"])]
+        k = (key or "").lower()
+        gone = [e for e in idx if k and k in (e["uuid"].lower(), e["email"].lower())]
         save_index([e for e in idx if e not in gone])
-        for e in gone: keychain_delete(STORE_SVC, e["uuid"])   # drop the stored token too
+        stuck = [e for e in gone if not keychain_delete(STORE_SVC, e["uuid"])]
         print(f"forgot {len(gone)} account(s)")
+        for e in stuck:   # index entry is gone; say so rather than leave an orphan token unmentioned
+            print(f"  warning: couldn't delete {e['email']}'s Keychain item — remove it by hand",
+                  file=sys.stderr)
         return
     rows = collect()
     if arg == "--json": render_json(rows)

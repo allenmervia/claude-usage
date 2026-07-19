@@ -93,6 +93,8 @@ Two things to know:
 claude-usage setup      guided first-time setup (register account + optional menu bar & PATH)
 claude-usage            table of all known accounts (default)
 claude-usage install    add the menu-bar view (see below)
+claude-usage doctor     check the setup and report what needs fixing
+claude-usage interval N set the menu-bar refresh cadence (1m / 5m / 10m / 30m)
 claude-usage --json     machine-readable JSON
 claude-usage --xbar     xbar / SwiftBar menu-bar format
 claude-usage capture    register the active account now (same as any run)
@@ -106,8 +108,8 @@ claude-usage forget X   drop an account by email or uuid (and delete its stored 
 
 Click an account in the menu and the CLI switches to it — no browser, no
 `/logout`+`/login`. Rows you can switch to are marked `⇄`; hold **⌥** and the row
-spells out what the click will do. The result appears at the bottom of the menu
-(`✓ Switched to …`), and the bar redraws with the new account marked `·active`.
+spells out what the click will do. The bar then redraws with the new account marked
+`·active`. If a switch can't go through, the menu says why at the bottom.
 
 It works by minting a fresh access token from that account's stored refresh token and
 writing it into Claude Code's Keychain item, so your next `claude` run *is* that
@@ -150,23 +152,39 @@ to switch to with `▶`.
 
 ### Refresh interval
 
-The `.5m.` in the plugin filename (`claude-usage.5m.sh`) is how often the bar
-refreshes — every **5 minutes** by default. Rename the file to change it:
+The bar refreshes every **5 minutes** by default. Change it from the menu — the
+**⏱ Refresh every** submenu at the bottom offers 1m / 5m / 10m / 30m and ticks the
+current one — or from the terminal:
 
-| Filename | Interval | |
-|---|---|---|
-| `claude-usage.1m.sh`  | 1 minute   | account switches show up fastest |
-| `claude-usage.5m.sh`  | 5 minutes  | default |
-| `claude-usage.10m.sh` | 10 minutes | gentlest |
+```bash
+claude-usage interval 1m
+```
 
 Each refresh is cheap — one small `/usage` request per account (a few KB, well under a
 second) — and these are **status calls that don't count against your Claude usage
 limits**. So a shorter interval is fine; it mainly changes how quickly a newly
 signed-into account appears on its own. You can always click the menu-bar icon →
-Refresh for an instant update. (If you rename the file, re-point the symlink:
-`claude-usage install` again, or relink by hand.)
+Refresh for an instant update.
 
-To remove the bar: delete the symlink from xbar's plugin folder (`claude-usage.5m.sh`).
+The cadence lives in the filename of the symlink in the host's plugin folder (that's
+how xbar and SwiftBar read it), so `interval` just renames that link — your checkout
+is untouched. Changing it **restarts the menu-bar app**, which is why the bar blinks for
+a second: the host holds the plugin's old path in memory and won't follow a rename on
+its own.
+
+To remove the bar: delete the `claude-usage.*.sh` symlink from xbar's plugin folder.
+
+### When something looks wrong
+
+```bash
+claude-usage doctor
+```
+
+It checks each thing that has to line up — Keychain access, the signed-in account,
+every registered account's usage read and whether it's switchable, the menu-bar host
+and plugin link, the `python3` the plugin will find, and the `PATH` symlink — and for
+anything that fails, names the command that fixes it. This is the fastest way to tell a
+revoked token (from `/logout`) apart from an unlinked plugin.
 
 ## Which account to use, and when
 
@@ -220,22 +238,28 @@ what lets it show every account without a login swap.
 Two properties keep the reporting side safe:
 
 - **Reading never touches your session.** For the active account the tool only reads
-  Claude Code's Keychain item and never refreshes that token itself, so simply showing
+  Claude Code's credential and never refreshes that token itself, so simply showing
   your usage cannot invalidate or desync the session you're logged into. Only *parked*
-  accounts get refreshed, using their own stored tokens.
+  accounts get refreshed, using their own stored tokens. Identifying which account is
+  live falls back to matching the stored credential when the profile lookup can't be
+  reached, so an expired token or a dropped network can't cause the live account to be
+  mistaken for a parked one and refreshed.
 - The tool is a **live mirror** of the usage endpoint. It stores no usage numbers
   and no reset schedule — only credentials and account identity. So if Anthropic
   issues an out-of-band usage reset, it simply appears as lower usage on the next
   refresh; there is nothing cached to fall out of sync.
 
 **Switching is the one exception, by design.** [Switching accounts](#switching-accounts)
-deliberately *writes* Claude Code's Keychain item — that's the whole mechanism. It
-replaces only the `claudeAiOauth` value (anything else in that item is preserved) and
-saves the previous credential first, so `claude-usage switch --undo` puts it back.
+deliberately *writes* Claude Code's credential — that's the whole mechanism. It replaces
+only the `claudeAiOauth` value (anything else is preserved), writes back to whichever
+store Claude Code actually reads (Keychain, or `~/.claude/.credentials.json` for a CLI
+configured without it), and saves the previous credential first, so `claude-usage switch
+--undo` puts it back. If the write fails it says so rather than reporting a switch that
+didn't happen.
 
 Nothing sensitive is written into the repo or into `~/.claude-usage/` — that
 directory holds only non-secret state (account identity, cached usage numbers, the
-last action's outcome). **Every credential, including the pre-switch backup, lives in
+last failure's message). **Every credential, including the pre-switch backup, lives in
 the Keychain.**
 
 ## Caveats
@@ -247,7 +271,8 @@ the Keychain.**
 - **Refresh-token rotation.** If a provider rotates refresh tokens on every use, a
   parked account's stored token can go stale between the last time it was active and
   now. Frequent menu-bar polling keeps the stored copy fresh; if a parked read
-  fails, signing into that account once repairs it.
+  fails, signing into that account once repairs it. `claude-usage doctor` names which
+  accounts are affected.
 
 ## License
 
