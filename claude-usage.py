@@ -78,8 +78,11 @@ def keychain_write(service, account, secret):
     denying the access prompt) would otherwise leave a rotated token unsaved and the account
     permanently unrefreshable, with nothing shown anywhere.
 
-    Note: the secret is passed as an argv value, briefly visible to `ps`. `security` has no
-    non-interactive stdin path for this, and we stay stdlib-only, so this is a deliberate tradeoff.
+    The secret is passed as an argv value, which anything running as this user can read out of the
+    process table. `security`'s only alternative is the interactive prompt behind a bare `-w`, and
+    that reads through a 128-byte buffer — it silently truncates the ~530-byte credential blobs
+    stored here, so it is not an option. Callers keep the exposure rare by writing only when the
+    value actually changes (see store_secret).
     """
     return _sec(["add-generic-password", "-U", "-s", service, "-a", account, "-w", secret]).returncode == 0
 
@@ -167,12 +170,17 @@ BLOB_META = ("scopes", "subscriptionType", "rateLimitTier")   # non-token fields
 
 def store_secret(uuid, refresh, access=None, expires_at=None, host=None, meta=None):
     # merge over any existing record so BLOB_META survives token rotations
-    rec = load_secret(uuid) or {}
+    prev = load_secret(uuid) or {}
+    rec = dict(prev)
     # keep the existing refresh token if the caller has none: it is the account's only durable
     # credential, and overwriting it with None costs a re-login with no way back
     rec.update({"refreshToken": refresh or rec.get("refreshToken"), "accessToken": access,
                 "expiresAt": expires_at, "tokenHost": host})
     if meta: rec.update({k: v for k, v in meta.items() if v is not None})
+    if rec == prev:
+        # nothing changed, so skip the write: every write puts the secret in argv where the process
+        # table exposes it, and an unchanged re-ingest happens on every refresh tick
+        return True
     return keychain_write(STORE_SVC, uuid, json.dumps(rec))
 
 def load_secret(uuid):
