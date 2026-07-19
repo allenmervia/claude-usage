@@ -541,6 +541,15 @@ def render_json(rows):
                       "recommend": {"uuid": rec_uuid, "reason": reason},
                       "generated_at": datetime.now(timezone.utc).isoformat()}, indent=2))
 
+def xb(s):
+    """Make server-supplied text safe to place in an xbar menu line.
+
+    `|` separates a line's text from its parameters, and these lines carry `bash=`/`param1=` on a
+    clickable item — so a `|` arriving in a display name or model name could extend the parameter
+    list rather than the text. Newlines would split one row into several.
+    """
+    return re.sub(r"[|\r\n]", "/", str(s))
+
 def render_xbar(rows):
     if not rows:
         print("Claude · —")
@@ -561,7 +570,7 @@ def render_xbar(rows):
         fp = head["five_hour"]["pct"] or 0; wp = head["seven_day"]["pct"] or 0
         dot = "🟢" if wp < 65 and fp < 65 else ("🟡" if wp < 90 else "🔴")
         stale = " ·" if any(r.get("stale") for r in rows) else ""
-        print(f"{dot} {short_label(head)} {int(fp)}%/{int(wp)}%{stale}")
+        print(f"{dot} {xb(short_label(head))} {int(fp)}%/{int(wp)}%{stale}")
     else:
         have = any(has_usage(r) for r in rows)
         print("🔴 capped" if have else "Claude · ⏳")
@@ -585,35 +594,35 @@ def render_xbar(rows):
         if switchable:
             params += (f' bash="{os.path.realpath(__file__)}" param1=switch param2={r["uuid"]}'
                        f" terminal=false refresh=true")
-        print(f"{star}{r['label']}  {plan_name(r)}{act}{hint} | {params}")
+        print(f"{star}{xb(r['label'])}  {xb(plan_name(r))}{act}{hint} | {params}")
         if switchable:   # holding ⌥ swaps the row for what the click actually does
-            print(f"{star}⇄ Switch to {r['label']} | alternate=true {params}")
+            print(f"{star}⇄ Switch to {xb(r['label'])} | alternate=true {params}")
         if r.get("error"):
-            print(f"    {r['error']} | color=#e5534b font=Menlo size=12"); print("---"); continue
+            print(f"    {xb(r['error'])} | color=#e5534b font=Menlo size=12"); print("---"); continue
         fh, wk = r["five_hour"], r["seven_day"]
         fp, wp = fh["pct"] or 0, wk["pct"] or 0
         scoped = [s for s in r.get("scoped", []) if s.get("pct")]
         barline("5-hour", fp, resets_phrase(fh["resets_at"], "short"))
         barline("weekly", wp, resets_phrase(wk["resets_at"], "short") if scoped else resets_phrase(wk["resets_at"], "week"))
         for i, s in enumerate(scoped):
-            barline((s["model"] or "scoped")[:6], s["pct"], week_abs_label(wk) if i == 0 else "")
+            barline(xb(s["model"] or "scoped")[:6], s["pct"], week_abs_label(wk) if i == 0 else "")
         sp = r.get("spend") or {}
         if sp.get("enabled") and sp.get("limit"):
             print(f"    extra  {usd(sp['used'])} / {usd(sp['limit'])} used | color=#8b949e font=Menlo size=12")
         print("---")
     if on_best:
-        print(f"✓ On the right account · {reason} | color=#3fb950 font=Menlo size=12")
+        print(f"✓ On the right account · {xb(reason)} | color=#3fb950 font=Menlo size=12")
     elif rec:
-        print(f"→ Use {rec['label']} · {reason} | color=#3fb950 font=Menlo size=12")
+        print(f"→ Use {xb(rec['label'])} · {xb(reason)} | color=#3fb950 font=Menlo size=12")
     else:
-        print(f"{reason} | color=#d9a13b font=Menlo size=12")
+        print(f"{xb(reason)} | color=#d9a13b font=Menlo size=12")
     if any(r.get("stale") for r in rows):
         print("⚠ last known values — rate-limited; updates on the next refresh | color=#d9a13b font=Menlo size=12")
     if len([r for r in rows if not r.get("is_team")]) <= 1:
         print("＋ Log into another account with the claude CLI (claude → /login) to track it | color=#8b949e font=Menlo size=12")
     prob = last_problem()      # only failures reach the menu; success is visible in the bar itself
     if prob:
-        print(f"⚠ {prob.get('msg','')} | color=#d9a13b font=Menlo size=11")
+        print(f"⚠ {xb(prob.get('msg',''))} | color=#d9a13b font=Menlo size=11")
     ts = data_ts()
     upd = datetime.fromtimestamp(ts).strftime("%-I:%M:%S %p") if ts else "—"
     _, iv = find_plugin_link()
@@ -670,12 +679,24 @@ def _fail(msg, kind="action"):
     record_problem(msg, kind)          # surfaced in the menu on the next render
     print(msg, file=sys.stderr); sys.exit(1)
 
+ACCT_RE = re.compile(r'^\s*"acct"<blob>=(?:0x([0-9A-Fa-f]+)\s+)?"(.*)"\s*$')
+
 def live_account_attr():
-    """The Keychain 'account' attribute on Claude Code's item, so a write updates the SAME item."""
+    """The Keychain 'account' attribute on Claude Code's item, so a write updates the SAME item.
+
+    `security` prints a non-ASCII value as `0x<hex>  "escaped"`, so the hex form is decoded when
+    present. Getting this wrong doesn't fail loudly: `-U` would match no existing item and add a
+    *second* credential under the same service, after which reads by service alone resolve to
+    either one.
+    """
     r = _sec(["find-generic-password", "-s", LIVE_SVC])
     for line in (r.stdout + "\n" + r.stderr).splitlines():
-        if '"acct"' in line and "=" in line:
-            return line.split("=", 1)[1].strip().strip('"')
+        m = ACCT_RE.match(line)
+        if not m: continue
+        if m.group(1):
+            try: return bytes.fromhex(m.group(1)).decode()
+            except Exception: pass
+        return m.group(2)
     return getpass.getuser()      # Claude Code uses the macOS username
 
 CRED_FILE = os.path.expanduser("~/.claude/.credentials.json")
