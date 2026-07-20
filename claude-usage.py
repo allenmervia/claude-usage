@@ -515,7 +515,7 @@ def render_table(rows):
             print(f"    {C['r']}{r['error']}{C['x']}\n"); continue
         fh, wk = r["five_hour"], r["seven_day"]
         fp, wp = fh["pct"] or 0, wk["pct"] or 0
-        scoped = [s for s in r.get("scoped", []) if s.get("pct")]
+        scoped = [s for s in r.get("scoped", []) if s.get("pct") is not None]
         wk_meta = resets_phrase(wk['resets_at'], 'short') if scoped else resets_phrase(wk['resets_at'], 'week')
         print(f"    5-hour  {color(fp)}{bar(fp)} {str(int(fp)).rjust(3)}%{C['x']}   "
               f"{C['dim']}{resets_phrase(fh['resets_at'], 'short')}{C['x']}")
@@ -609,7 +609,7 @@ def render_xbar(rows):
             print(f"    {xb(r['error'])} | color=#e5534b font=Menlo size=12"); print("---"); continue
         fh, wk = r["five_hour"], r["seven_day"]
         fp, wp = fh["pct"] or 0, wk["pct"] or 0
-        scoped = [s for s in r.get("scoped", []) if s.get("pct")]
+        scoped = [s for s in r.get("scoped", []) if s.get("pct") is not None]
         barline("5-hour", fp, resets_phrase(fh["resets_at"], "short"))
         barline("weekly", wp, resets_phrase(wk["resets_at"], "short") if scoped else resets_phrase(wk["resets_at"], "week"))
         for i, s in enumerate(scoped):
