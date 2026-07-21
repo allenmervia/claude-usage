@@ -10,29 +10,28 @@ tells you which account to use next. The menu bar is the main way to use it; the
 terminal command is the same data on demand.
 
 ```
-Claude usage  · 2:14 PM
+Usage  · 2:14 PM
 
-▶ allen        allen@example.com    Max 20x  [active]
+  allen        allen@example.com    Max 20x  [active]
     5-hour  ██░░░░░░░░   22%   3h 22m left
-    weekly  ███████░░░   66%   2d 10h left
-    Fable   ███░░░░░░░   26%   weekly resets Mon 7am
-  allen-1      allen-1@example.com  Max 20x
+    weekly  ███████░░░   66%   5d left
+    Fable   ███░░░░░░░   26%   weekly resets Sat 7am
+▶ allen-1      allen-1@example.com  Max 20x
     5-hour  ░░░░░░░░░░    5%   3h 9m left
-    weekly  ████░░░░░░   35%   5d left
+    weekly  ████░░░░░░   35%   2d 10h left
     Fable   █░░░░░░░░░    7%   weekly resets Wed 9pm
   allen-2      allen-2@example.com  Max 5x
     5-hour  ░░░░░░░░░░    0%   idle
     weekly  █████████░   94%   3d 20h left
     Fable   ██████░░░░   57%   weekly resets Tue 5pm
-
-▶ Use allen now — 34% weekly left.
 ```
 
 Accounts are listed alphabetically, and the `▶` marks the account to use — not the
-top row. Here it's `allen`: of the accounts with real headroom it resets soonest, so
+top row. Here it's `allen-1`: of the accounts with real headroom it resets soonest, so
 use-it-or-lose-it says spend that capacity before it expires. `allen-2` is skipped —
-at 94% weekly there's almost nothing left to use. (The weekly line shows the
-countdown; the exact reset time rides on the Fable row, since the two share it.)
+at 94% weekly there's almost nothing left to use. No `▶` at all means you're already
+on the best account. (The weekly line shows the countdown; the exact reset time rides
+on the Fable row, since the two share it.)
 
 ## Requirements
 
@@ -145,10 +144,12 @@ the plugin in, and launches the host. From then on the bar updates every 5 minut
 click the menu-bar icon → Refresh to update immediately. If Homebrew isn't installed,
 it points you to https://xbarapp.com instead.
 
-The title shows the account you're currently on (the one the `claude` CLI is signed
-into) and its `5-hour%/weekly%`, colored green/amber/red by how close you are to a
-limit. The dropdown lists every account with its bars and resets, and marks the one
-to switch to with `▶`.
+The title is a pair of **ring gauges** — one per active provider (Claude on the left,
+Codex on the right), each filled by that account's worst window and tinted
+green/amber/red, so how close you are to a limit reads at a glance with no numbers to
+parse. The dropdown lists every account with its bars and resets, grouped by provider
+and tabbed under a `CLAUDE` / `CODEX` header, and marks the Claude account to switch to
+with `▶`.
 
 ### Refresh interval
 
@@ -207,8 +208,8 @@ From that, the strategy the tool recommends:
    days, one is almost always fresh. The tool sorts by soonest weekly reset so the
    rotation falls out naturally.
 
-The `▶` marker and the closing line point at the account this rule selects right
-now, so you don't have to work it out yourself.
+The `▶` marker points at the account this rule selects right now, so you don't have to
+work it out yourself. When you're already on that account, there's no marker at all.
 
 ## Account types
 
@@ -224,6 +225,34 @@ personal plan and a team seat (same account, different orgs), the tool tracks th
 org — is ignored: the personal account keeps showing (as a parked account) with its
 usage intact, and no separate team section appears. A team account shows only when
 it's the *only* context that login has.
+
+## Codex
+
+If you use [Codex](https://openai.com/codex) too, its usage appears in its own
+section, under the Claude accounts. It's **read-only**: the tool shows Codex usage
+but never signs it in, switches it, or writes anything — there's no click-to-switch
+on a Codex row.
+
+Codex has no usage API, so the numbers come from Codex's own session logs. Identity
+(email, plan, account id) is read from `~/.codex/auth.json`; the utilization figure
+is the most recent rate limit Codex recorded in a session under `~/.codex/sessions/`.
+Codex only reports the windows that apply to your plan — often just a weekly one — so
+the row shows exactly those, no phantom "5-hour" line.
+
+Two consequences follow from reading logs instead of an API:
+
+- **The reading is only as fresh as your last Codex run.** It updates whenever you
+  use `codex` (each turn logs a fresh figure); when a window has rolled over since,
+  the row shows the reset rather than a stale percentage.
+- **A session log doesn't name its account**, so the reading is attributed to
+  whichever account is signed in now. That's right whenever you ran Codex as the
+  account you're currently signed in as — the normal case.
+
+**Multiple Codex accounts.** Codex itself signs in one account at a time. If you
+rotate accounts by swapping `~/.codex/auth.json` (what tools like `codex-account` do),
+each one is remembered as it passes through, keyed by account id — the same way Claude
+accounts accrue. Accounts kept in separate `CODEX_HOME` directories aren't
+auto-discovered; point the tool at one with `CODEX_HOME=/path claude-usage`.
 
 ## How it works, and why it can't desync your session
 
@@ -273,6 +302,10 @@ the Keychain.**
   now. Frequent menu-bar polling keeps the stored copy fresh; if a parked read
   fails, signing into that account once repairs it. `claude-usage doctor` names which
   accounts are affected.
+- **Codex usage can lag.** It's read from Codex's session logs, not a live API, so it
+  only updates when you run `codex` (found by scanning your recent sessions). The last
+  reading is kept and shown until a newer one appears, so a stretch without Codex use
+  leaves the figure unchanged rather than blank. See [Codex](#codex).
 
 ## License
 

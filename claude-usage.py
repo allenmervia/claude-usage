@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """claude-usage — show 5-hour and weekly usage across several Claude accounts
-without logging in and out.
+without logging in and out. Codex (OpenAI) usage is shown alongside, read-only.
 
 How it works
 ------------
@@ -20,6 +20,13 @@ Safety: the active account is always read live from Claude Code's own Keychain
 item and is never independently refreshed, so this tool cannot desync the session
 you're logged into. Only parked accounts get refreshed, and rotated refresh
 tokens are written straight back to the Keychain.
+
+Codex: identity is read from ~/.codex/auth.json and usage from the newest Codex
+session rollout that records a rate limit — no API call, no writes, no switching.
+A session log doesn't name its account, so the reading is attributed to whoever
+is currently signed in, and each row shows how old it is (Codex usage can't be
+refreshed without running codex). Accounts are keyed by account_id, so rotating
+the auth.json slot accretes them the same way Claude accounts accrue.
 
 Usage:
   claude-usage setup      guided first-time setup (register account, optional menu bar + PATH)
@@ -52,6 +59,13 @@ BETA = "oauth-2025-04-20"
 STATE_DIR = os.path.expanduser("~/.claude-usage")
 INDEX = os.path.join(STATE_DIR, "accounts.json")
 CACHE = os.path.join(STATE_DIR, "cache.json")
+# Codex (OpenAI). Read-only: identity from ~/.codex/auth.json, usage from the latest session rollout.
+# CODEX_HOME lets a per-home multi-account setup point us at one home; multi-home isn't auto-discovered.
+CODEX_HOME     = os.path.expanduser(os.environ.get("CODEX_HOME") or "~/.codex")
+CODEX_AUTH     = os.path.join(CODEX_HOME, "auth.json")
+CODEX_SESSIONS = os.path.join(CODEX_HOME, "sessions")
+CODEX_INDEX    = os.path.join(STATE_DIR, "codex-accounts.json")   # opportunistic registry, keyed by account_id
+CODEX_SCAN     = 60        # newest session files to search for a usable reading before giving up (see below)
 FH_NEAR = 90   # at/above this 5-hour %, an account is treated as unusable *right now*
 WK_NEAR = 90   # at/above this weekly %, an account has too little runway to recommend
 COOLDOWN = 30  # s — rapid re-refreshes within this window reuse the last result, sparing the API
@@ -342,13 +356,17 @@ def collect(ingest=True):
     if cache and 0 <= now - cache.get("ts", 0) < COOLDOWN:
         return cache["rows"]                                  # rapid re-refresh → reuse, don't hit the API
     rows = _collect_live(ingest)
-    if any(not r.get("error") for r in rows):                 # got fresh data → this is the new truth
+    # Freshness is judged on Claude alone: only Claude hits the network, and a retained Codex snapshot
+    # (never an error) must not mask a Claude 429 storm and clobber the last-known Claude values.
+    claude = [r for r in rows if r.get("provider", "claude") == "claude"]
+    codex  = [r for r in rows if r.get("provider") == "codex"]
+    if not claude or any(not r.get("error") for r in claude):  # got fresh Claude data (or none to fetch)
         save_cache(rows, now)
         return rows
-    if cache and cache.get("rows"):                           # everything errored (e.g. 429 storm) → last known
-        stale = cache["rows"]
+    if cache and cache.get("rows"):                           # every Claude read errored → last known Claude
+        stale = [r for r in cache["rows"] if r.get("provider", "claude") == "claude"]
         for r in stale: r["stale"] = True
-        return stale
+        return stale + codex                                  # keep this run's fresh Codex rows
     return rows
 
 def _collect_live(ingest=True):
@@ -367,7 +385,7 @@ def _collect_live(ingest=True):
             token, err = live["accessToken"], None
         else:
             token, err = token_for_parked(uuid)
-        row = {"uuid": uuid, "email": e["email"], "label": e["label"],
+        row = {"provider": "claude", "uuid": uuid, "email": e["email"], "label": e["label"],
                "tier": e.get("tier"), "org_type": e.get("org_type"), "is_team": is_team_entry(e),
                "active": uuid == active_uuid, "error": err}
         if token and not err:
@@ -398,9 +416,13 @@ def _collect_live(ingest=True):
                                        "resets_at": lim.get("resets_at")})
                 row["scoped"] = scoped
         rows.append(row)
+    rows += collect_codex(persist=ingest)   # Codex is read-only; persist mirrors Claude's ingest flag
     return rows
 
 def recommend(rows):
+    # Only Claude accounts are switchable from here, so the "use this one" pick is Claude-only;
+    # Codex rows are informational. Per-provider by construction — there's nothing to rank across.
+    rows = [r for r in rows if r.get("provider", "claude") == "claude"]
     def wk(r):   return parse_dt(r.get("seven_day", {}).get("resets_at")) or datetime.max.replace(tzinfo=timezone.utc)
     def fh(r):   return parse_dt(r.get("five_hour", {}).get("resets_at")) or datetime.max.replace(tzinfo=timezone.utc)
     def wpct(r): return (r.get("seven_day") or {}).get("pct")
@@ -422,6 +444,173 @@ def recommend(rows):
         nxt = sorted(ok, key=wk)[0]
         return None, f"all accounts are weekly-capped; {nxt['label']}'s weekly resets first (in {rel(wk(nxt))})"
     return None, "no usage data"
+
+# ---- codex (openai) ---------------------------------------------------------
+# Codex reports the same thing Claude does — percent of a rate-limit window used, and when it resets —
+# but through different plumbing: no API, a single-account auth.json, and usage buried in session logs.
+# Three facts shape the code below: (1) a session rollout doesn't record *which* account wrote it, so
+# identity must come from auth.json and usage is attributed to whoever is currently signed in; (2) a
+# window whose reset time has passed reports a stale percentage the file never clears — treat it as
+# unknown; (3) the data is only as fresh as the last codex run, so every row carries its own age.
+
+def _jwt_claims(tok):
+    """Decode a JWT payload without verifying — it's a local file we already trust; we only read it."""
+    try:
+        import base64
+        p = (tok or "").split(".")[1]; p += "=" * (-len(p) % 4)
+        d = json.loads(base64.urlsafe_b64decode(p))
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+def codex_plan_name(plan):
+    if not plan: return ""
+    return {"free": "Free", "plus": "Plus", "pro": "Pro", "prolite": "Pro Lite",
+            "business": "Business", "team": "Team", "enterprise": "Enterprise"}.get(plan.lower(), plan)
+
+def codex_window_label(minutes):
+    """Name a window by its duration — Codex places the 5-hour/weekly limit in whichever slot, so the
+    minutes (not the primary/secondary position) are what identify it."""
+    if not minutes: return "window"
+    return {300: "5-hour", 1440: "daily", 10080: "weekly", 43200: "monthly"}.get(
+        minutes, f"{minutes // 1440}d" if minutes >= 1440 else f"{minutes // 60}h")
+
+def codex_latest_usage():
+    """The newest rate_limits event that actually carries a window, as (epoch_ts, rate_limits).
+
+    Each active session rewrites rate_limits every turn, so the most-recently-modified file holds the
+    freshest figures. But Codex also logs window-less events (limit_id "premium" with primary and
+    secondary both null — a separate stream, e.g. the desktop/computer-use runtime), which carry no
+    utilization. Whole runs of recent sessions can be window-less, so we skip those events and scan
+    back through the newest CODEX_SCAN files, stopping at the first that yields a windowed reading.
+    Past that budget we return None and the caller keeps the last stored figure (aged, not erased)."""
+    try:
+        files = sorted(glob.glob(os.path.join(CODEX_SESSIONS, "*", "*", "*", "*.jsonl")),
+                       key=os.path.getmtime, reverse=True)
+    except Exception:
+        files = []
+    for f in files[:CODEX_SCAN]:
+        best = None
+        try:
+            with open(f) as fh:
+                for line in fh:
+                    if '"rate_limits"' not in line: continue
+                    try:
+                        d = json.loads(line); rl = d.get("payload", {}).get("rate_limits")
+                        ts = parse_dt(d.get("timestamp"))
+                    except Exception:
+                        continue
+                    if not isinstance(rl, dict) or not ts: continue
+                    if not (_codex_window_ok(rl.get("primary")) or _codex_window_ok(rl.get("secondary"))):
+                        continue                              # window-less event, or window with no real %
+                    if best is None or ts.timestamp() > best[0]:
+                        best = (ts.timestamp(), rl)
+        except Exception:
+            continue
+        if best:
+            return best
+    return None
+
+def _codex_window_ok(w):
+    """A usable window: a dict carrying a real numeric utilization. A window object with a null/absent
+    used_percent isn't a reading — accepting it would render as a bogus green 0%."""
+    return isinstance(w, dict) and isinstance(w.get("used_percent"), (int, float))
+
+def codex_windows(rl):
+    """The present windows as raw {label, minutes, pct, resets_at}, sorted short→long. Expiry is NOT
+    baked in here: a reading can sit in the registry across refreshes, so whether a window has rolled
+    over is decided live at display time (codex_display_windows), never frozen at capture."""
+    wins = []
+    for slot in ("primary", "secondary"):
+        w = rl.get(slot)
+        if not _codex_window_ok(w): continue
+        ra = w.get("resets_at")
+        wins.append({"label": codex_window_label(w.get("window_minutes")),
+                     "minutes": w.get("window_minutes"),
+                     "pct": float(w["used_percent"]),
+                     "resets_at": datetime.fromtimestamp(ra, timezone.utc).isoformat()
+                                  if isinstance(ra, (int, float)) else None})
+    wins.sort(key=lambda x: x.get("minutes") or 0)
+    return wins
+
+def codex_display_windows(row):
+    """Windows resolved for display: a window whose reset has passed reports a percentage the session
+    log never cleared, so we blank it (expired, pct None) rather than show a number that isn't true."""
+    now = time.time(); out = []
+    for w in row.get("windows", []):
+        dt = parse_dt(w.get("resets_at"))
+        expired = dt is not None and dt.timestamp() <= now
+        out.append({**w, "expired": expired, "pct": None if expired else w.get("pct")})
+    return out
+
+def load_codex_index():
+    try:
+        with open(CODEX_INDEX) as f: d = json.load(f)
+        return d if isinstance(d, dict) else {}      # a tampered file that parses as a list must not crash
+    except Exception:
+        return {}
+
+def save_codex_index(idx):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = CODEX_INDEX + ".tmp"
+        with open(tmp, "w") as f: json.dump(idx, f, indent=2)
+        os.replace(tmp, CODEX_INDEX)
+    except Exception:
+        pass
+
+def codex_label(email, name, aid):
+    if email and "@" in email: return email.split("@")[0]
+    return name or (aid[:8] if aid else "codex")
+
+def collect_codex(persist=True):
+    """Codex rows for every known account. The signed-in account (auth.json) is refreshed from the
+    latest session; accounts seen before but not currently signed in render from their last snapshot
+    (marked stale by age). Registry is keyed by account_id, so rotating the auth.json slot accretes
+    accounts the same way the Claude side does."""
+    idx = load_codex_index()
+    live_aid = None
+    try:
+        with open(CODEX_AUTH) as f: auth = json.load(f)
+    except Exception:
+        auth = None
+    tokens = auth.get("tokens") if isinstance(auth, dict) else None
+    if isinstance(tokens, dict):
+        claims = _jwt_claims(tokens.get("id_token"))
+        oauth  = claims.get("https://api.openai.com/auth")
+        oauth  = oauth if isinstance(oauth, dict) else {}
+        aid = tokens.get("account_id") or oauth.get("chatgpt_account_id")
+        if aid:
+            live_aid = aid
+            prev = idx.get(aid) if isinstance(idx.get(aid), dict) else {}
+            prev_as_of = prev.get("as_of") if isinstance(prev.get("as_of"), (int, float)) else 0
+            # identity always refreshes from auth.json; usage only when the scan turns up a reading at
+            # least as new as the stored one — a window-less stretch must not erase the last real figure.
+            entry = {"account_id": aid, "email": claims.get("email") or "",
+                     "name": claims.get("name") or "", "plan": oauth.get("chatgpt_plan_type") or prev.get("plan")}
+            best = codex_latest_usage()
+            if best and best[0] >= prev_as_of:
+                ts, rl = best
+                entry["windows"] = codex_windows(rl)
+                entry["as_of"]   = ts
+                entry["plan"]    = rl.get("plan_type") or entry["plan"]
+                cr = rl.get("credits") or {}
+                entry["credits"] = {"has": bool(cr.get("has_credits")),
+                                    "unlimited": bool(cr.get("unlimited")), "balance": cr.get("balance")}
+            idx[aid] = {**prev, **entry}
+            if persist: save_codex_index(idx)
+    rows = []
+    for aid, e in idx.items():
+        if not isinstance(e, dict): continue         # skip a tampered/foreign registry entry
+        wins = e.get("windows") or []
+        rows.append({
+            "provider": "codex", "uuid": aid, "account_id": aid,
+            "email": e.get("email") or aid, "label": codex_label(e.get("email"), e.get("name"), aid),
+            "plan": e.get("plan"), "windows": wins, "as_of": e.get("as_of"),
+            "credits": e.get("credits"), "active": aid == live_aid,
+            "error": None if (wins or e.get("as_of")) else "no usage recorded yet — run codex once",
+        })
+    return rows
 
 # ---- rendering --------------------------------------------------------------
 
@@ -467,11 +656,6 @@ def color(pct):
     if pct >= 65: return C["y"]
     return C["g"]
 
-def short_label(row):
-    s = row.get("email") or row.get("label") or "?"
-    if "@" in s: s = s.split("@")[0]
-    return s if len(s) <= 10 else s[:9] + "…"
-
 def plan_name(row):
     """Human plan label from the profile fields — never assumes a plan."""
     if row.get("is_team"):
@@ -491,53 +675,109 @@ def sort_rows(rows):
     # the ▶ marker (not position) points at the recommended account.
     return sorted(rows, key=lambda r: (r.get("label") or r.get("email") or "").lower())
 
+PROVIDERS = [("claude", "Claude"), ("codex", "Codex")]
+
+def by_provider(rows):
+    """Rows grouped as [(key, name, rows)] in Claude-then-Codex order, empty groups dropped."""
+    out = []
+    for key, name in PROVIDERS:
+        g = sort_rows([r for r in rows if r.get("provider", "claude") == key])
+        if g: out.append((key, name, g))
+    return out
+
+def plan_of(row):
+    return codex_plan_name(row.get("plan")) if row.get("provider") == "codex" else plan_name(row)
+
+def codex_worst_pct(rows):
+    """Worst live window of the Codex account you're signed into — what the menu-bar ring reports.
+    Parked (non-active) Codex snapshots are shown in the dropdown but never drive the title, so the
+    ring always reflects the provider you're actually on."""
+    active = next((r for r in rows if r.get("provider") == "codex" and r.get("active")), None)
+    if not active: return None
+    pcts = [w["pct"] for w in codex_display_windows(active) if w.get("pct") is not None]
+    return max(pcts) if pcts else None
+
+def _col_widths(rows):
+    """Label/email column widths that fit the actual names, so the plan column lines up down both
+    sections. Capped so one long address can't shove everything off the right edge."""
+    ok = [r for r in rows if not r.get("error")]
+    lw = min(16, max([6] + [len(r.get("label") or "") for r in ok]))
+    ew = min(26, max([6] + [len(r.get("email") or "") for r in ok]))
+    return lw, ew
+
+def _table_claude_row(r, rec_uuid, on_best, w):
+    lw, ew = w
+    # Name at col 2 under the provider header; the ▶ pick-marker sits in the margin to its left.
+    mark = f"{C['g']}▶{C['x']}" if (r["uuid"] == rec_uuid and not on_best) else " "
+    head = (f"{mark} {C['b']}{r['label']:<{lw}}{C['x']} {C['dim']}{r['email']:<{ew}}{C['x']}"
+            f"  {C['cyan']}{plan_of(r)}{C['x']}")
+    if r.get("active"): head += f"  {C['cyan']}[active]{C['x']}"
+    print(head)
+    if r.get("error"):
+        print(f"    {C['r']}{r['error']}{C['x']}\n"); return
+    fh, wk = r["five_hour"], r["seven_day"]
+    fp, wp = fh["pct"] or 0, wk["pct"] or 0
+    scoped = [s for s in r.get("scoped", []) if s.get("pct") is not None]
+    wk_meta = resets_phrase(wk['resets_at'], 'short') if scoped else resets_phrase(wk['resets_at'], 'week')
+    print(f"    5-hour  {color(fp)}{bar(fp)} {str(int(fp)).rjust(3)}%{C['x']}   "
+          f"{C['dim']}{resets_phrase(fh['resets_at'], 'short')}{C['x']}")
+    print(f"    weekly  {color(wp)}{bar(wp)} {str(int(wp)).rjust(3)}%{C['x']}   "
+          f"{C['dim']}{wk_meta}{C['x']}")
+    for i, s in enumerate(scoped):
+        lbl = f"   {week_abs_label(wk)}" if i == 0 else ""
+        print(f"    {C['dim']}{(s['model'] or 'scoped'):<7} {bar(s['pct'])} {str(int(s['pct'])).rjust(3)}%{lbl}{C['x']}")
+    sp = r.get("spend") or {}
+    if sp.get("enabled") and sp.get("limit"):   # extra-usage credits, only when turned on
+        print(f"    {C['dim']}extra   {usd(sp['used'])} / {usd(sp['limit'])} used{C['x']}")
+    print()
+
+def _table_codex_row(r, show_active, w):
+    lw, ew = w
+    head = (f"  {C['b']}{r['label']:<{lw}}{C['x']} {C['dim']}{r['email']:<{ew}}{C['x']}"
+            f"  {C['cyan']}{plan_of(r)}{C['x']}")
+    if show_active and r.get("active"): head += f"  {C['cyan']}[signed in]{C['x']}"
+    print(head)
+    if r.get("error"):
+        print(f"    {C['r']}{r['error']}{C['x']}\n"); return
+    for w in codex_display_windows(r):
+        if w.get("expired"):
+            print(f"    {C['dim']}{w['label']:<7} {bar(0)}   —   window reset — run codex to refresh{C['x']}")
+        else:
+            pct = w["pct"] or 0
+            print(f"    {w['label']:<7} {color(pct)}{bar(pct)} {str(int(pct)).rjust(3)}%{C['x']}   "
+                  f"{C['dim']}{resets_phrase(w['resets_at'], 'week')}{C['x']}")
+    cr = r.get("credits") or {}
+    if cr.get("has") and cr.get("balance") not in (None, "0"):
+        print(f"    {C['dim']}credits {cr['balance']}{C['x']}")
+    print()
+
 def render_table(rows):
     if not rows:
-        print(f"\n{C['b']}Claude usage{C['x']}\n")
+        print(f"\n{C['b']}Usage{C['x']}\n")
         print(f"{C['y']}No accounts found.{C['x']} Log in with the `claude` CLI "
               f"(`claude` → /login), then run this again.")
         print(f"{C['dim']}It reads the account the CLI is signed into; log into each of your "
               f"accounts once to add them all.{C['x']}\n")
         return
-    rows = sort_rows(rows)
-    rec_uuid, reason = recommend(rows)
-    active_uuid = next((r["uuid"] for r in rows if r.get("active")), None)
+    def is_claude(r): return r.get("provider", "claude") == "claude"   # pre-Codex cached rows have no field
+    groups = by_provider(rows)
+    rec_uuid, _ = recommend(rows)
+    active_uuid = next((r["uuid"] for r in rows if is_claude(r) and r.get("active")), None)
     on_best = rec_uuid is not None and rec_uuid == active_uuid   # already on the pick — nothing to switch to
-    print(f"\n{C['b']}Claude usage{C['x']}  {C['dim']}· {datetime.now().astimezone().strftime('%-I:%M %p')}{C['x']}\n")
-    for r in rows:
-        mark = f"{C['g']}▶{C['x']}" if (r["uuid"] == rec_uuid and not on_best) else " "
-        tag  = plan_name(r)
-        head = (f"{mark} {C['b']}{r['label']:<12}{C['x']} {C['dim']}{r['email']}{C['x']}"
-                f"  {C['cyan']}{tag}{C['x']}")
-        if r.get("active"): head += f"  {C['cyan']}[active]{C['x']}"
-        print(head)
-        if r.get("error"):
-            print(f"    {C['r']}{r['error']}{C['x']}\n"); continue
-        fh, wk = r["five_hour"], r["seven_day"]
-        fp, wp = fh["pct"] or 0, wk["pct"] or 0
-        scoped = [s for s in r.get("scoped", []) if s.get("pct") is not None]
-        wk_meta = resets_phrase(wk['resets_at'], 'short') if scoped else resets_phrase(wk['resets_at'], 'week')
-        print(f"    5-hour  {color(fp)}{bar(fp)} {str(int(fp)).rjust(3)}%{C['x']}   "
-              f"{C['dim']}{resets_phrase(fh['resets_at'], 'short')}{C['x']}")
-        print(f"    weekly  {color(wp)}{bar(wp)} {str(int(wp)).rjust(3)}%{C['x']}   "
-              f"{C['dim']}{wk_meta}{C['x']}")
-        for i, s in enumerate(scoped):
-            lbl = f"   {week_abs_label(wk)}" if i == 0 else ""
-            print(f"    {C['dim']}{(s['model'] or 'scoped'):<7} {bar(s['pct'])} {str(int(s['pct'])).rjust(3)}%{lbl}{C['x']}")
-        sp = r.get("spend") or {}
-        if sp.get("enabled") and sp.get("limit"):   # extra-usage credits, only when turned on
-            print(f"    {C['dim']}extra   {usd(sp['used'])} / {usd(sp['limit'])} used{C['x']}")
-        print()
-    if on_best:
-        print(f"{C['g']}✓ You're on the right account{C['x']} — {reason}.\n")
-    elif rec_uuid:
-        rec = next(r for r in rows if r["uuid"] == rec_uuid)
-        print(f"{C['g']}▶ Use {rec['label']} now{C['x']} — {reason}.\n")
-    else:
-        print(f"{C['y']}⏳ {reason}.{C['x']}\n")
-    if any(r.get("stale") for r in rows):
+    print(f"\n{C['b']}Usage{C['x']}  {C['dim']}· {datetime.now().astimezone().strftime('%-I:%M %p')}{C['x']}\n")
+    multi = len(groups) > 1   # only label the sections when there's more than one provider to tell apart
+    w = _col_widths(rows)     # shared across sections so the plan column lines up throughout
+    for key, name, grp in groups:
+        if multi:
+            print(f"{C['dim']}── {name} " + "─" * (56 - len(name)) + f"{C['x']}")
+        if key == "codex":
+            show_active = len(grp) > 1
+            for r in grp: _table_codex_row(r, show_active, w)
+        else:
+            for r in grp: _table_claude_row(r, rec_uuid, on_best, w)
+    if any(r.get("stale") for r in rows if is_claude(r)):
         print(f"{C['y']}⚠ Showing last known values — the usage API rate-limited this refresh.{C['x']}\n")
-    n = len([r for r in rows if not r.get("is_team")])
+    n = len([r for r in rows if is_claude(r) and not r.get("is_team")])
     if n <= 1:
         lead = "No personal accounts tracked yet" if n == 0 else "Only one account tracked so far"
         print(f"{C['dim']}{lead} — log into your other accounts with the `claude` CLI "
@@ -548,6 +788,91 @@ def render_json(rows):
     print(json.dumps({"accounts": sort_rows(rows),
                       "recommend": {"uuid": rec_uuid, "reason": reason},
                       "generated_at": datetime.now(timezone.utc).isoformat()}, indent=2))
+
+# ---- menu-bar icon (dynamic ring gauges) ------------------------------------
+# xbar/SwiftBar render a base64 PNG placed after `| image=` on the title line. We draw one ring per
+# active provider — Claude, then Codex — each filled clockwise from 12 o'clock by that account's worst
+# window and tinted green/amber/red, so the icon itself shows how close you are before the numbers are
+# read. Pure stdlib: a hand-rolled PNG writer plus a supersampled rasteriser, no Pillow dependency. Any
+# failure returns None and the title falls back to the emoji dot.
+
+RING_RGB = {"g": (63, 185, 80), "y": (217, 161, 59), "r": (229, 83, 75), "dim": (130, 138, 148)}
+
+def _ring_rgb(pct):
+    if pct is None: return RING_RGB["dim"]
+    if pct >= 90:   return RING_RGB["r"]
+    if pct >= 65:   return RING_RGB["y"]
+    return RING_RGB["g"]
+
+def _png(w, h, rgba, ppm=0):
+    import struct, zlib
+    def chunk(t, d):
+        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+    raw, row = bytearray(), w * 4
+    for y in range(h):
+        raw.append(0)                                   # per-scanline filter: none
+        raw += rgba[y * row:(y + 1) * row]
+    out = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+    if ppm:                                             # pHYs: physical resolution, so a retina display
+        out += chunk(b"pHYs", struct.pack(">IIB", ppm, ppm, 1))   # draws the extra pixels at half the points
+    return out + chunk(b"IDAT", zlib.compress(bytes(raw), 9)) + chunk(b"IEND", b"")
+
+def menu_icon_b64(specs, scale=4):
+    """specs: one pct per ring (0-100, or None for an unknown/idle ring). Returns a base64 PNG, or None
+    on any failure. `scale` is the pixel density: higher = crisper on a retina menu bar (xbar draws the
+    bitmap near 1:1, so it needs the extra pixels), at the cost of a larger bitmap."""
+    if not specs: return None
+    try:
+        import math, base64
+        SS = 3                                          # supersample, then box-downsample for smooth edges
+        D, GAP, TH, PAD = 10, 3, 1.7, 1                 # ring diameter / gap / thickness / padding, in points
+        n = len(specs)
+        W = (PAD * 2 + n * D + (n - 1) * GAP) * scale
+        H = (PAD * 2 + D) * scale
+        rw, rh = W * SS, H * SS
+        px = bytearray(rw * rh * 4)
+        for i, pct in enumerate(specs):
+            r0, g0, b0 = _ring_rgb(pct)
+            frac = max(0.0, min(1.0, (pct or 0) / 100.0))
+            cx = (PAD + D / 2 + i * (D + GAP)) * scale * SS
+            cy = (PAD + D / 2) * scale * SS
+            rO = (D / 2) * scale * SS
+            rI = (D / 2 - TH) * scale * SS
+            # rounded caps: a filled disc of radius TH/2 at each end of the arc (top, and the frac angle).
+            rM, capR = (rO + rI) / 2, (rO - rI) / 2
+            th = frac * 2 * math.pi
+            sX, sY = cx, cy - rM
+            eX, eY = cx + rM * math.sin(th), cy - rM * math.cos(th)
+            for y in range(max(0, int(cy - rO - 1)), min(rh, int(cy + rO + 2))):
+                for x in range(max(0, int(cx - rO - 1)), min(rw, int(cx + rO + 2))):
+                    dx, dy = x - cx, y - cy
+                    d = math.hypot(dx, dy)
+                    if d > rO or d < rI: continue
+                    a = (math.atan2(dx, -dy) % (2 * math.pi)) / (2 * math.pi)   # 0 at top, clockwise
+                    fill = a <= frac
+                    if not fill and 0 < frac < 1:        # round the two ends
+                        fill = math.hypot(x - sX, y - sY) <= capR or math.hypot(x - eX, y - eY) <= capR
+                    o = (y * rw + x) * 4
+                    px[o], px[o + 1], px[o + 2], px[o + 3] = r0, g0, b0, (255 if fill else 55)
+        out = bytearray(W * H * 4)                      # alpha-weighted downsample (clean anti-aliased edges)
+        for y in range(H):
+            for x in range(W):
+                r = g = b = a = 0
+                for sy in range(SS):
+                    base = ((y * SS + sy) * rw + x * SS) * 4
+                    for sx in range(SS):
+                        o = base + sx * 4; aa = px[o + 3]
+                        r += px[o] * aa; g += px[o + 1] * aa; b += px[o + 2] * aa; a += aa
+                oo = (y * W + x) * 4
+                if a:
+                    out[oo], out[oo + 1], out[oo + 2] = r // a, g // a, b // a
+                out[oo + 3] = a // (SS * SS)
+        # Declare the bitmap at 36·scale DPI so the display size is scale-invariant (matching what a
+        # plain 72-DPI scale-2 image showed) while the extra pixels land as retina sharpness.
+        ppm = round(36 * scale / 0.0254)
+        return base64.b64encode(_png(W, H, out, ppm)).decode()
+    except Exception:
+        return None
 
 def xb(s):
     """Make server-supplied text safe to place in an xbar menu line.
@@ -565,33 +890,52 @@ def render_xbar(rows):
         print("No accounts found — run: claude → /login | color=#d9a13b font=Menlo size=12")
         print("Refresh now | refresh=true")
         return
-    rows = sort_rows(rows)
-    rec_uuid, reason = recommend(rows)
-    rec = next((r for r in rows if r["uuid"] == rec_uuid), None)
-    active_uuid = next((r["uuid"] for r in rows if r.get("active")), None)
+    rec_uuid, _ = recommend(rows)
+    claude_rows = sort_rows([r for r in rows if r.get("provider", "claude") == "claude"])
+    rec = next((r for r in claude_rows if r["uuid"] == rec_uuid), None)
+    active_uuid = next((r["uuid"] for r in claude_rows if r.get("active")), None)
     on_best = rec_uuid is not None and rec_uuid == active_uuid   # already on the pick — no switch to suggest
-    # menu-bar title: the account you're on (CLI-active) with its 5h%/weekly%, colored by severity.
-    # Falls back to the recommended account when there's no usable active one (e.g. desktop-only).
+    xlw = min(14, max([6] + [len(r.get("label") or "") for r in rows if not r.get("error")]))  # align plan col
+    # xbar trims leading whitespace from a menu title, and its trim set is the Unicode Zs category —
+    # which includes the regular space AND the non-breaking space, so neither indents. U+2800 (the blank
+    # Braille cell) renders as empty space but is category So, not Zs, so it survives the trim. All
+    # dropdown indentation is built from it, which is what finally makes the tabbed hierarchy show.
+    NB = "\u2800"
+    # menu-bar title: just the ring gauges — one per active provider (Claude, then Codex), each filled
+    # by that account's worst window. No numbers; the rings carry fill + severity, position carries which
+    # provider. If the PNG can't be built, fall back to one severity dot per provider (still no numbers).
     def has_usage(r): return not r.get("error") and (r.get("five_hour") or {}).get("pct") is not None
-    head = next((r for r in rows if r.get("active") and has_usage(r)), None) or (rec if rec and has_usage(rec) else None)
+    def dot(p): return "🟢" if p < 65 else ("🟡" if p < 90 else "🔴")
+    head = next((r for r in claude_rows if r.get("active") and has_usage(r)), None) or (rec if rec and has_usage(rec) else None)
+    cw = codex_worst_pct(rows)
+    specs = []
     if head:
         fp = head["five_hour"]["pct"] or 0; wp = head["seven_day"]["pct"] or 0
-        dot = "🟢" if wp < 65 and fp < 65 else ("🟡" if wp < 90 else "🔴")
-        stale = " ·" if any(r.get("stale") for r in rows) else ""
-        print(f"{dot} {xb(short_label(head))} {int(fp)}%/{int(wp)}%{stale}")
+        specs = [max(fp, wp)] + ([cw] if cw is not None else [])
+    elif cw is not None:
+        specs = [cw]
+    img = menu_icon_b64(specs)
+    if img:
+        print(f"|image={img}")
+    elif specs:
+        print("".join(dot(p) for p in specs))          # dot per provider, same order as the rings
     else:
-        have = any(has_usage(r) for r in rows)
-        print("🔴 capped" if have else "Claude · ⏳")
+        print("🔴" if any(has_usage(r) for r in claude_rows) else "Claude · ⏳")
     print("---")
     def barline(label, pct, meta=""):
         # Severity belongs to the gauge, not the clock: the bar and % carry the red/amber/green,
         # while the label and the reset text stay the menu's default color. That needs two colors on
         # one line, which `color=` can't do (it paints the whole item) — hence ANSI spans.
+        # Detail lines sit at the SAME indent as the account name (one cell under the provider header) —
+        # the name row and its bars share a left edge; only the ▶ marker ever hangs left of it.
         tail = f"  · {meta}" if meta else ""
-        print(f"    {label:<6} {color(pct)}{bar(pct)} {int(pct):>3}%{C['x']}{tail} "
+        print(f"{NB}{label:<6} {color(pct)}{bar(pct)} {int(pct):>3}%{C['x']}{tail} "
               f"| font=Menlo size=12 ansi=true")
-    for r in rows:
-        star = "▶ " if (r["uuid"] == rec_uuid and not on_best) else "  "
+    def xbar_claude_row(r):
+        # Account name one cell under the provider header; the ▶ pick-marker hangs in the col-0 margin
+        # to its left so the name column never shifts.
+        mark = "▶" if (r["uuid"] == rec_uuid and not on_best) else NB
+        lead = mark
         act  = " ·active" if r.get("active") else ""
         # Click-to-switch, no confirm — the account row itself is the target.
         switchable = not r.get("active") and not r.get("error")
@@ -602,11 +946,11 @@ def render_xbar(rows):
         if switchable:
             params += (f' bash="{os.path.realpath(__file__)}" param1=switch param2={r["uuid"]}'
                        f" terminal=false refresh=true")
-        print(f"{star}{xb(r['label'])}  {xb(plan_name(r))}{act}{hint} | {params}")
+        print(f"{lead}{xb(r['label']):<{xlw}}  {xb(plan_of(r))}{act}{hint} | {params}")
         if switchable:   # holding ⌥ swaps the row for what the click actually does
-            print(f"{star}⇄ Switch to {xb(r['label'])} | alternate=true {params}")
+            print(f"{lead}⇄ Switch to {xb(r['label'])} | alternate=true {params}")
         if r.get("error"):
-            print(f"    {xb(r['error'])} | color=#e5534b font=Menlo size=12"); print("---"); continue
+            print(f"{NB}{xb(r['error'])} | color=#e5534b font=Menlo size=12"); print("---"); return
         fh, wk = r["five_hour"], r["seven_day"]
         fp, wp = fh["pct"] or 0, wk["pct"] or 0
         scoped = [s for s in r.get("scoped", []) if s.get("pct") is not None]
@@ -616,17 +960,39 @@ def render_xbar(rows):
             barline(xb(s["model"] or "scoped")[:6], s["pct"], week_abs_label(wk) if i == 0 else "")
         sp = r.get("spend") or {}
         if sp.get("enabled") and sp.get("limit"):
-            print(f"    extra  {usd(sp['used'])} / {usd(sp['limit'])} used | color=#8b949e font=Menlo size=12")
+            print(f"{NB}extra  {usd(sp['used'])} / {usd(sp['limit'])} used | color=#8b949e font=Menlo size=12")
         print("---")
-    if on_best:
-        print(f"✓ On the right account · {xb(reason)} | color=#3fb950 font=Menlo size=12")
-    elif rec:
-        print(f"→ Use {xb(rec['label'])} · {xb(reason)} | color=#3fb950 font=Menlo size=12")
-    else:
-        print(f"{xb(reason)} | color=#d9a13b font=Menlo size=12")
-    if any(r.get("stale") for r in rows):
+    def xbar_codex_row(r, show_active):
+        # No switch affordance: this tool reads Codex, it doesn't drive `codex login`. The absence of ⇄
+        # under the CODEX header reads as a property of the group, which is why the grouping earns its line.
+        # Name and window rows share the same one-cell indent, matching the Claude section.
+        act = " ·signed in" if show_active and r.get("active") else ""
+        print(f"{NB}{xb(r['label']):<{xlw}}  {xb(plan_of(r))}{act} | font=Menlo size=13")
+        if r.get("error"):
+            print(f"{NB}{xb(r['error'])} | color=#e5534b font=Menlo size=12"); print("---"); return
+        for w in codex_display_windows(r):
+            if w.get("expired"):
+                print(f"{NB}{xb(w['label'])[:6]:<6} window reset — run codex to refresh | color=#8b949e font=Menlo size=12")
+            else:
+                barline(xb(w["label"])[:6], w["pct"] or 0, resets_phrase(w["resets_at"], "week"))
+        cr = r.get("credits") or {}
+        if cr.get("has") and cr.get("balance") not in (None, "0"):
+            print(f"{NB}credits {xb(cr['balance'])} | color=#8b949e font=Menlo size=12")
+        print("---")
+    groups = by_provider(rows)
+    multi = len(groups) > 1
+    for key, name, grp in groups:
+        if multi:
+            print(f"{name.upper()} | color=#8b949e font=Menlo size=11")
+            print("---")   # divider under the header, matching the one after every account below it
+        if key == "codex":
+            show_active = len(grp) > 1
+            for r in grp: xbar_codex_row(r, show_active)
+        else:
+            for r in grp: xbar_claude_row(r)
+    if any(r.get("stale") for r in claude_rows):
         print("⚠ last known values — rate-limited; updates on the next refresh | color=#d9a13b font=Menlo size=12")
-    if len([r for r in rows if not r.get("is_team")]) <= 1:
+    if len([r for r in claude_rows if not r.get("is_team")]) <= 1:
         print("＋ Log into another account with the claude CLI (claude → /login) to track it | color=#8b949e font=Menlo size=12")
     prob = last_problem()      # only failures reach the menu; success is visible in the bar itself
     if prob:
@@ -1022,10 +1388,11 @@ def cmd_doctor():
     # or rewrite the index. Reading a parked account can still rotate its refresh token — that is
     # inherent to reading its usage at all.
     rows = collect(ingest=False)
-    if not rows:
+    claude_rows = [r for r in rows if r.get("provider", "claude") == "claude"]   # Codex has its own section
+    if not claude_rows:
         say("warn", "no accounts registered yet",
             "sign into each account once with `claude` → /login.")
-    for r in sort_rows(rows):
+    for r in sort_rows(claude_rows):
         if r.get("error"):
             say("bad", f"{r['email']}: {r['error']}")
         elif r.get("active"):
@@ -1040,6 +1407,25 @@ def cmd_doctor():
         age = int((time.time() - ts) // 60)
         say("warn", f"usage numbers last fetched {age // 60}h {age % 60}m ago",
             "the menu-bar host may not be running.")
+
+    section("Codex")
+    if not os.path.exists(CODEX_AUTH):
+        say("warn", "no Codex sign-in found",
+            "optional — sign in with the codex CLI to track it here, or ignore if you don't use Codex.")
+    else:
+        codex_rows = [r for r in rows if r.get("provider") == "codex"]
+        live = next((r for r in codex_rows if r.get("active")), None)
+        if not live:
+            say("warn", "Codex auth found but its account couldn't be read",
+                "the codex CLI may be signed out; run `codex login`.")
+        elif live.get("error"):
+            say("warn", f"{live['email']}: {live['error']}", "run codex once so it logs a usage figure.")
+        else:
+            say("ok", f"{live['email']}: usage reads OK")
+        for r in codex_rows:
+            if not r.get("active") and not r.get("error"):
+                say("warn", f"{r['email']}: shown from a past snapshot",
+                    "sign back into it with codex to refresh.")
 
     section("Menu bar")
     app, pdir = host_and_plugin_dir()
