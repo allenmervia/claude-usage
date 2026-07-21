@@ -485,7 +485,8 @@ def codex_latest_usage():
     back through the newest CODEX_SCAN files, stopping at the first that yields a windowed reading.
     Past that budget we return None and the caller keeps the last stored figure (aged, not erased)."""
     try:
-        files = sorted(glob.glob(os.path.join(CODEX_SESSIONS, "*", "*", "*", "*.jsonl")),
+        # Recursive so we don't depend on the YYYY/MM/DD layout — any rollout under sessions/ is found.
+        files = sorted(glob.glob(os.path.join(CODEX_SESSIONS, "**", "*.jsonl"), recursive=True),
                        key=os.path.getmtime, reverse=True)
     except Exception:
         files = []
@@ -1494,7 +1495,8 @@ def cmd_setup():
     print("  • read the Claude account you're signed into (read-only) and register it")
     print("  • store each account's refresh token in your macOS Keychain — never in files or the repo")
     print("  • optionally add a menu-bar view (xbar / SwiftBar)")
-    print("It never changes or signs out your Claude Code session.\n")
+    print("It never changes or signs out your Claude Code session.")
+    print("If you use the Codex CLI, its usage shows automatically alongside — nothing to set up.\n")
     if not _ask("Proceed?", True):
         print("Aborted."); return
 

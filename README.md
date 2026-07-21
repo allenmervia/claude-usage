@@ -1,17 +1,20 @@
 # claude-usage
 
-See your 5-hour and weekly Claude usage across several accounts at a glance —
-without logging in and out or opening incognito windows to check each one.
+See your 5-hour and weekly Claude usage across several accounts at a glance — and
+your OpenAI Codex usage alongside — without logging in and out or opening incognito
+windows to check each one.
 
 If you run more than one Claude account (say a couple of Max subscriptions) and
 switch between them as you hit limits, this shows all of them side by side — as a
 macOS **menu-bar dropdown** that's always a glance away, or a terminal table — and
-tells you which account to use next. The menu bar is the main way to use it; the
-terminal command is the same data on demand.
+tells you which account to use next. If you also use the Codex CLI, its usage shows
+in its own group, read-only. The menu bar is the main way to use it; the terminal
+command is the same data on demand.
 
 ```
 Usage  · 2:14 PM
 
+── Claude ──────────────────────────────────────────────────
   allen        allen@example.com    Max 20x  [active]
     5-hour  ██░░░░░░░░   22%   3h 22m left
     weekly  ███████░░░   66%   5d left
@@ -24,20 +27,30 @@ Usage  · 2:14 PM
     5-hour  ░░░░░░░░░░    0%   idle
     weekly  █████████░   94%   3d 20h left
     Fable   ██████░░░░   57%   weekly resets Tue 5pm
+
+── Codex ───────────────────────────────────────────────────
+  allen        allen@example.com    Pro Lite
+    weekly  █████░░░░░   54%   Fri 8pm · 3d left
 ```
 
-Accounts are listed alphabetically, and the `▶` marks the account to use — not the
-top row. Here it's `allen-1`: of the accounts with real headroom it resets soonest, so
-use-it-or-lose-it says spend that capacity before it expires. `allen-2` is skipped —
+Accounts are listed alphabetically, and the `▶` marks the Claude account to use — not
+the top row. Here it's `allen-1`: of the accounts with real headroom it resets soonest,
+so use-it-or-lose-it says spend that capacity before it expires. `allen-2` is skipped —
 at 94% weekly there's almost nothing left to use. No `▶` at all means you're already
 on the best account. (The weekly line shows the countdown; the exact reset time rides
 on the Fable row, since the two share it.)
+
+Codex sits in its own group, read-only — no `▶` and no switching. The `── Claude ──` /
+`── Codex ──` headers appear only when you're tracking more than one provider; with
+Claude alone the list is ungrouped, exactly as before.
 
 ## Requirements
 
 - macOS (reads Claude usage tokens from the macOS Keychain)
 - Python 3.8+ (system `python3` is fine — no third-party packages)
 - [Claude Code](https://claude.com/claude-code), signed in to at least one account
+- Optional: the [Codex](https://openai.com/codex) CLI, signed in — its usage then
+  appears alongside, read-only (nothing to set up; see [Codex](#codex))
 
 ## Install
 
