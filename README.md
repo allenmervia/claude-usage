@@ -35,6 +35,26 @@ Usage  · 2:14 PM
 Accounts are listed alphabetically. (The weekly line shows the countdown; the exact
 reset time rides on the Fable row, since the two share it.)
 
+### The `~` on a weekly reset
+
+A weekly window opens on first use, so between a reset and your next request the
+endpoint reports no reset time — the row would otherwise go blank on exactly the
+account you just got a fresh week on.
+
+The reset time it reports once the window opens isn't seven days out; it's a fixed
+weekly boundary the account keeps across resets. So the last one seen is remembered
+and used to fill the gap:
+
+```
+    weekly  ░░░░░░░░░░    0%   ~6d 18h left
+    Fable   ░░░░░░░░░░    0%   weekly resets ~Wed 9pm
+```
+
+The `~` means projected, not reported. It disappears the moment the endpoint has a
+real answer, which then replaces the remembered boundary. A boundary older than eight
+weeks isn't projected at all — by then the account has been idle long enough that it
+may have moved unobserved, and `idle` is the honest answer.
+
 Codex sits in its own group, read-only — no switching. The `── Claude ──` /
 `── Codex ──` headers appear only when you're tracking more than one provider; with
 Claude alone the list is ungrouped, exactly as before.
@@ -122,6 +142,11 @@ It works by minting a fresh access token from that account's stored refresh toke
 writing it into Claude Code's Keychain item, so your next `claude` run *is* that
 account. The account you leave keeps its session — it just becomes a parked account
 you can switch back to.
+
+Claude Code keeps two separate things: the credential, which decides whose quota a
+request spends, and a cached copy of the account profile in `~/.claude.json`, which is
+what it shows you and reads the plan from. A switch writes both together, so the account
+`claude auth status` names is the account your usage lands on.
 
 ```bash
 claude-usage switch allen-1@example.com   # or its label / uuid
@@ -277,10 +302,11 @@ Two properties keep the reporting side safe:
   live falls back to matching the stored credential when the profile lookup can't be
   reached, so an expired token or a dropped network can't cause the live account to be
   mistaken for a parked one and refreshed.
-- The tool is a **live mirror** of the usage endpoint. It stores no usage numbers
-  and no reset schedule — only credentials and account identity. So if Anthropic
-  issues an out-of-band usage reset, it simply appears as lower usage on the next
-  refresh; there is nothing cached to fall out of sync.
+- The tool is a **live mirror** of the usage endpoint. It stores no usage numbers, so
+  if Anthropic issues an out-of-band usage reset, it simply appears as lower usage on
+  the next refresh. The one remembered schedule is each account's weekly boundary (see
+  [The `~` on a weekly reset](#the--on-a-weekly-reset)), which is only ever *shown*
+  when the endpoint reports none, and always marked as the guess it is.
 
 **Switching is the one exception, by design.** [Switching accounts](#switching-accounts)
 deliberately *writes* Claude Code's credential — that's the whole mechanism. It replaces
@@ -289,6 +315,12 @@ store Claude Code actually reads (Keychain, or `~/.claude/.credentials.json` for
 configured without it), and saves the previous credential first, so `claude-usage switch
 --undo` puts it back. If the write fails it says so rather than reporting a switch that
 didn't happen.
+
+It also replaces the `oauthAccount` key in `~/.claude.json` with the switched-to
+account's profile, built from the same `/profile` endpoint the rest of the tool reads.
+The rest of that file is preserved, the previous profile is saved for `--undo`, and if
+this write is the one that fails, the switch says so — a working switch that reads as
+the wrong account is worse discovered silently than reported.
 
 Nothing sensitive is written into the repo or into `~/.claude-usage/` — that
 directory holds only non-secret state (account identity, cached usage numbers, the

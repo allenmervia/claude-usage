@@ -43,7 +43,7 @@ Usage:
   claude-usage forget X   drop account by email or uuid
 """
 import sys, os, re, json, glob, time, getpass, subprocess, shutil, urllib.request, urllib.error
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 CLIENT_ID   = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 LIVE_SVC    = "Claude Code-credentials"       # Claude Code's own keychain item
@@ -275,14 +275,26 @@ def ingest_live(idx):
         existing = next((e for e in idx if e.get("uuid") == uuid), None)
         if existing and not is_team_entry(existing):
             return None
-    upsert(idx, {
+    entry = {
         "uuid": uuid,
         "email": acct.get("email", uuid),
         "label": acct.get("display_name") or acct.get("email", uuid),
         "tier":  org.get("rate_limit_tier"),          # e.g. default_claude_max_20x / _5x / pro
         "org_type": org.get("organization_type"),     # claude_max / claude_team / claude_enterprise
         "seat_tier": org.get("seat_tier"),            # non-null => a team/enterprise seat
-    })
+    }
+    # Keep a copy of Claude Code's own profile block for this account, so switching back to it can
+    # restore the keys /profile doesn't carry. Read it only when we haven't got one for this
+    # account: ~/.claude.json is the largest file either side touches and this runs on every
+    # refresh tick, while what we want from it changes only at login. Only take it when it names
+    # the account we just identified — the credential and the cached profile can disagree, and the
+    # credential is the one that decides whose account this is.
+    have = (next((e for e in idx if e.get("uuid") == uuid), None) or {}).get("profile") or {}
+    if have.get("accountUuid") != uuid:
+        prof_blob = read_live_profile()
+        if prof_blob and prof_blob.get("accountUuid") == uuid:
+            entry["profile"] = prof_blob
+    upsert(idx, entry)
     # keep this account's stored credentials current from the live keychain (full blob, so we can
     # write a faithful one back when switching to it)
     prev = load_secret(uuid)
@@ -298,6 +310,40 @@ def parse_dt(s):
     if not s: return None
     try: return datetime.fromisoformat(s.replace("Z", "+00:00"))
     except Exception: return None
+
+# ---- the weekly boundary ----------------------------------------------------
+# The weekly window opens on first use, so between a reset and the next request the endpoint reports
+# no reset time at all. The time it reports once the window does open is not seven days out — it is a
+# fixed weekly boundary the account has kept across resets. So the last one seen predicts the next,
+# and remembering it keeps an account's schedule on screen through the gap. A projection is always
+# marked as one: the boundary is inferred from observed behaviour, not something the API promises.
+
+WEEK = 7 * 86400
+ANCHOR_MAX_AGE = 8 * WEEK   # past this, the account has been idle long enough that a boundary moved
+                            # without us watching is likelier than the stale one still holding
+
+def project_weekly(anchor):
+    """The next occurrence of the weekly boundary `anchor` fell on, or None if it can't carry one."""
+    dt = parse_dt(anchor)
+    if not dt: return None
+    now = datetime.now(timezone.utc)
+    if (now - dt).total_seconds() > ANCHOR_MAX_AGE: return None
+    if dt > now: return dt.isoformat()
+    steps = int((now - dt).total_seconds() // WEEK) + 1
+    return (dt + timedelta(seconds=steps * WEEK)).isoformat()
+
+def apply_weekly_anchor(wk, entry):
+    """Record on `entry` the weekly reset this account just reported, or fill `wk` with the
+    projection when it reports none. True if the entry changed and the index needs saving."""
+    if wk.get("resets_at"):
+        if wk["resets_at"] == entry.get("weekly_anchor"):
+            return False
+        entry["weekly_anchor"] = wk["resets_at"]
+        return True
+    projected = project_weekly(entry.get("weekly_anchor"))
+    if projected:
+        wk["resets_at"], wk["projected"] = projected, True
+    return False
 
 def fetch_usage(uuid, token, active):
     """Return (usage_json, error). On a 401 for a parked account, force a token refresh and retry once."""
@@ -377,6 +423,7 @@ def _collect_live(ingest=True):
     idx = load_index()
     live = read_live()
     rows = []
+    anchors_moved = False
     for e in idx:
         uuid = e["uuid"]
         if uuid == active_uuid and live:
@@ -398,6 +445,7 @@ def _collect_live(ingest=True):
                     row["error"] = "usage response had no windows"
                 row["five_hour"] = {"pct": fh_u.get("utilization"), "resets_at": fh_u.get("resets_at")}
                 row["seven_day"] = {"pct": wk_u.get("utilization"), "resets_at": wk_u.get("resets_at")}
+                anchors_moved |= apply_weekly_anchor(row["seven_day"], e)
                 # dollar spend is a SEPARATE, opt-in thing (extra-usage credits / usage-based billing).
                 # It is disabled on most plans incl. standard team seats, so only surface it when enabled.
                 sp = (u or {}).get("spend") or {}
@@ -414,6 +462,8 @@ def _collect_live(ingest=True):
                                        "resets_at": lim.get("resets_at")})
                 row["scoped"] = scoped
         rows.append(row)
+    if anchors_moved and ingest:   # ingest=False is diagnostic: report the state, don't advance it
+        save_index(idx)
     rows += collect_codex(persist=ingest)   # Codex is read-only; persist mirrors Claude's ingest flag
     return rows
 
@@ -612,10 +662,18 @@ def resets_phrase(resets_at, style="week"):
         return f"{rel(dt)} left"
     return f"{local_short(dt)} · {rel(dt)} left"
 
+def wk_phrase(wk, style="week"):
+    """resets_phrase for the weekly window, marking a projected boundary with a leading ~ so it never
+    reads as a time the endpoint reported."""
+    wk = wk or {}
+    s = resets_phrase(wk.get("resets_at"), style)
+    return f"~{s}" if wk.get("projected") else s
+
 def week_abs_label(wk):
     """The absolute weekly reset, labeled — shown on the first scoped (e.g. Fable) row, which shares it."""
     dt = parse_dt((wk or {}).get("resets_at"))
-    return f"weekly resets {local_short(dt)}" if dt else ""
+    if not dt: return ""
+    return f"weekly resets {'~' if (wk or {}).get('projected') else ''}{local_short(dt)}"
 
 def bar(pct, width=10):
     pct = pct or 0
@@ -694,7 +752,7 @@ def _table_claude_row(r, w):
     fh, wk = r["five_hour"], r["seven_day"]
     fp, wp = fh["pct"] or 0, wk["pct"] or 0
     scoped = [s for s in r.get("scoped", []) if s.get("pct") is not None]
-    wk_meta = resets_phrase(wk['resets_at'], 'short') if scoped else resets_phrase(wk['resets_at'], 'week')
+    wk_meta = wk_phrase(wk, 'short') if scoped else wk_phrase(wk, 'week')
     print(f"    5-hour  {color(fp)}{bar(fp)} {str(int(fp)).rjust(3)}%{C['x']}   "
           f"{C['dim']}{resets_phrase(fh['resets_at'], 'short')}{C['x']}")
     print(f"    weekly  {color(wp)}{bar(wp)} {str(int(wp)).rjust(3)}%{C['x']}   "
@@ -934,7 +992,7 @@ def render_xbar(rows):
         fp, wp = fh["pct"] or 0, wk["pct"] or 0
         scoped = [s for s in r.get("scoped", []) if s.get("pct") is not None]
         barline("5-hour", fp, resets_phrase(fh["resets_at"], "short"))
-        barline("weekly", wp, resets_phrase(wk["resets_at"], "short") if scoped else resets_phrase(wk["resets_at"], "week"))
+        barline("weekly", wp, wk_phrase(wk, "short") if scoped else wk_phrase(wk, "week"))
         for i, s in enumerate(scoped):
             barline(xb(s["model"] or "scoped")[:6], s["pct"], week_abs_label(wk) if i == 0 else "")
         sp = r.get("spend") or {}
@@ -993,6 +1051,10 @@ def render_xbar(rows):
 
 # the pre-switch credential lives in the Keychain like every other secret — never in a file
 PREV_KEY = "__previous__"
+# A switch moves the credential and the profile together. When only the credential lands, the CLI
+# spends one account under another's name, so the partial result is reported rather than announced
+# as a clean success — including through the menu, which has no stdout to print to.
+MISMATCH_NOTE = " — but ~/.claude.json still names the other account, so the CLI will show that name"
 ACTION   = os.path.join(STATE_DIR, "last-problem.json")   # non-secret: just an error message
 LEGACY_ACTION = os.path.join(STATE_DIR, "last-action.json")   # pre-rename name; swept on write
 
@@ -1032,6 +1094,15 @@ def _fail(msg, kind="action"):
     record_problem(msg, kind)          # surfaced in the menu on the next render
     print(msg, file=sys.stderr); sys.exit(1)
 
+def _report_switch(msg, note):
+    """Announce a switch that went through. A note means it went through only in part, which the
+    menu has to be told about — a clicked item can't print."""
+    if note:
+        record_problem(msg + note, "switch")
+    else:
+        clear_problem("switch")
+    print(msg + note)
+
 ACCT_RE = re.compile(r'^\s*"acct"<blob>=(?:0x([0-9A-Fa-f]+)\s+)?"(.*)"\s*$')
 
 def live_account_attr():
@@ -1053,6 +1124,92 @@ def live_account_attr():
     return getpass.getuser()      # Claude Code uses the macOS username
 
 CRED_FILE = os.path.expanduser("~/.claude/.credentials.json")
+
+# ---- the live profile -------------------------------------------------------
+# The OAuth token says who you *are*; ~/.claude.json's oauthAccount is a cached copy of the profile
+# that Claude Code shows and reads its plan from. They are written independently, so switching only
+# the credential leaves the CLI spending the new account under the old account's name. Both move
+# together here.
+
+CLAUDE_JSON = os.path.expanduser("~/.claude.json")
+PROFILE_KEY = "oauthAccount"
+PREV_PROFILE = os.path.join(STATE_DIR, "previous-profile.json")   # non-secret: profile fields only
+
+def read_live_profile():
+    """Claude Code's cached profile for the live account, or None."""
+    try:
+        with open(CLAUDE_JSON) as f:
+            p = json.load(f).get(PROFILE_KEY)
+        return p if isinstance(p, dict) and p.get("accountUuid") else None
+    except Exception:
+        return None
+
+def write_live_profile(profile):
+    """Replace only oauthAccount, leaving the rest of ~/.claude.json byte-for-byte intact in value.
+
+    Read-modify-write on a file that running sessions also write is a race we can lose, so the
+    window is kept to one read and one atomic replace, and the file is never created from nothing:
+    a missing or unparseable ~/.claude.json means Claude Code owns a state we can't reconstruct.
+    """
+    try:
+        with open(CLAUDE_JSON) as f:
+            cur = json.load(f)
+        if not isinstance(cur, dict):
+            return False
+        mode = os.stat(CLAUDE_JSON).st_mode & 0o777
+    except Exception:
+        return False
+    cur[PROFILE_KEY] = profile
+    tmp = CLAUDE_JSON + ".claude-usage.tmp"
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+        os.fchmod(fd, mode)           # the open() mode is masked by umask; this is what preserves it
+        with os.fdopen(fd, "w") as f: json.dump(cur, f, indent=2)
+        os.replace(tmp, CLAUDE_JSON)
+        return True
+    except Exception:
+        try: os.remove(tmp)
+        except Exception: pass
+        return False
+
+# /profile's fields, in Claude Code's spelling: (oauthAccount key, section, section key)
+PROFILE_MAP = [
+    ("accountUuid",                 "account",      "uuid"),
+    ("emailAddress",                "account",      "email"),
+    ("displayName",                 "account",      "display_name"),
+    ("accountCreatedAt",            "account",      "created_at"),
+    ("organizationUuid",            "organization", "uuid"),
+    ("organizationName",            "organization", "name"),
+    ("organizationType",            "organization", "organization_type"),
+    ("organizationRateLimitTier",   "organization", "rate_limit_tier"),
+    ("seatTier",                    "organization", "seat_tier"),
+    ("billingType",                 "organization", "billing_type"),
+    ("hasExtraUsageEnabled",        "organization", "has_extra_usage_enabled"),
+    ("subscriptionCreatedAt",       "organization", "subscription_created_at"),
+    ("ccOnboardingFlags",           "organization", "cc_onboarding_flags"),
+    ("claudeCodeTrialEndsAt",       "organization", "claude_code_trial_ends_at"),
+    ("claudeCodeTrialDurationDays", "organization", "claude_code_trial_duration_days"),
+]
+
+def derive_profile(prof, base=None):
+    """An oauthAccount block for the account /profile just described. Every key /profile carries is
+    taken from it, so a snapshot can't reinstate an old plan or org; a snapshot fills in only the
+    keys /profile omits (organizationRole, workspaceRole), and only while it still describes the
+    same org — those are org-scoped, so once the org differs they describe nothing. Returns None if
+    the response has no account uuid to key it on."""
+    out = {}
+    for key, section, field in PROFILE_MAP:
+        sec = prof.get(section) or {}
+        if field in sec:
+            out[key] = sec[field]
+    if not out.get("accountUuid"):
+        return None
+    base = base or {}
+    if base.get("organizationUuid") == out.get("organizationUuid"):
+        for k, v in base.items():
+            out.setdefault(k, v)
+    out["profileFetchedAt"] = int(time.time() * 1000)
+    return out
 
 def live_store():
     """Where Claude Code keeps the live credential on this machine: 'keychain' or 'file'.
@@ -1112,9 +1269,22 @@ def cmd_switch(target):
         if not blob or not write_live(blob):
             _fail("couldn't restore the previous account — no writable credential store", "switch")
         keychain_delete(STORE_SVC, PREV_KEY)
+        try:
+            with open(PREV_PROFILE) as f: prev_prof = json.load(f)
+        except Exception:
+            prev_prof = None
+        # A credential restored without its profile is the mismatch this pairing exists to prevent,
+        # so a missing backup is as much a failure to report as a failed write.
+        if not prev_prof:
+            note = "" if not read_live_profile() else MISMATCH_NOTE
+        elif write_live_profile(prev_prof):
+            note = ""
+            try: os.remove(PREV_PROFILE)
+            except Exception: pass
+        else:
+            note = MISMATCH_NOTE
         clear_cache()
-        clear_problem("switch")
-        print("restored the previous account"); return
+        _report_switch(f"restored the previous account", note); return
 
     e = resolve_account(target)
     if not e:
@@ -1141,11 +1311,29 @@ def cmd_switch(target):
         _fail("no Claude Code credential store found — sign in with the claude CLI first", "switch")
     cur = read_live_raw()                             # back up (to the Keychain) before overwriting
     if cur: keychain_write(STORE_SVC, PREV_KEY, cur)
+    cur_prof = read_live_profile()                    # ditto for the profile, so --undo restores both
+    if cur_prof:
+        try:
+            os.makedirs(STATE_DIR, exist_ok=True)
+            with open(PREV_PROFILE, "w") as f: json.dump(cur_prof, f, indent=2)
+        except Exception:
+            pass
     if not write_live(blob):
         _fail(f"couldn't write the credential — switch to {e['email']} did not happen", "switch")
+
+    # The credential is the switch; the profile is the label on it. A failure here leaves a working
+    # switch that reads as the wrong account, which is worse to discover silently than to be told.
+    note = ""
+    if cur_prof:                      # nothing cached to correct means nothing to write
+        try:
+            new_prof = derive_profile(api_get(PROFILE_URL, token), e.get("profile"))
+        except Exception:
+            new_prof = e.get("profile")
+        if not new_prof or not write_live_profile(new_prof):
+            note = MISMATCH_NOTE
+
     clear_cache()                                     # so the post-switch refresh shows the new active account
-    clear_problem("switch")
-    print(f"switched to {e['email']}")
+    _report_switch(f"switched to {e['email']}", note)
 
 # ---- menu-bar install -------------------------------------------------------
 
