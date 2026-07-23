@@ -933,6 +933,11 @@ def render_xbar(rows):
         return
     claude_rows = sort_rows([r for r in rows if r.get("provider", "claude") == "claude"])
     xlw = min(14, max([6] + [len(r.get("label") or "") for r in rows if not r.get("error")]))  # align plan col
+    # Display names collide (several of one person's logins share a name), so each Claude row also
+    # carries its email — the real identity — padded so the plan column stays aligned, mirroring the
+    # CLI table. Plain text: xbar's ANSI parser has no gray/faint, and color= paints the whole line.
+    xew = min(26, max([0] + [len(r.get("email") or "") for r in claude_rows
+                             if not r.get("error") and "@" in (r.get("email") or "")]))
     # xbar trims leading whitespace from a menu title, and its trim set is the Unicode Zs category —
     # which includes the regular space AND the non-breaking space, so neither indents. U+2800 (the blank
     # Braille cell) renders as empty space but is category So, not Zs, so it survives the trim. All
@@ -983,9 +988,12 @@ def render_xbar(rows):
         if switchable:
             params += (f' bash="{os.path.realpath(__file__)}" param1=switch param2={r["uuid"]}'
                        f" terminal=false refresh=true")
-        print(f"{lead}{xb(r['label']):<{xlw}}  {xb(plan_of(r))}{act}{hint} | {params}")
+        em = r.get("email") or ""
+        em = em if "@" in em and em != r.get("label") else ""   # label falls back to the email — don't repeat it
+        mail = f"{xb(em):<{xew}}  " if xew else ""
+        print(f"{lead}{xb(r['label']):<{xlw}}  {mail}{xb(plan_of(r))}{act}{hint} | {params}")
         if switchable:   # holding ⌥ swaps the row for what the click actually does
-            print(f"{lead}⇄ Switch to {xb(r['label'])} | alternate=true {params}")
+            print(f"{lead}⇄ Switch to {xb(r['label'])}{'  ' + xb(em) if em else ''} | alternate=true {params}")
         if r.get("error"):
             print(f"{NB}{xb(r['error'])} | color=#e5534b font=Menlo size=12"); print("---"); return
         fh, wk = r["five_hour"], r["seven_day"]
