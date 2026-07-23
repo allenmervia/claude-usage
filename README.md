@@ -6,10 +6,9 @@ windows to check each one.
 
 If you run more than one Claude account (say a couple of Max subscriptions) and
 switch between them as you hit limits, this shows all of them side by side — as a
-macOS **menu-bar dropdown** that's always a glance away, or a terminal table — and
-tells you which account to use next. If you also use the Codex CLI, its usage shows
-in its own group, read-only. The menu bar is the main way to use it; the terminal
-command is the same data on demand.
+macOS **menu-bar dropdown** that's always a glance away, or a terminal table. If you
+also use the Codex CLI, its usage shows in its own group, read-only. The menu bar is
+the main way to use it; the terminal command is the same data on demand.
 
 ```
 Usage  · 2:14 PM
@@ -19,7 +18,7 @@ Usage  · 2:14 PM
     5-hour  ██░░░░░░░░   22%   3h 22m left
     weekly  ███████░░░   66%   5d left
     Fable   ███░░░░░░░   26%   weekly resets Sat 7am
-▶ allen-1      allen-1@example.com  Max 20x
+  allen-1      allen-1@example.com  Max 20x
     5-hour  ░░░░░░░░░░    5%   3h 9m left
     weekly  ████░░░░░░   35%   2d 10h left
     Fable   █░░░░░░░░░    7%   weekly resets Wed 9pm
@@ -33,14 +32,10 @@ Usage  · 2:14 PM
     weekly  █████░░░░░   54%   Fri 8pm · 3d left
 ```
 
-Accounts are listed alphabetically, and the `▶` marks the Claude account to use — not
-the top row. Here it's `allen-1`: of the accounts with real headroom it resets soonest,
-so use-it-or-lose-it says spend that capacity before it expires. `allen-2` is skipped —
-at 94% weekly there's almost nothing left to use. No `▶` at all means you're already
-on the best account. (The weekly line shows the countdown; the exact reset time rides
-on the Fable row, since the two share it.)
+Accounts are listed alphabetically. (The weekly line shows the countdown; the exact
+reset time rides on the Fable row, since the two share it.)
 
-Codex sits in its own group, read-only — no `▶` and no switching. The `── Claude ──` /
+Codex sits in its own group, read-only — no switching. The `── Claude ──` /
 `── Codex ──` headers appear only when you're tracking more than one provider; with
 Claude alone the list is ungrouped, exactly as before.
 
@@ -158,11 +153,11 @@ click the menu-bar icon → Refresh to update immediately. If Homebrew isn't ins
 it points you to https://xbarapp.com instead.
 
 The title is a pair of **ring gauges** — one per active provider (Claude on the left,
-Codex on the right), each filled by that account's worst window and tinted
-green/amber/red, so how close you are to a limit reads at a glance with no numbers to
-parse. The dropdown lists every account with its bars and resets, grouped by provider
-and tabbed under a `CLAUDE` / `CODEX` header, and marks the Claude account to switch to
-with `▶`.
+Codex on the right). Each ring is that account's **weekly** window, filled clockwise
+and tinted green/amber/red; the **pie in its centre** is the **5-hour** window, filled
+the same way in the same colors. So the slow budget and the burst budget each read at
+a glance, with no numbers to parse. The dropdown lists every account with its bars and
+resets, grouped by provider and tabbed under a `CLAUDE` / `CODEX` header.
 
 ### Refresh interval
 
@@ -209,7 +204,7 @@ Two limits interact, and they are not the same kind of thing:
 - The **weekly limit** is the scarce resource. It does not roll over: capacity you
   don't use before the weekly reset is gone. It is use-it-or-lose-it.
 
-From that, the strategy the tool recommends:
+From that, a strategy:
 
 1. **Use the account whose weekly limit resets soonest**, as long as it still has
    both 5-hour and weekly headroom. Its unused weekly capacity is about to expire
@@ -218,11 +213,7 @@ From that, the strategy the tool recommends:
    Don't bounce between accounts for a single message each — starting an account
    opens a fresh 5-hour window, so drain one before moving on.
 3. **Staggered weekly resets are an asset.** If your accounts reset on different
-   days, one is almost always fresh. The tool sorts by soonest weekly reset so the
-   rotation falls out naturally.
-
-The `▶` marker points at the account this rule selects right now, so you don't have to
-work it out yourself. When you're already on that account, there's no marker at all.
+   days, one is almost always fresh.
 
 ## Account types
 

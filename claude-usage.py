@@ -66,8 +66,6 @@ CODEX_AUTH     = os.path.join(CODEX_HOME, "auth.json")
 CODEX_SESSIONS = os.path.join(CODEX_HOME, "sessions")
 CODEX_INDEX    = os.path.join(STATE_DIR, "codex-accounts.json")   # opportunistic registry, keyed by account_id
 CODEX_SCAN     = 60        # newest session files to search for a usable reading before giving up (see below)
-FH_NEAR = 90   # at/above this 5-hour %, an account is treated as unusable *right now*
-WK_NEAR = 90   # at/above this weekly %, an account has too little runway to recommend
 COOLDOWN = 30  # s — rapid re-refreshes within this window reuse the last result, sparing the API
 # The menu-bar host reads the refresh cadence from the "5m" in the plugin filename; we own the
 # symlink in its folder, so changing the interval is a rename of that link. PLUGIN_FILE is the
@@ -419,32 +417,6 @@ def _collect_live(ingest=True):
     rows += collect_codex(persist=ingest)   # Codex is read-only; persist mirrors Claude's ingest flag
     return rows
 
-def recommend(rows):
-    # Only Claude accounts are switchable from here, so the "use this one" pick is Claude-only;
-    # Codex rows are informational. Per-provider by construction — there's nothing to rank across.
-    rows = [r for r in rows if r.get("provider", "claude") == "claude"]
-    def wk(r):   return parse_dt(r.get("seven_day", {}).get("resets_at")) or datetime.max.replace(tzinfo=timezone.utc)
-    def fh(r):   return parse_dt(r.get("five_hour", {}).get("resets_at")) or datetime.max.replace(tzinfo=timezone.utc)
-    def wpct(r): return (r.get("seven_day") or {}).get("pct")
-    def fpct(r): return (r.get("five_hour") or {}).get("pct")
-    ok = [r for r in rows if not r.get("error") and wpct(r) is not None]
-    viable    = [r for r in ok if (wpct(r) or 0) < 100]                 # weekly headroom left
-    usable    = [r for r in viable if (fpct(r) or 0) < FH_NEAR]         # ...and can work right now
-    healthy   = [r for r in usable if (wpct(r) or 0) < WK_NEAR]         # ...with real weekly runway
-    pool = healthy or usable                                           # prefer real runway; fall back if none
-    if pool:
-        # use-it-or-lose-it among accounts worth using: drain the one whose weekly resets soonest.
-        best = sorted(pool, key=lambda r: (wk(r), fpct(r) or 0))[0]
-        left = 100 - int(wpct(best) or 0)
-        return best["uuid"], f"{left}% weekly left"
-    if viable:
-        nxt = sorted(viable, key=fh)[0]
-        return None, f"every account with weekly headroom is near its 5-hour cap; {nxt['label']}'s resets first (in {rel(fh(nxt))})"
-    if ok:
-        nxt = sorted(ok, key=wk)[0]
-        return None, f"all accounts are weekly-capped; {nxt['label']}'s weekly resets first (in {rel(wk(nxt))})"
-    return None, "no usage data"
-
 # ---- codex (openai) ---------------------------------------------------------
 # Codex reports the same thing Claude does — percent of a rate-limit window used, and when it resets —
 # but through different plumbing: no API, a single-account auth.json, and usage buried in session logs.
@@ -672,8 +644,7 @@ def usd(minor):
     return None if minor is None else f"${minor/100:.0f}"
 
 def sort_rows(rows):
-    # stable alphabetical order so the list doesn't reshuffle as reset times change;
-    # the ▶ marker (not position) points at the recommended account.
+    # stable alphabetical order so the list doesn't reshuffle as reset times change
     return sorted(rows, key=lambda r: (r.get("label") or r.get("email") or "").lower())
 
 PROVIDERS = [("claude", "Claude"), ("codex", "Codex")]
@@ -689,14 +660,19 @@ def by_provider(rows):
 def plan_of(row):
     return codex_plan_name(row.get("plan")) if row.get("provider") == "codex" else plan_name(row)
 
-def codex_worst_pct(rows):
-    """Worst live window of the Codex account you're signed into — what the menu-bar ring reports.
-    Parked (non-active) Codex snapshots are shown in the dropdown but never drive the title, so the
-    ring always reflects the provider you're actually on."""
+def codex_ring_spec(rows):
+    """Menu-bar (ring pct, pie pct) for the Codex account you're signed into: the ring is the longest
+    window (weekly), the centre pie the shortest (5-hour) when the account has more than one. Windows
+    arrive sorted short→long, so the ends of the list are those two. Parked (non-active) Codex
+    snapshots are shown in the dropdown but never drive the title, so the ring always reflects the
+    provider you're actually on. None when neither has a live reading — callers rely on a returned
+    pair carrying at least one number."""
     active = next((r for r in rows if r.get("provider") == "codex" and r.get("active")), None)
     if not active: return None
-    pcts = [w["pct"] for w in codex_display_windows(active) if w.get("pct") is not None]
-    return max(pcts) if pcts else None
+    wins = codex_display_windows(active)
+    ring = wins[-1]["pct"] if wins else None
+    pie = wins[0]["pct"] if len(wins) > 1 else None
+    return None if ring is None and pie is None else (ring, pie)
 
 def _col_widths(rows):
     """Label/email column widths that fit the actual names, so the plan column lines up down both
@@ -706,11 +682,10 @@ def _col_widths(rows):
     ew = min(26, max([6] + [len(r.get("email") or "") for r in ok]))
     return lw, ew
 
-def _table_claude_row(r, rec_uuid, on_best, w):
+def _table_claude_row(r, w):
     lw, ew = w
-    # Name at col 2 under the provider header; the ▶ pick-marker sits in the margin to its left.
-    mark = f"{C['g']}▶{C['x']}" if (r["uuid"] == rec_uuid and not on_best) else " "
-    head = (f"{mark} {C['b']}{r['label']:<{lw}}{C['x']} {C['dim']}{r['email']:<{ew}}{C['x']}"
+    # Name at col 2 under the provider header, matching the Codex section.
+    head = (f"  {C['b']}{r['label']:<{lw}}{C['x']} {C['dim']}{r['email']:<{ew}}{C['x']}"
             f"  {C['cyan']}{plan_of(r)}{C['x']}")
     if r.get("active"): head += f"  {C['cyan']}[active]{C['x']}"
     print(head)
@@ -762,9 +737,6 @@ def render_table(rows):
         return
     def is_claude(r): return r.get("provider", "claude") == "claude"   # pre-Codex cached rows have no field
     groups = by_provider(rows)
-    rec_uuid, _ = recommend(rows)
-    active_uuid = next((r["uuid"] for r in rows if is_claude(r) and r.get("active")), None)
-    on_best = rec_uuid is not None and rec_uuid == active_uuid   # already on the pick — nothing to switch to
     print(f"\n{C['b']}Usage{C['x']}  {C['dim']}· {datetime.now().astimezone().strftime('%-I:%M %p')}{C['x']}\n")
     multi = len(groups) > 1   # only label the sections when there's more than one provider to tell apart
     w = _col_widths(rows)     # shared across sections so the plan column lines up throughout
@@ -775,7 +747,7 @@ def render_table(rows):
             show_active = len(grp) > 1
             for r in grp: _table_codex_row(r, show_active, w)
         else:
-            for r in grp: _table_claude_row(r, rec_uuid, on_best, w)
+            for r in grp: _table_claude_row(r, w)
     if any(r.get("stale") for r in rows if is_claude(r)):
         print(f"{C['y']}⚠ Showing last known values — the usage API rate-limited this refresh.{C['x']}\n")
     n = len([r for r in rows if is_claude(r) and not r.get("is_team")])
@@ -785,17 +757,16 @@ def render_table(rows):
               f"(`claude` → /login) to add them.{C['x']}\n")
 
 def render_json(rows):
-    rec_uuid, reason = recommend(rows)
     print(json.dumps({"accounts": sort_rows(rows),
-                      "recommend": {"uuid": rec_uuid, "reason": reason},
                       "generated_at": datetime.now(timezone.utc).isoformat()}, indent=2))
 
 # ---- menu-bar icon (dynamic ring gauges) ------------------------------------
-# xbar/SwiftBar render a base64 PNG placed after `| image=` on the title line. We draw one ring per
-# active provider — Claude, then Codex — each filled clockwise from 12 o'clock by that account's worst
-# window and tinted green/amber/red, so the icon itself shows how close you are before the numbers are
-# read. Pure stdlib: a hand-rolled PNG writer plus a supersampled rasteriser, no Pillow dependency. Any
-# failure returns None and the title falls back to the emoji dot.
+# xbar/SwiftBar render a base64 PNG placed after `| image=` on the title line. We draw one gauge per
+# active provider — Claude, then Codex. Each gauge carries the account's two windows separately: the
+# ring is the weekly window, filled clockwise from 12 o'clock, and a pie in its centre is the 5-hour
+# window, filled the same way — both tinted green/amber/red, so slow budget and burst budget each
+# read at a glance before the numbers are. Pure stdlib: a hand-rolled PNG writer plus a supersampled rasteriser, no Pillow
+# dependency. Any failure returns None and the title falls back to the emoji dot.
 
 RING_RGB = {"g": (63, 185, 80), "y": (217, 161, 59), "r": (229, 83, 75), "dim": (130, 138, 148)}
 
@@ -819,41 +790,52 @@ def _png(w, h, rgba, ppm=0):
     return out + chunk(b"IDAT", zlib.compress(bytes(raw), 9)) + chunk(b"IEND", b"")
 
 def menu_icon_b64(specs, scale=4):
-    """specs: one pct per ring (0-100, or None for an unknown/idle ring). Returns a base64 PNG, or None
-    on any failure. `scale` is the pixel density: higher = crisper on a retina menu bar (xbar draws the
-    bitmap near 1:1, so it needs the extra pixels), at the cost of a larger bitmap."""
+    """specs: one (ring pct, pie pct) pair per gauge — ring is the weekly window, centre pie the
+    5-hour (each 0-100, or None: a dim ring / no pie). Returns a base64 PNG, or None on any failure. `scale`
+    is the pixel density: higher = crisper on a retina menu bar (xbar draws the bitmap near 1:1, so it
+    needs the extra pixels), at the cost of a larger bitmap."""
     if not specs: return None
     try:
         import math, base64
         SS = 3                                          # supersample, then box-downsample for smooth edges
-        D, GAP, TH, PAD = 10, 3, 1.7, 1                 # ring diameter / gap / thickness / padding, in points
+        D, GAP, TH, RPIE, PAD = 10, 3, 1.7, 2.2, 1      # ring diameter / gap / thickness / centre-pie radius / padding, in points
         n = len(specs)
         W = (PAD * 2 + n * D + (n - 1) * GAP) * scale
         H = (PAD * 2 + D) * scale
         rw, rh = W * SS, H * SS
         px = bytearray(rw * rh * 4)
-        for i, pct in enumerate(specs):
+        def clamp01(p): return max(0.0, min(1.0, (p or 0) / 100.0))
+        for i, (pct, pie_pct) in enumerate(specs):
             r0, g0, b0 = _ring_rgb(pct)
-            frac = max(0.0, min(1.0, (pct or 0) / 100.0))
+            frac = clamp01(pct)
             cx = (PAD + D / 2 + i * (D + GAP)) * scale * SS
             cy = (PAD + D / 2) * scale * SS
             rO = (D / 2) * scale * SS
             rI = (D / 2 - TH) * scale * SS
+            rP = RPIE * scale * SS
+            p0, p1, p2 = _ring_rgb(pie_pct)
             # rounded caps: a filled disc of radius TH/2 at each end of the arc (top, and the frac angle).
             rM, capR = (rO + rI) / 2, (rO - rI) / 2
             th = frac * 2 * math.pi
             sX, sY = cx, cy - rM
             eX, eY = cx + rM * math.sin(th), cy - rM * math.cos(th)
+            pie_frac = clamp01(pie_pct)
             for y in range(max(0, int(cy - rO - 1)), min(rh, int(cy + rO + 2))):
                 for x in range(max(0, int(cx - rO - 1)), min(rw, int(cx + rO + 2))):
                     dx, dy = x - cx, y - cy
                     d = math.hypot(dx, dy)
-                    if d > rO or d < rI: continue
+                    in_pie = pie_pct is not None and d <= rP
+                    if not in_pie and (d > rO or d < rI): continue
                     a = (math.atan2(dx, -dy) % (2 * math.pi)) / (2 * math.pi)   # 0 at top, clockwise
+                    o = (y * rw + x) * 4
+                    if in_pie:
+                        # centre pie: the 5-hour window — a wedge filled clockwise from 12 o'clock by
+                        # its pct, the rest a faint track, mirroring the ring's fill language.
+                        px[o], px[o + 1], px[o + 2], px[o + 3] = p0, p1, p2, (255 if a <= pie_frac else 55)
+                        continue
                     fill = a <= frac
                     if not fill and 0 < frac < 1:        # round the two ends
                         fill = math.hypot(x - sX, y - sY) <= capR or math.hypot(x - eX, y - eY) <= capR
-                    o = (y * rw + x) * 4
                     px[o], px[o + 1], px[o + 2], px[o + 3] = r0, g0, b0, (255 if fill else 55)
         out = bytearray(W * H * 4)                      # alpha-weighted downsample (clean anti-aliased edges)
         for y in range(H):
@@ -891,35 +873,33 @@ def render_xbar(rows):
         print("No accounts found — run: claude → /login | color=#d9a13b font=Menlo size=12")
         print("Refresh now | refresh=true")
         return
-    rec_uuid, _ = recommend(rows)
     claude_rows = sort_rows([r for r in rows if r.get("provider", "claude") == "claude"])
-    rec = next((r for r in claude_rows if r["uuid"] == rec_uuid), None)
-    active_uuid = next((r["uuid"] for r in claude_rows if r.get("active")), None)
-    on_best = rec_uuid is not None and rec_uuid == active_uuid   # already on the pick — no switch to suggest
     xlw = min(14, max([6] + [len(r.get("label") or "") for r in rows if not r.get("error")]))  # align plan col
     # xbar trims leading whitespace from a menu title, and its trim set is the Unicode Zs category —
     # which includes the regular space AND the non-breaking space, so neither indents. U+2800 (the blank
     # Braille cell) renders as empty space but is category So, not Zs, so it survives the trim. All
     # dropdown indentation is built from it, which is what finally makes the tabbed hierarchy show.
     NB = "\u2800"
-    # menu-bar title: just the ring gauges — one per active provider (Claude, then Codex), each filled
-    # by that account's worst window. No numbers; the rings carry fill + severity, position carries which
-    # provider. If the PNG can't be built, fall back to one severity dot per provider (still no numbers).
+    # menu-bar title: just the ring gauges — one per active provider (Claude, then Codex). Each ring is
+    # that account's weekly window; the pie in its centre is the 5-hour window. No numbers; fill +
+    # severity carry the state, position carries which provider. If the PNG can't be built, fall back
+    # to one severity dot per provider, colored by its worst window (still no numbers).
     def has_usage(r): return not r.get("error") and (r.get("five_hour") or {}).get("pct") is not None
     def dot(p): return "🟢" if p < 65 else ("🟡" if p < 90 else "🔴")
-    head = next((r for r in claude_rows if r.get("active") and has_usage(r)), None) or (rec if rec and has_usage(rec) else None)
-    cw = codex_worst_pct(rows)
+    # the gauge tracks the account you're actually on, matching the Codex rule below
+    head = next((r for r in claude_rows if r.get("active") and has_usage(r)), None)
     specs = []
     if head:
-        fp = head["five_hour"]["pct"] or 0; wp = head["seven_day"]["pct"] or 0
-        specs = [max(fp, wp)] + ([cw] if cw is not None else [])
-    elif cw is not None:
-        specs = [cw]
+        specs.append((head["seven_day"]["pct"] or 0, head["five_hour"]["pct"] or 0))
+    cs = codex_ring_spec(rows)
+    if cs is not None:
+        specs.append(cs)
     img = menu_icon_b64(specs)
     if img:
         print(f"|image={img}")
     elif specs:
-        print("".join(dot(p) for p in specs))          # dot per provider, same order as the rings
+        # worst window of each gauge's pair, same order as the rings
+        print("".join(dot(max(v for v in s if v is not None)) for s in specs))
     else:
         print("🔴" if any(has_usage(r) for r in claude_rows) else "Claude · ⏳")
     print("---")
@@ -928,15 +908,13 @@ def render_xbar(rows):
         # while the label and the reset text stay the menu's default color. That needs two colors on
         # one line, which `color=` can't do (it paints the whole item) — hence ANSI spans.
         # Detail lines sit at the SAME indent as the account name (one cell under the provider header) —
-        # the name row and its bars share a left edge; only the ▶ marker ever hangs left of it.
+        # the name row and its bars share a left edge.
         tail = f"  · {meta}" if meta else ""
         print(f"{NB}{label:<6} {color(pct)}{bar(pct)} {int(pct):>3}%{C['x']}{tail} "
               f"| font=Menlo size=12 ansi=true")
     def xbar_claude_row(r):
-        # Account name one cell under the provider header; the ▶ pick-marker hangs in the col-0 margin
-        # to its left so the name column never shifts.
-        mark = "▶" if (r["uuid"] == rec_uuid and not on_best) else NB
-        lead = mark
+        # Account name one cell under the provider header, matching the Codex section.
+        lead = NB
         act  = " ·active" if r.get("active") else ""
         # Click-to-switch, no confirm — the account row itself is the target.
         switchable = not r.get("active") and not r.get("error")
