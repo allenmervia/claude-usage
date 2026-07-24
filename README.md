@@ -57,7 +57,8 @@ weeks isn't projected at all — by then the account has been idle long enough t
 may have moved unobserved, and `idle` is the honest answer.
 
 The `── Claude ──` / `── Codex ──` headers appear only when you're tracking more than
-one provider; with Claude alone the list is ungrouped, exactly as before.
+one provider; with Claude alone the list is ungrouped, since there is nothing to tell
+it apart from.
 
 ## Requirements
 
@@ -125,10 +126,10 @@ claude-usage interval N set the menu-bar refresh cadence (1m / 5m / 10m / 30m)
 claude-usage --json     machine-readable JSON
 claude-usage --xbar     xbar / SwiftBar menu-bar format
 claude-usage capture    register the active account now (same as any run)
-claude-usage list       list registered accounts
+claude-usage list       list registered accounts, Claude and Codex
 claude-usage switch X   switch the CLI to that account (see below)
 claude-usage switch --undo   put the previous account back
-claude-usage forget X   drop an account by email or uuid (and delete its stored token)
+claude-usage forget X   drop an account by email, label or id (and delete its stored credential)
 ```
 
 ## Switching accounts
@@ -161,9 +162,10 @@ is why clicking a row in the menu is always unambiguous.
 
 Two things to know:
 
-- **An account must be logged into once (with the `claude` CLI) before you can switch
-  to it**, so the tool has its full credentials stored. Until then the menu says so
-  rather than writing a partial credential.
+- **An account must be logged into once before you can switch to it**, so the tool has
+  its full credentials stored — with the `claude` CLI for a Claude account, `codex
+  login` for a Codex one. Until then the menu says so rather than writing a partial
+  credential.
 - **This switches the CLI account**, not the desktop app — the desktop app keeps its
   credentials in its own sandbox, out of reach (see [Registering your accounts](#registering-your-accounts)).
 
@@ -265,7 +267,7 @@ it's the *only* context that login has.
 
 If you use [Codex](https://openai.com/codex) too, its usage appears in its own
 section, under the Claude accounts, and its accounts switch the same way Claude's do —
-click the row in the menu, or `claude-usage switch <email>`. The account Codex is
+click the row in the menu, or `claude-usage switch codex:<email>`. The account Codex is
 currently on carries the ▶ marker, the same as on the Claude side.
 
 Codex has no usage API, so the numbers come from Codex's own session logs. Identity
@@ -295,7 +297,12 @@ directories aren't auto-discovered; point the tool at one with
 
 Codex keeps its whole credential in one file, so a switch is a file swap: each
 account's `~/.codex/auth.json` is stashed in the Keychain as it's seen and written
-back on the way in. Two differences follow.
+back on the way in. That stash is a copy of a live credential, so every run makes one
+for the signed-in Codex account — the Claude side has always kept refresh tokens the
+same way, and it is what lets you return to an account later. `claude-usage forget
+codex:<email>` deletes an account's copy along with its entry.
+
+Two differences from a Claude switch follow.
 
 - **No refresh of our own.** Claude accounts get a fresh access token minted before
   the switch; Codex tokens are handed over as captured and the `codex` CLI refreshes
@@ -306,7 +313,9 @@ back on the way in. Two differences follow.
   be overwritten by it. Quit `codex` first. (The same is true of `claude` and a Claude
   switch.)
 
-`claude-usage switch --undo` reverses the last switch, whichever provider it was.
+`claude-usage switch --undo` reverses the last switch, whichever provider it was. Each
+provider keeps its own backup, so once one has been undone, a further `--undo` reaches
+the other's — an earlier Claude switch stays reversible after a Codex one is put back.
 
 ## How it works, and why it can't desync your session
 
@@ -348,9 +357,9 @@ this write is the one that fails, the switch says so — a working switch that r
 the wrong account is worse discovered silently than reported.
 
 Nothing sensitive is written into the repo or into `~/.claude-usage/` — that
-directory holds only non-secret state (account identity, cached usage numbers, the
-last failure's message). **Every credential, including the pre-switch backup, lives in
-the Keychain.**
+directory holds only non-secret state (account identity, cached usage numbers, the last
+failure's message, which provider was switched last). **Every credential, including
+the pre-switch backup, lives in the Keychain.**
 
 ## Caveats
 

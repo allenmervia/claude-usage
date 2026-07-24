@@ -631,9 +631,12 @@ def codex_store_auth(aid, raw):
         return True
     return keychain_write(STORE_SVC, codex_key(aid), raw)
 
+CODEX_AUTH_KEYS = ("tokens", "auth_mode", "last_refresh", "OPENAI_API_KEY")
+
 def codex_write_auth(raw):
-    """Install a stashed auth.json as the signed-in one. Replaces the credential fields and keeps
-    whatever else the current file holds (an OPENAI_API_KEY set outside this tool, say)."""
+    """Install a stashed auth.json as the signed-in one. Every field that identifies or authenticates
+    an account comes from the incoming blob — including OPENAI_API_KEY, which is that account's key
+    and must not survive from the one being displaced. Anything else in the file is left as found."""
     try:
         new = json.loads(raw)
         if not isinstance(new, dict) or not isinstance(new.get("tokens"), dict): return False
@@ -644,8 +647,9 @@ def codex_write_auth(raw):
         if not isinstance(cur, dict): cur = {}
     except Exception:
         cur = {}
-    for k in ("tokens", "auth_mode", "last_refresh"):
+    for k in CODEX_AUTH_KEYS:
         if k in new: cur[k] = new[k]
+        else: cur.pop(k, None)      # absent upstream means unset, not "keep the old account's"
     try:
         os.makedirs(CODEX_HOME, exist_ok=True)
         tmp = CODEX_AUTH + ".tmp"
@@ -691,8 +695,9 @@ def codex_boundary(idx, aid):
     still land on the wrong account — at most one refresh interval of it. `switch` doesn't rely on
     this, recording the exact instant it moves the credential.
 
-    A registry that has never recorded a sighting (every account predates this) yields no boundary,
-    which keeps the single-account reading exactly as it was.
+    A registry with no other sighting to bound against — one account, or a registry that predates
+    this field — yields no boundary: with nothing to have signed in from, every reading found is
+    that account's own.
     """
     seen = [e["last_seen_live"] for a, e in idx.items()
             if a != aid and isinstance(e, dict) and isinstance(e.get("last_seen_live"), (int, float))]
@@ -742,6 +747,8 @@ def collect_codex(persist=True):
             "email": e.get("email") or aid, "label": codex_label(e.get("email"), e.get("name"), aid),
             "plan": e.get("plan"), "windows": wins, "as_of": e.get("as_of"),
             "credits": e.get("credits"), "active": aid == live_aid,
+            # one `security` read per parked account: the Keychain has no bulk listing that returns
+            # every match, so existence is asked per account
             "switchable": aid != live_aid and bool(keychain_read(STORE_SVC, codex_key(aid))),
             "error": None if (wins or e.get("as_of")) else "no usage recorded yet — run codex once",
         })
@@ -1412,6 +1419,29 @@ def codex_resolve(key):
             return {**e, "account_id": aid}
     return None
 
+CODEX_PREFIX = "codex:"
+
+def resolve_target(key):
+    """(provider, entry, note) for a name typed at the CLI, or (None, None, note).
+
+    One email commonly names an account on both providers, so `codex:` in front picks the Codex one;
+    a bare name that matches both takes Claude and carries a note saying how to reach the other. Every
+    command that accepts an account name resolves through here, so the prefix and the collision
+    behave the same wherever a name is typed.
+    """
+    k = (key or "").strip()
+    if k.lower().startswith(CODEX_PREFIX):
+        bare = k[len(CODEX_PREFIX):]
+        e = codex_resolve(bare)
+        return ("codex", e, None) if e else (None, None, f"unknown Codex account: {bare}")
+    claude, codex = resolve_account(k), codex_resolve(k)
+    if claude and codex:
+        return "claude", claude, (f"note: Codex also has {codex.get('email') or k} — "
+                                  f"use `{CODEX_PREFIX}{k}` for that one")
+    if claude: return "claude", claude, None
+    if codex:  return "codex", codex, None
+    return None, None, f"unknown account: {k}"
+
 def codex_mark_signed_in(aid):
     """Record the sign-in boundary the moment the credential lands, so a render between the switch
     and the next capture doesn't credit this account with the previous one's usage."""
@@ -1433,7 +1463,9 @@ def cmd_codex_switch(e):
     if cur and cur_aid:
         if not codex_store_auth(cur_aid, cur):     # keep the outgoing account switchable-back-to
             _fail("couldn't stash the current Codex credential — unlock the Keychain and retry", "switch")
-        if not keychain_write(STORE_SVC, CODEX_PREV_KEY, cur):
+        # compact, matching the stash: `security` hands back a newline-bearing secret hex-encoded,
+        # and one encoding for one kind of blob keeps a backup comparable to a stash
+        if not keychain_write(STORE_SVC, CODEX_PREV_KEY, json.dumps(json.loads(cur), separators=(",", ":"))):
             _fail("couldn't back up the current Codex credential — switch did not happen", "switch")
     else:
         # Nothing identifiable is being displaced (signed out, or a file we can't read). Drop any
@@ -1461,24 +1493,20 @@ def cmd_codex_undo():
     _report_switch("restored the previous Codex account", "")
 
 def cmd_switch(target):
-    # One email can name an account on both providers, so `codex:` forces the Codex one. Without it
-    # a name that matches both goes to Claude, and the switch says the other reading was available.
-    forced = target.lower().startswith("codex:") and target.lower() != CODEX_PREV_KEY
-    if forced:
-        target = target.split(":", 1)[1]
-        e = codex_resolve(target)
-        if not e:
-            _fail(f"unknown Codex account: {target}", "switch")
-        cmd_codex_switch(e); return
-    if target == "--undo" and last_switch_provider() == "codex":
-        cmd_codex_undo(); return
-    if target not in ("--undo", ""):
-        claude, codex = resolve_account(target), codex_resolve(target)
-        if codex and not claude:
-            cmd_codex_switch(codex); return
-        if codex and claude:
-            print(f"note: Codex also has {codex.get('email') or target} — "
-                  f"switch it with `codex:{target}`", file=sys.stderr)
+    # Undo reverses the last switch, so it follows the marker — but only while that provider still
+    # holds a backup. Once a Codex undo has consumed its own, an earlier Claude switch is still
+    # undoable, and falling through is what keeps it reachable.
+    if target == "--undo":
+        if last_switch_provider() == "codex" and keychain_read(STORE_SVC, CODEX_PREV_KEY):
+            cmd_codex_undo(); return
+    elif target:
+        provider, e, note = resolve_target(target)
+        if note and not e:
+            _fail(note, "switch")
+        if note:
+            print(note, file=sys.stderr)
+        if provider == "codex":
+            cmd_codex_switch(e); return
     if target == "--undo":
         prev = keychain_read(STORE_SVC, PREV_KEY)
         if not prev:
@@ -1814,7 +1842,10 @@ def cmd_doctor():
         for r in codex_rows:
             if r.get("active"): continue
             if r.get("switchable"):
-                say("ok", f"{r['email']}: parked — switch to it with `claude-usage switch {r['email']}`")
+                # the prefix unconditionally: an email registered on both providers resolves to
+                # Claude without it, so the command we print would switch the other provider
+                say("ok", f"{r['email']}: parked — switch to it with "
+                          f"`claude-usage switch {CODEX_PREFIX}{r['email']}`")
             else:
                 say("warn", f"{r['email']}: shown from a past snapshot, and switching to it won't work",
                     "sign into it with `codex login` once to capture its credential.")
@@ -1947,24 +1978,25 @@ def main():
         return
     if arg == "forget":
         key = sys.argv[2] if len(sys.argv) > 2 else ""
-        ce = codex_resolve(key)
-        if ce and not resolve_account(key):
-            aid = ce["account_id"]
+        provider, e, note = resolve_target(key)
+        if not e:
+            print(note, file=sys.stderr); sys.exit(1)
+        if note: print(note, file=sys.stderr)            # names both providers; `codex:` picks the other
+        # forget acts on the resolved account, so every name that switches also forgets — matching
+        # the key again here would drop a label the resolver accepts
+        who = e.get("email") or e.get("account_id") or e.get("uuid")
+        if provider == "codex":
+            aid = e["account_id"]
             idx = load_codex_index(); idx.pop(aid, None); save_codex_index(idx)
-            if not keychain_delete(STORE_SVC, codex_key(aid)):
-                print(f"  warning: couldn't delete {ce.get('email') or aid}'s Keychain item — "
-                      f"remove it by hand", file=sys.stderr)
-            print(f"forgot {ce.get('email') or aid}")
-            return
-        idx = load_index()
-        k = (key or "").lower()
-        gone = [e for e in idx if k and k in (e["uuid"].lower(), e["email"].lower())]
-        save_index([e for e in idx if e not in gone])
-        stuck = [e for e in gone if not keychain_delete(STORE_SVC, e["uuid"])]
-        print(f"forgot {len(gone)} account(s)")
-        for e in stuck:   # index entry is gone; say so rather than leave an orphan token unmentioned
-            print(f"  warning: couldn't delete {e['email']}'s Keychain item — remove it by hand",
+            item = codex_key(aid)
+        else:
+            save_index([x for x in load_index() if x["uuid"] != e["uuid"]])
+            item = e["uuid"]
+        if not keychain_delete(STORE_SVC, item):
+            # the index entry is gone; say so rather than leave an orphan credential unmentioned
+            print(f"  warning: couldn't delete {who}'s Keychain item — remove it by hand",
                   file=sys.stderr)
+        print(f"forgot {who}")
         return
     rows = collect()
     if arg == "--json": render_json(rows)
