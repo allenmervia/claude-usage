@@ -7,14 +7,15 @@ windows to check each one.
 If you run more than one Claude account (say a couple of Max subscriptions) and
 switch between them as you hit limits, this shows all of them side by side — as a
 macOS **menu-bar dropdown** that's always a glance away, or a terminal table. If you
-also use the Codex CLI, its usage shows in its own group, read-only. The menu bar is
-the main way to use it; the terminal command is the same data on demand.
+also use the Codex CLI, its usage shows in its own group and switches the same way.
+The menu bar is the main way to use it; the terminal command is the same data on
+demand.
 
 ```
 Usage  · 2:14 PM
 
 ── Claude ──────────────────────────────────────────────────
-  allen        allen@example.com    Max 20x  [active]
+▶ allen        allen@example.com    Max 20x
     5-hour  ██░░░░░░░░   22%   3h 22m left
     weekly  ███████░░░   66%   5d left
     Fable   ███░░░░░░░   26%   weekly resets Sat 7am
@@ -28,7 +29,7 @@ Usage  · 2:14 PM
     Fable   ██████░░░░   57%   weekly resets Tue 5pm
 
 ── Codex ───────────────────────────────────────────────────
-  allen        allen@example.com    Pro Lite
+▶ allen        allen@example.com    Pro Lite
     weekly  █████░░░░░   54%   Fri 8pm · 3d left
 ```
 
@@ -55,9 +56,8 @@ real answer, which then replaces the remembered boundary. A boundary older than 
 weeks isn't projected at all — by then the account has been idle long enough that it
 may have moved unobserved, and `idle` is the honest answer.
 
-Codex sits in its own group, read-only — no switching. The `── Claude ──` /
-`── Codex ──` headers appear only when you're tracking more than one provider; with
-Claude alone the list is ungrouped, exactly as before.
+The `── Claude ──` / `── Codex ──` headers appear only when you're tracking more than
+one provider; with Claude alone the list is ungrouped, exactly as before.
 
 ## Requirements
 
@@ -65,7 +65,7 @@ Claude alone the list is ungrouped, exactly as before.
 - Python 3.8+ (system `python3` is fine — no third-party packages)
 - [Claude Code](https://claude.com/claude-code), signed in to at least one account
 - Optional: the [Codex](https://openai.com/codex) CLI, signed in — its usage then
-  appears alongside, read-only (nothing to set up; see [Codex](#codex))
+  appears alongside (nothing to set up; see [Codex](#codex))
 
 ## Install
 
@@ -135,8 +135,8 @@ claude-usage forget X   drop an account by email or uuid (and delete its stored 
 
 Click an account in the menu and the CLI switches to it — no browser, no
 `/logout`+`/login`. Rows you can switch to are marked `⇄`; hold **⌥** and the row
-spells out what the click will do. The bar then redraws with the new account marked
-`·active`. If a switch can't go through, the menu says why at the bottom.
+spells out what the click will do. The bar then redraws with the ▶ moved to the new
+account. If a switch can't go through, the menu says why at the bottom.
 
 It works by minting a fresh access token from that account's stored refresh token and
 writing it into Claude Code's Keychain item, so your next `claude` run *is* that
@@ -151,7 +151,13 @@ what it shows you and reads the plan from. A switch writes both together, so the
 ```bash
 claude-usage switch allen-1@example.com   # or its label / uuid
 claude-usage switch --undo                # restore the previous account
+claude-usage switch codex:you@example.com # the Codex account of that name
 ```
+
+The same email often names an account on both providers. A bare name switches the
+Claude one and tells you the Codex account exists; `codex:` in front picks the Codex
+one. Account ids are unique across providers, so those never need the prefix — which
+is why clicking a row in the menu is always unambiguous.
 
 Two things to know:
 
@@ -258,9 +264,9 @@ it's the *only* context that login has.
 ## Codex
 
 If you use [Codex](https://openai.com/codex) too, its usage appears in its own
-section, under the Claude accounts. It's **read-only**: the tool shows Codex usage
-but never signs it in, switches it, or writes anything — there's no click-to-switch
-on a Codex row.
+section, under the Claude accounts, and its accounts switch the same way Claude's do —
+click the row in the menu, or `claude-usage switch <email>`. The account Codex is
+currently on carries the ▶ marker, the same as on the Claude side.
 
 Codex has no usage API, so the numbers come from Codex's own session logs. Identity
 (email, plan, account id) is read from `~/.codex/auth.json`; the utilization figure
@@ -274,14 +280,33 @@ Two consequences follow from reading logs instead of an API:
   use `codex` (each turn logs a fresh figure); when a window has rolled over since,
   the row shows the reset rather than a stale percentage.
 - **A session log doesn't name its account**, so the reading is attributed to
-  whichever account is signed in now. That's right whenever you ran Codex as the
-  account you're currently signed in as — the normal case.
+  whichever account is signed in now. Readings written before an account took over
+  `~/.codex/auth.json` are left out, which is what keeps that attribution true once
+  accounts rotate.
 
-**Multiple Codex accounts.** Codex itself signs in one account at a time. If you
-rotate accounts by swapping `~/.codex/auth.json` (what tools like `codex-account` do),
-each one is remembered as it passes through, keyed by account id — the same way Claude
-accounts accrue. Accounts kept in separate `CODEX_HOME` directories aren't
-auto-discovered; point the tool at one with `CODEX_HOME=/path claude-usage`.
+**Multiple Codex accounts.** Codex itself signs in one account at a time. Every
+account is remembered as it passes through `~/.codex/auth.json`, keyed by account id —
+the same way Claude accounts accrue — so signing into each one once with `codex login`
+makes them all switchable afterwards. Accounts kept in separate `CODEX_HOME`
+directories aren't auto-discovered; point the tool at one with
+`CODEX_HOME=/path claude-usage`.
+
+### How Codex switching differs from Claude's
+
+Codex keeps its whole credential in one file, so a switch is a file swap: each
+account's `~/.codex/auth.json` is stashed in the Keychain as it's seen and written
+back on the way in. Two differences follow.
+
+- **No refresh of our own.** Claude accounts get a fresh access token minted before
+  the switch; Codex tokens are handed over as captured and the `codex` CLI refreshes
+  them on its next run. If OpenAI rotated the refresh token after the snapshot was
+  taken, that run asks you to sign in again — `codex login` re-captures it.
+- **Don't switch while `codex` is running.** A running session holds its tokens in
+  memory and rewrites `auth.json` when they refresh, which can overwrite the switch or
+  be overwritten by it. Quit `codex` first. (The same is true of `claude` and a Claude
+  switch.)
+
+`claude-usage switch --undo` reverses the last switch, whichever provider it was.
 
 ## How it works, and why it can't desync your session
 

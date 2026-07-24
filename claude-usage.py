@@ -22,11 +22,18 @@ you're logged into. Only parked accounts get refreshed, and rotated refresh
 tokens are written straight back to the Keychain.
 
 Codex: identity is read from ~/.codex/auth.json and usage from the newest Codex
-session rollout that records a rate limit — no API call, no writes, no switching.
-A session log doesn't name its account, so the reading is attributed to whoever
-is currently signed in, and each row shows how old it is (Codex usage can't be
-refreshed without running codex). Accounts are keyed by account_id, so rotating
-the auth.json slot accretes them the same way Claude accounts accrue.
+session rollout that records a rate limit — no API call. Each row shows how old
+its reading is, since Codex usage can't be refreshed without running codex.
+Accounts are keyed by account_id, so rotating the auth.json slot accretes them
+the same way Claude accounts accrue.
+
+Codex switching works the same way from the outside, but the whole credential is
+that one file: each account's auth.json is stashed in the Keychain as it is seen
+and written back on the way in, with no refresh of our own — the codex CLI
+refreshes the tokens on its next run. A session log doesn't name its account, so
+usage is attributed to whoever is signed in; readings written before an account
+took the auth.json slot are excluded, which is what keeps that attribution true
+once accounts rotate.
 
 Usage:
   claude-usage setup      guided first-time setup (register account, optional menu bar + PATH)
@@ -38,7 +45,7 @@ Usage:
   claude-usage --xbar     xbar/SwiftBar menu-bar format
   claude-usage capture    explicitly ingest the active account (same as a run)
   claude-usage list       list registered accounts
-  claude-usage switch X   point the CLI at account X (email / label / uuid)
+  claude-usage switch X   point the CLI at account X (email / label / uuid; Claude or Codex)
   claude-usage switch --undo   restore the account that was active before the last switch
   claude-usage forget X   drop account by email or uuid
 """
@@ -83,7 +90,16 @@ def keychain_read(service, account=None):
     args = ["find-generic-password", "-s", service, "-w"]
     if account: args = ["find-generic-password", "-s", service, "-a", account, "-w"]
     r = _sec(args)
-    return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+    if r.returncode != 0 or not r.stdout.strip(): return None
+    return _unhex(r.stdout.strip())
+
+def _unhex(v):
+    """`security -w` prints the secret as bare hex when it holds a newline, and verbatim otherwise.
+    Every secret stored here is JSON, so a value that is pure hex — no braces, no quotes — is the
+    encoded form and nothing else could be."""
+    if len(v) % 2 or not all(c in "0123456789abcdefABCDEF" for c in v): return v
+    try: return bytes.fromhex(v).decode()
+    except Exception: return v
 
 def keychain_write(service, account, secret):
     """True if the secret landed. Callers must check: a silent failure (Keychain locked, the user
@@ -232,7 +248,7 @@ def match_live_uuid():
     """Which known account holds the live credential, by matching stored refresh tokens.
 
     No network and no writes, so it still identifies the session when /profile can't be reached
-    or its token has expired. That matters beyond the ·active label: an unidentified active
+    or its token has expired. That matters beyond the ▶ marker: an unidentified active
     account is treated as parked and refreshed from its stored token — the one thing reading
     must never do to the live session, since a rotation there invalidates Claude Code's own copy.
     """
@@ -497,8 +513,11 @@ def codex_window_label(minutes):
     return {300: "5-hour", 1440: "daily", 10080: "weekly", 43200: "monthly"}.get(
         minutes, f"{minutes // 1440}d" if minutes >= 1440 else f"{minutes // 60}h")
 
-def codex_latest_usage():
+def codex_latest_usage(not_before=0):
     """The newest rate_limits event that actually carries a window, as (epoch_ts, rate_limits).
+
+    not_before discards readings written before the signed-in account took the auth.json slot: a
+    rollout doesn't name its account, so anything older than that boundary may belong to another one.
 
     Each active session rewrites rate_limits every turn, so the most-recently-modified file holds the
     freshest figures. But Codex also logs window-less events (limit_id "premium" with primary and
@@ -524,6 +543,7 @@ def codex_latest_usage():
                     except Exception:
                         continue
                     if not isinstance(rl, dict) or not ts: continue
+                    if ts.timestamp() < not_before: continue  # predates this account's sign-in
                     if not (_codex_window_ok(rl.get("primary")) or _codex_window_ok(rl.get("secondary"))):
                         continue                              # window-less event, or window with no real %
                     if best is None or ts.timestamp() > best[0]:
@@ -566,6 +586,76 @@ def codex_display_windows(row):
         out.append({**w, "expired": expired, "pct": None if expired else w.get("pct")})
     return out
 
+# Codex credentials live in one 0600 JSON file, so a switch is a file swap: the whole auth.json is
+# stashed per account in the Keychain (never on disk) and written back on the way in. Unlike the
+# Claude side there is no refresh here — the tokens are handed over as captured and the codex CLI
+# refreshes them itself on its next run.
+def codex_key(aid):
+    return f"codex:{aid}"
+
+CODEX_PREV_KEY = codex_key("__previous__")
+
+def codex_read_auth_raw():
+    try:
+        with open(CODEX_AUTH) as f: return f.read()
+    except Exception:
+        return None
+
+def codex_identity(raw):
+    """(account_id, email, name, plan) from an auth.json blob, or Nones. The id_token is a JWT we
+    decode without verifying — it's a local file we already trust and we only read it."""
+    try:
+        auth = json.loads(raw or "")
+        tokens = auth.get("tokens") if isinstance(auth, dict) else None
+    except Exception:
+        tokens = None
+    if not isinstance(tokens, dict): return None, "", "", None
+    claims = _jwt_claims(tokens.get("id_token"))
+    oauth  = claims.get("https://api.openai.com/auth")
+    oauth  = oauth if isinstance(oauth, dict) else {}
+    aid = tokens.get("account_id") or oauth.get("chatgpt_account_id")
+    return aid, claims.get("email") or "", claims.get("name") or "", oauth.get("chatgpt_plan_type")
+
+def codex_store_auth(aid, raw):
+    """Stash an account's auth.json. Written only when the contents changed: every write puts the
+    secret in argv, and an unchanged re-capture happens on every refresh tick.
+
+    Stored compact. Codex writes the file pretty-printed, and a secret carrying a newline comes back
+    from `security` hex-encoded — which the comparison below would never match, so the credential
+    would be rewritten on every tick."""
+    try:
+        raw = json.dumps(json.loads(raw), separators=(",", ":"))
+    except Exception:
+        return False                  # not JSON: storing it would only produce an unusable blob
+    if keychain_read(STORE_SVC, codex_key(aid)) == raw:
+        return True
+    return keychain_write(STORE_SVC, codex_key(aid), raw)
+
+def codex_write_auth(raw):
+    """Install a stashed auth.json as the signed-in one. Replaces the credential fields and keeps
+    whatever else the current file holds (an OPENAI_API_KEY set outside this tool, say)."""
+    try:
+        new = json.loads(raw)
+        if not isinstance(new, dict) or not isinstance(new.get("tokens"), dict): return False
+    except Exception:
+        return False
+    try:
+        cur = json.loads(codex_read_auth_raw() or "{}")
+        if not isinstance(cur, dict): cur = {}
+    except Exception:
+        cur = {}
+    for k in ("tokens", "auth_mode", "last_refresh"):
+        if k in new: cur[k] = new[k]
+    try:
+        os.makedirs(CODEX_HOME, exist_ok=True)
+        tmp = CODEX_AUTH + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)   # the file holds live tokens
+        with os.fdopen(fd, "w") as f: json.dump(cur, f, indent=2)
+        os.replace(tmp, CODEX_AUTH)      # atomic: codex must never read a half-written credential
+        return True
+    except Exception:
+        return False
+
 def load_codex_index():
     try:
         with open(CODEX_INDEX) as f: d = json.load(f)
@@ -586,42 +676,63 @@ def codex_label(email, name, aid):
     if email and "@" in email: return email.split("@")[0]
     return name or (aid[:8] if aid else "codex")
 
+def codex_boundary(idx, aid):
+    """The earliest moment a reading could belong to `aid`, when this run is the first to find it in
+    the auth.json slot — else None, leaving any recorded boundary alone.
+
+    Session rollouts don't name their account, so usage is attributed to whoever is signed in. That
+    only holds if readings written under the previous account are excluded, and the changeover is
+    visible here: the account holding the most recent last_seen_live is the one we saw last, so a
+    different account in the slot now means a sign-in happened between the two runs.
+
+    The floor is that last sighting rather than the present moment, so an account signed into after
+    a stretch of use elsewhere keeps the history it really earned. It is a bound, not a timestamp:
+    the sign-in fell somewhere between the sighting and now, so usage from the tail of that gap can
+    still land on the wrong account — at most one refresh interval of it. `switch` doesn't rely on
+    this, recording the exact instant it moves the credential.
+
+    A registry that has never recorded a sighting (every account predates this) yields no boundary,
+    which keeps the single-account reading exactly as it was.
+    """
+    seen = [e["last_seen_live"] for a, e in idx.items()
+            if a != aid and isinstance(e, dict) and isinstance(e.get("last_seen_live"), (int, float))]
+    mine = (idx.get(aid) or {}).get("last_seen_live") if isinstance(idx.get(aid), dict) else None
+    if not seen: return None
+    if isinstance(mine, (int, float)) and mine >= max(seen): return None   # we saw it here last run
+    return max(seen)
+
 def collect_codex(persist=True):
     """Codex rows for every known account. The signed-in account (auth.json) is refreshed from the
     latest session; accounts seen before but not currently signed in render from their last snapshot
     (marked stale by age). Registry is keyed by account_id, so rotating the auth.json slot accretes
     accounts the same way the Claude side does."""
     idx = load_codex_index()
-    live_aid = None
-    try:
-        with open(CODEX_AUTH) as f: auth = json.load(f)
-    except Exception:
-        auth = None
-    tokens = auth.get("tokens") if isinstance(auth, dict) else None
-    if isinstance(tokens, dict):
-        claims = _jwt_claims(tokens.get("id_token"))
-        oauth  = claims.get("https://api.openai.com/auth")
-        oauth  = oauth if isinstance(oauth, dict) else {}
-        aid = tokens.get("account_id") or oauth.get("chatgpt_account_id")
-        if aid:
-            live_aid = aid
-            prev = idx.get(aid) if isinstance(idx.get(aid), dict) else {}
-            prev_as_of = prev.get("as_of") if isinstance(prev.get("as_of"), (int, float)) else 0
-            # identity always refreshes from auth.json; usage only when the scan turns up a reading at
-            # least as new as the stored one — a window-less stretch must not erase the last real figure.
-            entry = {"account_id": aid, "email": claims.get("email") or "",
-                     "name": claims.get("name") or "", "plan": oauth.get("chatgpt_plan_type") or prev.get("plan")}
-            best = codex_latest_usage()
-            if best and best[0] >= prev_as_of:
-                ts, rl = best
-                entry["windows"] = codex_windows(rl)
-                entry["as_of"]   = ts
-                entry["plan"]    = rl.get("plan_type") or entry["plan"]
-                cr = rl.get("credits") or {}
-                entry["credits"] = {"has": bool(cr.get("has_credits")),
-                                    "unlimited": bool(cr.get("unlimited")), "balance": cr.get("balance")}
-            idx[aid] = {**prev, **entry}
-            if persist: save_codex_index(idx)
+    raw = codex_read_auth_raw()
+    aid, email, name, plan = codex_identity(raw)
+    live_aid = aid
+    if aid:
+        prev = idx.get(aid) if isinstance(idx.get(aid), dict) else {}
+        prev_as_of = prev.get("as_of") if isinstance(prev.get("as_of"), (int, float)) else 0
+        # identity always refreshes from auth.json; usage only when the scan turns up a reading at
+        # least as new as the stored one — a window-less stretch must not erase the last real figure.
+        entry = {"account_id": aid, "email": email, "name": name, "plan": plan or prev.get("plan")}
+        since = codex_boundary(idx, aid)
+        if since is not None:
+            entry["signed_in_since"] = since
+        best = codex_latest_usage(entry.get("signed_in_since") or prev.get("signed_in_since") or 0)
+        if best and best[0] >= prev_as_of:
+            ts, rl = best
+            entry["windows"] = codex_windows(rl)
+            entry["as_of"]   = ts
+            entry["plan"]    = rl.get("plan_type") or entry["plan"]
+            cr = rl.get("credits") or {}
+            entry["credits"] = {"has": bool(cr.get("has_credits")),
+                                "unlimited": bool(cr.get("unlimited")), "balance": cr.get("balance")}
+        entry["last_seen_live"] = time.time()
+        idx[aid] = {**prev, **entry}
+        if persist:
+            save_codex_index(idx)
+            codex_store_auth(aid, raw)      # so this account can be switched back to later
     rows = []
     for aid, e in idx.items():
         if not isinstance(e, dict): continue         # skip a tampered/foreign registry entry
@@ -631,6 +742,7 @@ def collect_codex(persist=True):
             "email": e.get("email") or aid, "label": codex_label(e.get("email"), e.get("name"), aid),
             "plan": e.get("plan"), "windows": wins, "as_of": e.get("as_of"),
             "credits": e.get("credits"), "active": aid == live_aid,
+            "switchable": aid != live_aid and bool(keychain_read(STORE_SVC, codex_key(aid))),
             "error": None if (wins or e.get("as_of")) else "no usage recorded yet — run codex once",
         })
     return rows
@@ -740,13 +852,19 @@ def _col_widths(rows):
     ew = min(26, max([6] + [len(r.get("email") or "") for r in ok]))
     return lw, ew
 
+ACTIVE_MARK = "▶"     # the account the CLI is on — same glyph on both providers
+
+def active_mark(r):
+    """The margin marker for a table row: ▶ on the account you're on, a blank of equal width on
+    the rest, so the names below it stay aligned."""
+    return f"{C['cyan']}{ACTIVE_MARK}{C['x']}" if r.get("active") else " "
+
 def _table_claude_row(r, w):
     lw, ew = w
-    # Name at col 2 under the provider header, matching the Codex section.
-    head = (f"  {C['b']}{r['label']:<{lw}}{C['x']} {C['dim']}{r['email']:<{ew}}{C['x']}"
-            f"  {C['cyan']}{plan_of(r)}{C['x']}")
-    if r.get("active"): head += f"  {C['cyan']}[active]{C['x']}"
-    print(head)
+    # Name at col 2 under the provider header, matching the Codex section; the ▶ marking the account
+    # you're on hangs in the col-0 margin, so every name still shares one left edge.
+    print(f"{active_mark(r)} {C['b']}{r['label']:<{lw}}{C['x']} {C['dim']}{r['email']:<{ew}}{C['x']}"
+          f"  {C['cyan']}{plan_of(r)}{C['x']}")
     if r.get("error"):
         print(f"    {C['r']}{r['error']}{C['x']}\n"); return
     fh, wk = r["five_hour"], r["seven_day"]
@@ -765,12 +883,10 @@ def _table_claude_row(r, w):
         print(f"    {C['dim']}extra   {usd(sp['used'])} / {usd(sp['limit'])} used{C['x']}")
     print()
 
-def _table_codex_row(r, show_active, w):
+def _table_codex_row(r, w):
     lw, ew = w
-    head = (f"  {C['b']}{r['label']:<{lw}}{C['x']} {C['dim']}{r['email']:<{ew}}{C['x']}"
-            f"  {C['cyan']}{plan_of(r)}{C['x']}")
-    if show_active and r.get("active"): head += f"  {C['cyan']}[signed in]{C['x']}"
-    print(head)
+    print(f"{active_mark(r)} {C['b']}{r['label']:<{lw}}{C['x']} {C['dim']}{r['email']:<{ew}}{C['x']}"
+          f"  {C['cyan']}{plan_of(r)}{C['x']}")
     if r.get("error"):
         print(f"    {C['r']}{r['error']}{C['x']}\n"); return
     for w in codex_display_windows(r):
@@ -802,8 +918,7 @@ def render_table(rows):
         if multi:
             print(f"{C['dim']}── {name} " + "─" * (56 - len(name)) + f"{C['x']}")
         if key == "codex":
-            show_active = len(grp) > 1
-            for r in grp: _table_codex_row(r, show_active, w)
+            for r in grp: _table_codex_row(r, w)
         else:
             for r in grp: _table_claude_row(r, w)
     if any(r.get("stale") for r in rows if is_claude(r)):
@@ -976,14 +1091,14 @@ def render_xbar(rows):
         print(f"{NB}{label:<6} {color(pct)}{bar(pct)} {int(pct):>3}%{C['x']}{tail} "
               f"| font=Menlo size=12 ansi=true")
     def xbar_claude_row(r):
-        # Account name one cell under the provider header, matching the Codex section.
-        lead = NB
-        act  = " ·active" if r.get("active") else ""
+        # Account name one cell under the provider header, matching the Codex section; the ▶ on the
+        # account you're on takes that cell instead, so it hangs left of the shared name edge.
+        lead = ACTIVE_MARK if r.get("active") else NB
         # Click-to-switch, no confirm — the account row itself is the target.
         switchable = not r.get("active") and not r.get("error")
         hint = "  ⇄" if switchable else ""      # the only thing marking a row as clickable
         # macOS draws an actionless menu item at reduced alpha, so the active row reads dimmer than
-        # the switchable ones. `·active` and the menu-bar title carry the signal instead.
+        # the switchable ones. The ▶ and the menu-bar title carry the signal instead.
         params = "font=Menlo size=13"
         if switchable:
             params += (f' bash="{os.path.realpath(__file__)}" param1=switch param2={r["uuid"]}'
@@ -991,7 +1106,7 @@ def render_xbar(rows):
         em = r.get("email") or ""
         em = em if "@" in em and em != r.get("label") else ""   # label falls back to the email — don't repeat it
         mail = f"{xb(em):<{xew}}  " if xew else ""
-        print(f"{lead}{xb(r['label']):<{xlw}}  {mail}{xb(plan_of(r))}{act}{hint} | {params}")
+        print(f"{lead}{xb(r['label']):<{xlw}}  {mail}{xb(plan_of(r))}{hint} | {params}")
         if switchable:   # holding ⌥ swaps the row for what the click actually does
             print(f"{lead}⇄ Switch to {xb(r['label'])}{'  ' + xb(em) if em else ''} | alternate=true {params}")
         if r.get("error"):
@@ -1007,12 +1122,19 @@ def render_xbar(rows):
         if sp.get("enabled") and sp.get("limit"):
             print(f"{NB}extra  {usd(sp['used'])} / {usd(sp['limit'])} used | color=#8b949e font=Menlo size=12")
         print("---")
-    def xbar_codex_row(r, show_active):
-        # No switch affordance: this tool reads Codex, it doesn't drive `codex login`. The absence of ⇄
-        # under the CODEX header reads as a property of the group, which is why the grouping earns its line.
-        # Name and window rows share the same one-cell indent, matching the Claude section.
-        act = " ·signed in" if show_active and r.get("active") else ""
-        print(f"{NB}{xb(r['label']):<{xlw}}  {xb(plan_of(r))}{act} | font=Menlo size=13")
+    def xbar_codex_row(r):
+        # Name and window rows share the same one-cell indent, matching the Claude section. Only an
+        # account whose credential was captured can be switched to; the rest carry no affordance.
+        lead = ACTIVE_MARK if r.get("active") else NB
+        switchable = r.get("switchable")
+        hint = "  ⇄" if switchable else ""
+        params = "font=Menlo size=13"
+        if switchable:
+            params += (f' bash="{os.path.realpath(__file__)}" param1=switch param2={r["uuid"]}'
+                       f" terminal=false refresh=true")
+        print(f"{lead}{xb(r['label']):<{xlw}}  {xb(plan_of(r))}{hint} | {params}")
+        if switchable:   # holding ⌥ swaps the row for what the click actually does
+            print(f"{NB}⇄ Switch to {xb(r['label'])} | alternate=true {params}")
         if r.get("error"):
             print(f"{NB}{xb(r['error'])} | color=#e5534b font=Menlo size=12"); print("---"); return
         for w in codex_display_windows(r):
@@ -1031,8 +1153,7 @@ def render_xbar(rows):
             print(f"{name.upper()} | color=#8b949e font=Menlo size=11")
             print("---")   # divider under the header, matching the one after every account below it
         if key == "codex":
-            show_active = len(grp) > 1
-            for r in grp: xbar_codex_row(r, show_active)
+            for r in grp: xbar_codex_row(r)
         else:
             for r in grp: xbar_claude_row(r)
     if any(r.get("stale") for r in claude_rows):
@@ -1065,12 +1186,27 @@ PREV_KEY = "__previous__"
 MISMATCH_NOTE = " — but ~/.claude.json still names the other account, so the CLI will show that name"
 ACTION   = os.path.join(STATE_DIR, "last-problem.json")   # non-secret: just an error message
 LEGACY_ACTION = os.path.join(STATE_DIR, "last-action.json")   # pre-rename name; swept on write
+# `switch --undo` reverses whichever provider was switched last, so the switch records which it was.
+LAST_SWITCH = os.path.join(STATE_DIR, "last-switch.json")
+
+def record_last_switch(provider):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(LAST_SWITCH, "w") as f: json.dump({"provider": provider}, f)
+    except Exception:
+        pass
+
+def last_switch_provider():
+    try:
+        with open(LAST_SWITCH) as f: return json.load(f).get("provider") or "claude"
+    except Exception:
+        return "claude"      # written by a version that only switched Claude, or never written
 
 def record_problem(msg, kind="action"):
     """Clicked menu items can't print and notifications may be suppressed — leave a *failure*
     where the next render can show it (the click refreshes, so it appears immediately).
 
-    Only failures: a success already shows in the bar itself — the account row gains ·active,
+    Only failures: a success already shows in the bar itself — the ▶ moves to the account row,
     the title changes, the interval tick moves — so echoing it adds nothing.
     """
     try:
@@ -1265,7 +1401,84 @@ def resolve_account(key):
             return e
     return None
 
+def codex_resolve(key):
+    """A registered Codex account by account_id, email or label."""
+    k = (key or "").lower()
+    if not k: return None
+    for aid, e in load_codex_index().items():
+        if not isinstance(e, dict): continue
+        if k in (aid.lower(), (e.get("email") or "").lower(),
+                 codex_label(e.get("email"), e.get("name"), aid).lower()):
+            return {**e, "account_id": aid}
+    return None
+
+def codex_mark_signed_in(aid):
+    """Record the sign-in boundary the moment the credential lands, so a render between the switch
+    and the next capture doesn't credit this account with the previous one's usage."""
+    idx = load_codex_index()
+    e = idx.get(aid) if isinstance(idx.get(aid), dict) else {}
+    now = time.time()
+    idx[aid] = {**e, "signed_in_since": now, "last_seen_live": now}
+    save_codex_index(idx)
+
+def cmd_codex_switch(e):
+    aid = e["account_id"]
+    who = e.get("email") or aid
+    stored = keychain_read(STORE_SVC, codex_key(aid))
+    if not stored:
+        _fail(f"{who} isn't captured — sign into it with `codex login` once, then switching works",
+              "switch")
+    cur = codex_read_auth_raw()
+    cur_aid = codex_identity(cur)[0]
+    if cur and cur_aid:
+        if not codex_store_auth(cur_aid, cur):     # keep the outgoing account switchable-back-to
+            _fail("couldn't stash the current Codex credential — unlock the Keychain and retry", "switch")
+        if not keychain_write(STORE_SVC, CODEX_PREV_KEY, cur):
+            _fail("couldn't back up the current Codex credential — switch did not happen", "switch")
+    else:
+        # Nothing identifiable is being displaced (signed out, or a file we can't read). Drop any
+        # older backup rather than leave --undo pointing at an account this switch didn't replace.
+        keychain_delete(STORE_SVC, CODEX_PREV_KEY)
+    if not codex_write_auth(stored):
+        _fail(f"couldn't write ~/.codex/auth.json — switch to {who} did not happen", "switch")
+    codex_mark_signed_in(aid)
+    record_last_switch("codex")
+    clear_cache()
+    # The tokens go over as captured; codex refreshes them itself on its next run. If OpenAI rotated
+    # the refresh token after this snapshot was taken, that run asks for a login instead.
+    _report_switch(f"switched Codex to {who}", "")
+
+def cmd_codex_undo():
+    prev = keychain_read(STORE_SVC, CODEX_PREV_KEY)
+    if not prev:
+        _fail("nothing to undo", "switch")
+    if not codex_write_auth(prev):
+        _fail("couldn't restore the previous Codex account", "switch")
+    aid = codex_identity(prev)[0]
+    if aid: codex_mark_signed_in(aid)
+    keychain_delete(STORE_SVC, CODEX_PREV_KEY)
+    clear_cache()
+    _report_switch("restored the previous Codex account", "")
+
 def cmd_switch(target):
+    # One email can name an account on both providers, so `codex:` forces the Codex one. Without it
+    # a name that matches both goes to Claude, and the switch says the other reading was available.
+    forced = target.lower().startswith("codex:") and target.lower() != CODEX_PREV_KEY
+    if forced:
+        target = target.split(":", 1)[1]
+        e = codex_resolve(target)
+        if not e:
+            _fail(f"unknown Codex account: {target}", "switch")
+        cmd_codex_switch(e); return
+    if target == "--undo" and last_switch_provider() == "codex":
+        cmd_codex_undo(); return
+    if target not in ("--undo", ""):
+        claude, codex = resolve_account(target), codex_resolve(target)
+        if codex and not claude:
+            cmd_codex_switch(codex); return
+        if codex and claude:
+            print(f"note: Codex also has {codex.get('email') or target} — "
+                  f"switch it with `codex:{target}`", file=sys.stderr)
     if target == "--undo":
         prev = keychain_read(STORE_SVC, PREV_KEY)
         if not prev:
@@ -1340,6 +1553,7 @@ def cmd_switch(target):
         if not new_prof or not write_live_profile(new_prof):
             note = MISMATCH_NOTE
 
+    record_last_switch("claude")
     clear_cache()                                     # so the post-switch refresh shows the new active account
     _report_switch(f"switched to {e['email']}", note)
 
@@ -1598,9 +1812,12 @@ def cmd_doctor():
         else:
             say("ok", f"{live['email']}: usage reads OK")
         for r in codex_rows:
-            if not r.get("active") and not r.get("error"):
-                say("warn", f"{r['email']}: shown from a past snapshot",
-                    "sign back into it with codex to refresh.")
+            if r.get("active"): continue
+            if r.get("switchable"):
+                say("ok", f"{r['email']}: parked — switch to it with `claude-usage switch {r['email']}`")
+            else:
+                say("warn", f"{r['email']}: shown from a past snapshot, and switching to it won't work",
+                    "sign into it with `codex login` once to capture its credential.")
 
     section("Menu bar")
     app, pdir = host_and_plugin_dir()
@@ -1724,9 +1941,21 @@ def main():
     if arg == "list":
         for e in load_index():
             print(f"{e['email']:<28} {e.get('tier','')}  {e['uuid']}")
+        for aid, e in load_codex_index().items():
+            if isinstance(e, dict):
+                print(f"{e.get('email') or aid:<28} codex  {aid}")
         return
     if arg == "forget":
         key = sys.argv[2] if len(sys.argv) > 2 else ""
+        ce = codex_resolve(key)
+        if ce and not resolve_account(key):
+            aid = ce["account_id"]
+            idx = load_codex_index(); idx.pop(aid, None); save_codex_index(idx)
+            if not keychain_delete(STORE_SVC, codex_key(aid)):
+                print(f"  warning: couldn't delete {ce.get('email') or aid}'s Keychain item — "
+                      f"remove it by hand", file=sys.stderr)
+            print(f"forgot {ce.get('email') or aid}")
+            return
         idx = load_index()
         k = (key or "").lower()
         gone = [e for e in idx if k and k in (e["uuid"].lower(), e["email"].lower())]
