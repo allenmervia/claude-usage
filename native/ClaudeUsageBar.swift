@@ -60,6 +60,8 @@ struct DisplayRow: Decodable {
 struct Trend: Decodable {
     var series: [[Double]]?
     var note: String?
+    var pace_per_hour: Double?
+    var reset_ts: Double?
 }
 
 // MARK: - Severity colors (the tool's green/amber/red at 65/90, dim for no reading)
@@ -253,6 +255,9 @@ final class Model: ObservableObject {
     var claude: [Account] { payload?.accounts.filter { !$0.isCodex } ?? [] }
     var codex: [Account] { payload?.accounts.filter { $0.isCodex } ?? [] }
     var multiProvider: Bool { !claude.isEmpty && !codex.isEmpty }
+    var hasInsights: Bool {
+        payload?.accounts.contains { ($0.display?.trend?.series?.count ?? 0) >= 2 } == true
+    }
 }
 
 // MARK: - Countdown re-derivation ("3h 22m left" stays live while the window is open)
@@ -294,19 +299,142 @@ struct MenuView: View {
                     ProgressView().controlSize(.small)
                     Text(model.lastError ?? "Reading usage…").font(.system(size: 12)).foregroundStyle(.secondary)
                 }.padding(12)
-            } else {
-                if model.multiProvider { SectionHeader("CLAUDE") }
-                ForEach(model.claude) { AccountCard(account: $0) }
-                if !model.codex.isEmpty {
-                    SectionHeader("CODEX")
-                    ForEach(model.codex) { AccountCard(account: $0) }
+            } else if model.hasInsights {
+                // Two columns once there is history to chart: accounts left, insights right.
+                HStack(alignment: .top, spacing: 10) {
+                    VStack(alignment: .leading, spacing: 4) { accountsColumn }.frame(width: 336)
+                    InsightsView().frame(width: 300)
                 }
+                FooterView()
+            } else {
+                accountsColumn
                 FooterView()
             }
         }
         .padding(8)
-        .frame(width: 344)
+        .frame(width: model.payload != nil && model.hasInsights ? 664 : 352)
         .onAppear { Task { await model.refresh() } }
+    }
+
+    @ViewBuilder private var accountsColumn: some View {
+        if model.multiProvider { SectionHeader("CLAUDE") }
+        ForEach(model.claude) { AccountCard(account: $0) }
+        if !model.codex.isEmpty {
+            SectionHeader("CODEX")
+            ForEach(model.codex) { AccountCard(account: $0) }
+        }
+    }
+}
+
+// MARK: - Insights: one chart carrying both stories — burn (solid history), forecast (dashed at the
+// trailing-day pace), and the reset runway (each projection ends at its account's reset flag; the
+// gap to the 100% line is the budget that expires there).
+
+struct InsightsView: View {
+    @EnvironmentObject var model: Model
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            SectionHeader("BURN & FORECAST")
+            BurnChart(accounts: model.payload?.accounts ?? [])
+                .frame(height: 232)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 8)
+                .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.03)))
+            Text("solid: weekly used · dashed: at the trailing-day pace · ┃ weekly reset")
+                .font(.system(size: 9.5))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, 4)
+        }
+    }
+}
+
+struct BurnChart: View {
+    let accounts: [Account]
+    // Identity colors, distinct from the severity palette so a line never reads as a state.
+    static let palette: [Color] = [
+        Color(red: 0.22, green: 0.53, blue: 0.90),   // blue
+        Color(red: 0.85, green: 0.35, blue: 0.15),   // orange
+        Color(red: 0.10, green: 0.62, blue: 0.44),   // green-aqua
+        Color(red: 0.57, green: 0.52, blue: 0.91),   // violet
+        Color(red: 0.84, green: 0.32, blue: 0.51),   // magenta
+    ]
+
+    var body: some View {
+        Canvas { ctx, size in
+            let entries: [(String, Trend)] = accounts.compactMap { a in
+                guard let t = a.display?.trend, (t.series?.count ?? 0) >= 2 else { return nil }
+                return (a.label ?? a.uuid, t)
+            }
+            guard !entries.isEmpty else { return }
+            let now = Date().timeIntervalSince1970
+            var t0 = entries.compactMap { $0.1.series?.first?.first }.min() ?? now - 84 * 3600
+            var t1 = max(entries.compactMap { $0.1.reset_ts }.max() ?? 0, now + 6 * 3600)
+            t0 = min(t0, now - 3600)
+            t1 += (t1 - t0) * 0.02
+            let padL: CGFloat = 22, padR: CGFloat = 40, padT: CGFloat = 8, padB: CGFloat = 16
+            func X(_ t: Double) -> CGFloat { padL + CGFloat((t - t0) / (t1 - t0)) * (size.width - padL - padR) }
+            func Y(_ v: Double) -> CGFloat { padT + CGFloat(1 - min(105, max(0, v)) / 105) * (size.height - padT - padB) }
+            func line(_ a: CGPoint, _ b: CGPoint) -> Path {
+                var p = Path(); p.move(to: a); p.addLine(to: b); return p
+            }
+            for v: Double in [0, 50, 100] {
+                ctx.stroke(line(CGPoint(x: padL, y: Y(v)), CGPoint(x: size.width - padR, y: Y(v))),
+                           with: .color(v == 100 ? sevColor(95).opacity(0.45) : Color.primary.opacity(0.08)),
+                           style: StrokeStyle(lineWidth: 1, dash: v == 100 ? [3, 3] : []))
+                ctx.draw(Text("\(Int(v))").font(.system(size: 8)).foregroundColor(.secondary),
+                         at: CGPoint(x: padL - 11, y: Y(v)))
+            }
+            let df = DateFormatter(); df.dateFormat = "EEE"
+            var day = Calendar.current.startOfDay(for: Date(timeIntervalSince1970: t0)).addingTimeInterval(86400)
+            while day.timeIntervalSince1970 < t1 {
+                let x = X(day.timeIntervalSince1970)
+                ctx.stroke(line(CGPoint(x: x, y: padT), CGPoint(x: x, y: size.height - padB)),
+                           with: .color(Color.primary.opacity(0.05)))
+                ctx.draw(Text(df.string(from: day)).font(.system(size: 8)).foregroundColor(.secondary),
+                         at: CGPoint(x: x, y: size.height - padB + 8))
+                day = day.addingTimeInterval(86400)
+            }
+            ctx.stroke(line(CGPoint(x: X(now), y: padT), CGPoint(x: X(now), y: size.height - padB)),
+                       with: .color(Color.primary.opacity(0.22)))
+            for (i, (name, t)) in entries.enumerated() {
+                let color = Self.palette[i % Self.palette.count]
+                let s = t.series ?? []
+                var p = Path()
+                for (j, pt) in s.enumerated() where pt.count >= 2 {
+                    let point = CGPoint(x: X(pt[0]), y: Y(pt[1]))
+                    if j == 0 { p.move(to: point) } else { p.addLine(to: point) }
+                }
+                ctx.stroke(p, with: .color(color), style: StrokeStyle(lineWidth: 1.6, lineJoin: .round))
+                guard let last = s.last, last.count >= 2 else { continue }
+                let lastT = last[0], lastV = last[1]
+                var endT = lastT, endV = lastV
+                if let rt = t.reset_ts, rt > lastT {
+                    endT = rt
+                    var d = Path()
+                    d.move(to: CGPoint(x: X(lastT), y: Y(lastV)))
+                    if let pace = t.pace_per_hour, pace > 0 {
+                        let capT = lastT + (100 - lastV) / pace * 3600
+                        if capT < rt {                       // the pace hits the cap before the reset
+                            d.addLine(to: CGPoint(x: X(capT), y: Y(100)))
+                            d.addLine(to: CGPoint(x: X(rt), y: Y(100)))
+                            endV = 100
+                        } else {
+                            endV = lastV + (rt - lastT) / 3600 * pace
+                            d.addLine(to: CGPoint(x: X(rt), y: Y(endV)))
+                        }
+                    } else {
+                        d.addLine(to: CGPoint(x: X(rt), y: Y(lastV)))
+                    }
+                    ctx.stroke(d, with: .color(color.opacity(0.8)),
+                               style: StrokeStyle(lineWidth: 1.4, dash: [3, 3]))
+                    ctx.stroke(line(CGPoint(x: X(rt), y: Y(endV) - 5), CGPoint(x: X(rt), y: Y(endV) + 5)),
+                               with: .color(color), style: StrokeStyle(lineWidth: 2))
+                }
+                ctx.draw(Text(name).font(.system(size: 8.5, weight: .semibold)).foregroundColor(color),
+                         at: CGPoint(x: X(endT) + 3, y: Y(endV) - 7), anchor: .leading)
+            }
+        }
     }
 }
 
