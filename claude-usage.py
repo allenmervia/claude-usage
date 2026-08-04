@@ -40,6 +40,7 @@ Usage:
   claude-usage            table of all known accounts (default)
   claude-usage install    add the menu-bar view (installs xbar if needed, links + launches it)
   claude-usage app        build + launch the native menu-bar app (needs Xcode Command Line Tools)
+  claude-usage insights   trailing-week tokens + API-equivalent cost by model, from local transcripts
   claude-usage doctor     check the setup and report what needs fixing
   claude-usage interval N set the xbar plugin's refresh cadence (the native app has its own, in its gear menu)
   claude-usage --json     machine-readable JSON
@@ -448,10 +449,7 @@ def append_history(rows, ts):
         # keeps back-to-back rewrites from chasing the boundary.
         if os.path.getsize(HISTORY) > 512 * 1024 and _history_oldest() < ts - HISTORY_KEEP_S - 86400:
             kept = [s for s in load_history() if s["ts"] >= ts - HISTORY_KEEP_S]
-            tmp = f"{HISTORY}.{os.getpid()}.tmp"       # per-process: two pollers may trim at once
-            with open(tmp, "w") as f:
-                f.writelines(json.dumps(s, separators=(",", ":")) + "\n" for s in kept)
-            os.replace(tmp, HISTORY)
+            _replace_file(HISTORY, "".join(json.dumps(s, separators=(",", ":")) + "\n" for s in kept))
     except Exception:
         pass                           # history is an enrichment; a full disk must not break the render
 
@@ -1119,9 +1117,10 @@ def trend_view(hist, r):
 
 def attach_display(rows):
     """Give every row a `display` view-model: plan text, switchability, formatted lines, and the
-    trend (series + numeric pace + reset epoch, for charts). All phrasing and strategy stays here,
-    in one place — a consumer that renders `display` verbatim shows what the xbar dropdown shows."""
-    hist = load_history(TREND_S + 3600)
+    trend (series + numeric pace + the window's reset epoch and length, for charts). All phrasing
+    and strategy stays here, in one place — a consumer that renders `display` verbatim shows what
+    the xbar dropdown shows."""
+    hist = load_history(8 * 86400)     # the full week a chart can frame, plus a day of slack
     for r in rows:
         d = {"plan": plan_of(r), "can_switch": can_switch(r)}
         d["rows"] = _display_rows(r) if not r.get("error") else []
@@ -1130,10 +1129,18 @@ def attach_display(rows):
             t = {"series": [[round(a, 1), b] for a, b in _resample(series, 48)], "note": note}
             if pace is not None:
                 t["pace_per_hour"] = round(pace, 3)
-            src = (r.get("windows") or [{}])[-1] if r.get("provider") == "codex" else (r.get("seven_day") or {})
+            # The reset only anchors a chart if it belongs to a genuinely weekly-scale window —
+            # a Codex log carrying just its 5-hour window must not masquerade as a week.
+            if r.get("provider") == "codex":
+                wins = [w for w in (r.get("windows") or []) if (w.get("minutes") or 0) > 1440]
+                src = wins[-1] if wins else {}
+                win_s = (src.get("minutes") or 0) * 60
+            else:
+                src, win_s = r.get("seven_day") or {}, 7 * 86400
             reset = parse_dt(src.get("resets_at"))
             if reset:
                 t["reset_ts"] = round(reset.timestamp())
+                t["window_s"] = win_s
             d["trend"] = t
         r["display"] = d
     return rows
@@ -2276,6 +2283,169 @@ def cmd_setup():
 
 # ---- commands ---------------------------------------------------------------
 
+# ---- insights (local transcript scan) ---------------------------------------
+# The usage endpoint says how much window is left; the local Claude Code transcripts say where it
+# went. Each assistant message there records its model and token counters, so the trailing week can
+# be priced in API list terms — "what this usage would have cost through the API", a common unit
+# for comparing models and days, never a bill (subscriptions are what's actually paid).
+
+CLAUDE_PROJECTS = os.path.expanduser(os.environ.get("CU_PROJECTS") or "~/.claude/projects")
+INSIGHTS_CACHE = os.path.join(STATE_DIR, "insights.json")   # non-secret: aggregates only
+INSIGHTS_TTL = 1800                   # a scan is seconds; a menu open should never pay it twice
+INSIGHTS_WINDOW_D = 7
+# USD per MTok: (input, output, cache write, cache read) — API list prices as of Aug 2026
+PRICING = {"opus": (5.0, 25.0, 6.25, 0.50), "fable": (10.0, 50.0, 12.50, 1.00),
+           "sonnet": (3.0, 15.0, 3.75, 0.30), "haiku": (1.0, 5.0, 1.25, 0.10)}
+FAMILY_NAMES = {"opus": "Opus", "fable": "Fable", "sonnet": "Sonnet", "haiku": "Haiku"}
+
+def _model_family(model):
+    m = (model or "").lower()
+    for k in PRICING:
+        if k in m:
+            return k
+    return None
+
+EFFORT_ORDER = {"max": 0, "xhigh": 1, "high": 2, "medium": 3, "low": 4, "": 5}
+
+def _model_display(model):
+    """Row label for the mix: family + version — "Opus 4.8" and "Opus 5" are different spends.
+    Effort splits again inside each row (transcripts record it per message). Pricing stays per
+    family; versions within a family share list rates."""
+    fam = _model_family(model)
+    if not fam:
+        return None, None
+    m = (model or "").lower()
+    # version parts are 1-2 digits; an 8-digit date stamp is not a version. Modern ids put the
+    # version after the family ("opus-4-5-20260805"), legacy ids before it ("3-5-sonnet-20241022").
+    ver = (re.search(rf"{fam}[-_](\d{{1,2}}(?:[-.]\d{{1,2}})?)(?!\d)", m)
+           or re.search(rf"(\d{{1,2}}(?:[-_.]\d{{1,2}})?)[-_]{fam}", m))
+    return fam, FAMILY_NAMES[fam] + (f" {ver.group(1).replace('-', '.').replace('_', '.')}" if ver else "")
+
+def _msg_cost(fam, u):
+    pi, po, pw, pr = PRICING[fam]
+    return ((u.get("input_tokens", 0) or 0) * pi + (u.get("output_tokens", 0) or 0) * po
+            + (u.get("cache_creation_input_tokens", 0) or 0) * pw
+            + (u.get("cache_read_input_tokens", 0) or 0) * pr) / 1e6
+
+def compute_insights(now=None):
+    """Scan the trailing week's transcripts into per-model totals. A full rescan of the window
+    rather than an incremental cache: the window keeps the file set small (mtime pre-filter), and
+    seeing the whole window at once is what makes dedupe by message id correct — resumed and forked
+    sessions duplicate messages across files."""
+    now = now or time.time()
+    cut = now - INSIGHTS_WINDOW_D * 86400
+    # timestamps are UTC ISO strings, so boundaries expressed in the same format compare
+    # lexicographically — to the second for the window cut, and at the local midnight (in UTC
+    # terms) for the "today" figure
+    cut_iso = datetime.fromtimestamp(cut, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    today_utc = (datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+                 .astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"))
+    seen, agg = set(), {}
+    today_cost = 0.0
+    for fp in glob.glob(os.path.join(CLAUDE_PROJECTS, "**", "*.jsonl"), recursive=True):
+        try:
+            if os.path.getmtime(fp) < cut:
+                continue
+            with open(fp, errors="replace") as f:
+                for line in f:
+                    if '"usage"' not in line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue                       # a half-written tail line skips cleanly
+                    msg = rec.get("message") or {}
+                    u = msg.get("usage")
+                    if not isinstance(u, dict):
+                        continue
+                    ts = rec.get("timestamp") or ""
+                    if ts[:19] < cut_iso:
+                        continue
+                    mid = msg.get("id")     # dedupe before parsing: duplicates shouldn't pay it
+                    if mid:
+                        if mid in seen:
+                            continue
+                        seen.add(mid)
+                    fam, name = _model_display(msg.get("model"))
+                    if not fam:
+                        continue
+                    s = agg.setdefault(name, {"family": FAMILY_NAMES[fam], "msgs": 0, "input": 0,
+                                              "output": 0, "cache_write": 0, "cache_read": 0,
+                                              "cost": 0.0, "efforts": {}})
+                    s["msgs"] += 1
+                    s["input"] += u.get("input_tokens", 0) or 0
+                    s["output"] += u.get("output_tokens", 0) or 0
+                    s["cache_write"] += u.get("cache_creation_input_tokens", 0) or 0
+                    s["cache_read"] += u.get("cache_read_input_tokens", 0) or 0
+                    c = _msg_cost(fam, u)
+                    s["cost"] += c
+                    ef = s["efforts"].setdefault(rec.get("effort") or "", {"cost": 0.0, "msgs": 0})
+                    ef["cost"] += c
+                    ef["msgs"] += 1
+                    if ts >= today_utc:
+                        today_cost += c
+        except Exception:
+            continue                                   # one unreadable file must not sink the scan
+    def effort_slices(e):
+        return [{"effort": k or None, "rank": EFFORT_ORDER.get(k, 9),
+                 "cost": round(v["cost"], 2), "msgs": v["msgs"]}
+                for k, v in sorted(e.items(), key=lambda kv: EFFORT_ORDER.get(kv[0], 9))]
+    models = [{"name": n, "family": s["family"], "msgs": s["msgs"], "input": s["input"],
+               "output": s["output"], "cache_write": s["cache_write"],
+               "cache_read": s["cache_read"], "cost": round(s["cost"], 2),
+               "efforts": effort_slices(s["efforts"])}
+              for n, s in sorted(agg.items(), key=lambda kv: -kv[1]["cost"])]
+    return {"schema": 2, "as_of": round(now, 1), "ttl_s": INSIGHTS_TTL,
+            "day": datetime.now().astimezone().strftime("%Y-%m-%d"),
+            "window_days": INSIGHTS_WINDOW_D,
+            "total_cost": round(sum(s["cost"] for s in agg.values()), 2),
+            "today_cost": round(today_cost, 2), "models": models,
+            "note": "API list-price equivalents, not billing"}
+
+def _replace_file(path, text):
+    """Write-then-rename, pid-suffixed: concurrent pollers may write at once, and a reader must
+    never see a half-written file."""
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+def cmd_insights(as_json):
+    """Print the trailing-week transcript aggregate, computing at most once per INSIGHTS_TTL —
+    callers poll freely and the scan runs only when it's due. A cache from another schema or
+    another local day recomputes: the shape must match this printer, and the "today" figure must
+    not survive midnight."""
+    data = None
+    try:
+        with open(INSIGHTS_CACHE) as f:
+            cached = json.load(f)
+        if (cached.get("schema") == 2 and time.time() - cached.get("as_of", 0) < INSIGHTS_TTL
+                and cached.get("day") == datetime.now().astimezone().strftime("%Y-%m-%d")):
+            data = cached
+    except Exception:
+        pass
+    if data is None:
+        data = compute_insights()
+        try:
+            os.makedirs(STATE_DIR, exist_ok=True)
+            _replace_file(INSIGHTS_CACHE, json.dumps(data))
+        except Exception:
+            pass
+    if as_json:
+        print(json.dumps(data, indent=2))
+        return
+    print(f"past {data['window_days']} days · API list-price equivalent "
+          f"(not billing) · today ${data['today_cost']:,.0f}")
+    w = max([5] + [len(m["name"]) for m in data["models"]])
+    def line(*cells):
+        spec = [(w, "<"), (8, ">"), (9, ">"), (9, ">"), (10, ">"), (10, ">"), (9, ">")]
+        print(" ".join(f"{c:{a}{wd}}" for c, (wd, a) in zip(cells, spec)))
+    line("model", "msgs", "input", "output", "cache wr", "cache rd", "cost")
+    for m in data["models"]:
+        line(m["name"], f"{m['msgs']:,}", f"{m['input']:,}", f"{m['output']:,}",
+             f"{m['cache_write']:,}", f"{m['cache_read']:,}", "$%.0f" % m["cost"])
+    line("total", "", "", "", "", "", "$%.0f" % data["total_cost"])
+
 def cmd_app():
     """Compile native/ClaudeUsageBar.swift into "Claude Usage.app" and (re)launch it — /Applications
     when writable, else ~/Applications.
@@ -2338,6 +2508,8 @@ def main():
         cmd_install(); return
     if arg == "app":
         cmd_app(); return
+    if arg == "insights":
+        cmd_insights("--json" in sys.argv[2:]); return
     if arg == "doctor":
         cmd_doctor(); return
     if arg == "interval":

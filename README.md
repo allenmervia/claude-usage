@@ -213,9 +213,11 @@ claude-usage app
 
 builds a native macOS menu-bar app from the same data and installs it to
 `/Applications` — or `~/Applications` when that isn't writable (needs the Xcode
-Command Line Tools — `xcode-select --install` — and macOS 13+). Same gauges in the bar, same accounts, bars, and trend in the
-dropdown — plus what a native window can do that a menu can't: countdowns that
-tick while it's open, click-anywhere-to-switch account cards, and plan chips.
+Command Line Tools — `xcode-select --install` — and macOS 13+). Same gauges in the bar, and two tabs in the dropdown: **Usage**
+(the accounts, bars, and trend, plus what a native window can do that a menu
+can't — countdowns that tick while it's open, click-anywhere-to-switch account
+cards, plan chips) and **Insights** (the weekly burn chart, and the trailing
+week's model mix priced from local transcripts — see `claude-usage insights`).
 Refresh cadence, launch-at-login, and quit live behind the gear.
 
 The app is a shell over this script: it runs `claude-usage --json` on its timer and

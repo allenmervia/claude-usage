@@ -4,7 +4,7 @@
 //   swiftc -swift-version 5 -parse-as-library -D SNAPSHOT \
 //       native/ClaudeUsageBar.swift native/snapshot.swift -o snap
 //   claude-usage --json > payload.json
-//   ./snap payload.json out.png [light|dark]
+//   ./snap payload.json out.png [light|dark] [usage|insights] [insights.json]
 
 import SwiftUI
 import AppKit
@@ -18,9 +18,13 @@ enum Snapshot {
             exit(2)
         }
         let appearance = args.count > 3 ? args[3] : "dark"
+        let tab = args.count > 4 ? args[4] : "usage"
+        let insightsPath = args.count > 5 ? args[5] : nil
         DispatchQueue.main.async {
-            do { try render(payloadPath: args[1], outPath: args[2], appearance: appearance) }
-            catch {
+            do {
+                try render(payloadPath: args[1], outPath: args[2], appearance: appearance,
+                           tab: tab, insightsPath: insightsPath)
+            } catch {
                 FileHandle.standardError.write(Data("snapshot failed: \(error)\n".utf8))
                 exit(1)
             }
@@ -30,11 +34,16 @@ enum Snapshot {
     }
 
     @MainActor
-    static func render(payloadPath: String, outPath: String, appearance: String) throws {
+    static func render(payloadPath: String, outPath: String, appearance: String,
+                       tab: String, insightsPath: String?) throws {
         let data = try Data(contentsOf: URL(fileURLWithPath: payloadPath))
         let payload = try JSONDecoder().decode(Payload.self, from: data)
         let model = Model()
         model.payload = payload
+        model.tab = tab == "insights" ? 1 : 0
+        if let p = insightsPath, let d = try? Data(contentsOf: URL(fileURLWithPath: p)) {
+            model.insights = try? JSONDecoder().decode(InsightsPayload.self, from: d)
+        }
         let view = MenuView()
             .environmentObject(model)
             .background(Color(nsColor: .windowBackgroundColor))

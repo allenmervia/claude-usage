@@ -60,9 +60,43 @@ struct DisplayRow: Decodable {
 struct Trend: Decodable {
     var series: [[Double]]?
     var note: String?
-    var pace_per_hour: Double?
     var reset_ts: Double?
+    var window_s: Double?
 }
+
+// claude-usage insights --json: the trailing week's transcript aggregates
+struct InsightsPayload: Decodable {
+    var as_of: Double?
+    var ttl_s: Double?
+    var window_days: Int?
+    var total_cost: Double?
+    var today_cost: Double?
+    var models: [ModelRow]?
+}
+
+struct ModelRow: Decodable {
+    var name: String
+    var family: String?
+    var msgs: Int?
+    var cost: Double?
+    var efforts: [EffortSlice]?
+}
+
+struct EffortSlice: Decodable {
+    var effort: String?
+    var rank: Int?
+    var cost: Double?
+}
+
+// Identity colors for series and model families — distinct from the severity palette so a line or
+// bar never reads as a state.
+let seriesPalette: [Color] = [
+    Color(red: 0.22, green: 0.53, blue: 0.90),   // blue
+    Color(red: 0.85, green: 0.35, blue: 0.15),   // orange
+    Color(red: 0.10, green: 0.62, blue: 0.44),   // green-aqua
+    Color(red: 0.57, green: 0.52, blue: 0.91),   // violet
+    Color(red: 0.84, green: 0.32, blue: 0.51),   // magenta
+]
 
 // MARK: - Severity colors (the tool's green/amber/red at 65/90, dim for no reading)
 
@@ -189,6 +223,9 @@ final class Model: ObservableObject {
     @Published var refreshing = false
     @Published var switching: String?          // uuid mid-switch
     @Published var lastError: String?
+    @Published var insights: InsightsPayload?
+    @Published var insightsError: String?
+    @Published var tab = 0                     // 0 Usage · 1 Insights
     // Plain @Published backed by UserDefaults — @AppStorage inside an ObservableObject doesn't
     // fire objectWillChange, which would leave the gear menu's checkmark on the old cadence.
     @Published var intervalMinutes: Int {
@@ -222,20 +259,37 @@ final class Model: ObservableObject {
         }
     }
 
-    func refresh() async {
-        guard !refreshing else { return }
+    func refresh(force: Bool = false) async {
+        // force lets a completed switch redraw immediately even if a timer refresh is mid-flight —
+        // otherwise the guard would swallow it and the ▶ would sit on the old account for a tick.
+        if refreshing && !force { return }
         refreshing = true
-        defer { refreshing = false }
         do {
             let data = try await Backend.run(["--json"])
             let p = try JSONDecoder().decode(Payload.self, from: data)
-            payload = p
+            // Animate the swap: after a switch the ▶ moves and the spend-next chip can disappear,
+            // and an unanimated reflow reads as the window jumping.
+            withAnimation(.easeOut(duration: 0.18)) { payload = p }
             // No readable gauge still needs a visible status item: a dim empty ring, not a blank.
             let specs = (p.gauges?.isEmpty == false) ? p.gauges! : [[nil, nil]]
             icon = IconRenderer.render(specs: specs)
             lastError = nil
         } catch {
             lastError = error.localizedDescription
+        }
+        refreshing = false
+        // Insights ride along only once the backend's cache has aged out (the payload carries its
+        // TTL), so ordinary refreshes spawn nothing extra — and a cold scan never blocks the
+        // usage data above, which has already landed.
+        let age = Date().timeIntervalSince1970 - (insights?.as_of ?? 0)
+        if insights == nil || age > (insights?.ttl_s ?? 1800) {
+            do {
+                let data = try await Backend.run(["insights", "--json"])
+                insights = try JSONDecoder().decode(InsightsPayload.self, from: data)
+                insightsError = nil
+            } catch {
+                insightsError = error.localizedDescription
+            }
         }
     }
 
@@ -249,15 +303,12 @@ final class Model: ObservableObject {
         } catch {
             lastError = error.localizedDescription
         }
-        await refresh()
+        await refresh(force: true)
     }
 
     var claude: [Account] { payload?.accounts.filter { !$0.isCodex } ?? [] }
     var codex: [Account] { payload?.accounts.filter { $0.isCodex } ?? [] }
     var multiProvider: Bool { !claude.isEmpty && !codex.isEmpty }
-    var hasInsights: Bool {
-        payload?.accounts.contains { ($0.display?.trend?.series?.count ?? 0) >= 2 } == true
-    }
 }
 
 // MARK: - Countdown re-derivation ("3h 22m left" stays live while the window is open)
@@ -269,6 +320,14 @@ func relString(_ date: Date, now: Date) -> String {
     if d > 0 { return "\(d)d \(h)h" }
     if h > 0 { return "\(h)h \(m)m" }
     return "\(m)m"
+}
+
+func agoText(since ts: Double?) -> String {
+    guard let ts = ts else { return "—" }
+    let secs = Int(Date().timeIntervalSince1970 - ts)
+    if secs < 90 { return "just now" }
+    if secs < 3600 { return "\(secs / 60)m ago" }
+    return "\(secs / 3600)h ago"
 }
 
 func liveMeta(_ row: DisplayRow, now: Date) -> String {
@@ -299,20 +358,28 @@ struct MenuView: View {
                     ProgressView().controlSize(.small)
                     Text(model.lastError ?? "Reading usage…").font(.system(size: 12)).foregroundStyle(.secondary)
                 }.padding(12)
-            } else if model.hasInsights {
-                // Two columns once there is history to chart: accounts left, insights right.
-                HStack(alignment: .top, spacing: 10) {
-                    VStack(alignment: .leading, spacing: 4) { accountsColumn }.frame(width: 336)
-                    InsightsView().frame(width: 300)
-                }
-                FooterView()
             } else {
-                accountsColumn
+                // Centered, Settings-style; the window keeps one width across tabs so switching
+                // never moves or resizes the panel.
+                Picker("", selection: $model.tab) {
+                    Text("Usage").tag(0)
+                    Text("Insights").tag(1)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 200)
+                .frame(maxWidth: .infinity)
+                .padding(.bottom, 4)
+                if model.tab == 1 {
+                    InsightsTab()
+                } else {
+                    accountsColumn
+                }
                 FooterView()
             }
         }
         .padding(8)
-        .frame(width: model.payload != nil && model.hasInsights ? 664 : 352)
+        .frame(width: 420)
         .onAppear { Task { await model.refresh() } }
     }
 
@@ -326,115 +393,349 @@ struct MenuView: View {
     }
 }
 
-// MARK: - Insights: one chart carrying both stories — burn (solid history), forecast (dashed at the
-// trailing-day pace), and the reset runway (each projection ends at its account's reset flag; the
-// gap to the 100% line is the budget that expires there).
+// MARK: - Insights tab: the weekly burn (per-account window bands on one timeline) and the model
+// mix (the trailing week's transcript aggregates from the backend scan).
 
-struct InsightsView: View {
+struct InsightsTab: View {
     @EnvironmentObject var model: Model
+
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            SectionHeader("BURN & FORECAST")
-            BurnChart(accounts: model.payload?.accounts ?? [])
-                .frame(height: 232)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 8)
+            SectionHeader("WEEKLY BURN")
+            WindowStrips(accounts: model.payload?.accounts ?? [])
+                .padding(.horizontal, 8)
+                .padding(.vertical, 10)
                 .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.03)))
-            Text("solid: weekly used · dashed: at the trailing-day pace · ┃ weekly reset")
-                .font(.system(size: 9.5))
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-                .padding(.horizontal, 4)
+            Text("each band is that account's current week on one timeline · the line is now")
+                .font(.system(size: 9.5)).foregroundStyle(.secondary).padding(.horizontal, 4)
+            SectionHeader("MODEL MIX · PAST 7 DAYS")
+            ModelMixPanel(insights: model.insights, error: model.insightsError)
         }
     }
 }
 
-struct BurnChart: View {
+// Every account's window as a band on one shared timeline: each band spans that account's
+// current window (start → reset, length from the backend), the line inside is its recorded burn,
+// and a single now-line crosses all rows — the reset stagger reads as a shape.
+struct WindowStrips: View {
     let accounts: [Account]
-    // Identity colors, distinct from the severity palette so a line never reads as a state.
-    static let palette: [Color] = [
-        Color(red: 0.22, green: 0.53, blue: 0.90),   // blue
-        Color(red: 0.85, green: 0.35, blue: 0.15),   // orange
-        Color(red: 0.10, green: 0.62, blue: 0.44),   // green-aqua
-        Color(red: 0.57, green: 0.52, blue: 0.91),   // violet
-        Color(red: 0.84, green: 0.32, blue: 0.51),   // magenta
-    ]
+    @State private var hover: CGPoint?
+
+    private static let rowH: CGFloat = 34, gap: CGFloat = 9, axisH: CGFloat = 15, labelW: CGFloat = 60
 
     var body: some View {
-        Canvas { ctx, size in
-            let entries: [(String, Trend)] = accounts.compactMap { a in
-                guard let t = a.display?.trend, (t.series?.count ?? 0) >= 2 else { return nil }
-                return (a.label ?? a.uuid, t)
+        // Color keys on the account's position in the payload, then rows sort by window start so
+        // the bands cascade top-left to bottom-right — identity stays put while order follows the
+        // week as resets rotate.
+        let entries: [Entry] = accounts.enumerated().compactMap { idx, a -> Entry? in
+            guard let t = a.display?.trend, (t.series?.count ?? 0) >= 2,
+                  let rt = t.reset_ts else { return nil }
+            let win = t.window_s ?? 7 * 86400
+            return Entry(name: a.label ?? a.uuid, trend: t,
+                         color: seriesPalette[idx % seriesPalette.count],
+                         start: rt - win, reset: rt)
+        }
+        .sorted { $0.start < $1.start }
+        if entries.isEmpty {
+            Text("collecting history…").font(.system(size: 11)).foregroundStyle(.secondary)
+        } else {
+            HStack(alignment: .top, spacing: 8) {
+                VStack(alignment: .leading, spacing: Self.gap) {
+                    ForEach(Array(entries.enumerated()), id: \.offset) { _, e in
+                        VStack(alignment: .leading, spacing: 0) {
+                            Text(e.name).font(.system(size: 10.5, weight: .semibold))
+                                .foregroundStyle(e.color)
+                            Text("\(Int(e.trend.series?.last?.last ?? 0))%")
+                                .font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary)
+                        }
+                        .frame(width: Self.labelW, height: Self.rowH, alignment: .leading)
+                    }
+                }
+                canvas(entries)
             }
-            guard !entries.isEmpty else { return }
+        }
+    }
+
+    struct Entry {
+        let name: String
+        let trend: Trend
+        let color: Color
+        let start: Double
+        let reset: Double
+    }
+
+    // One canvas, one time axis: every account's week is a band placed where it falls in real
+    // time, so a single now-line crosses all rows and the reset stagger reads as a shape.
+    private static let dayFmt: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "EEE"; return f
+    }()
+    private static let resetFmt: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "EEE ha"; return f
+    }()
+    private static let hoverFmt: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "EEE h:mm a"; return f
+    }()
+
+    private func canvas(_ entries: [Entry]) -> some View {
+        let H = CGFloat(entries.count) * Self.rowH + CGFloat(entries.count - 1) * Self.gap + Self.axisH
+        return Canvas { ctx, size in
             let now = Date().timeIntervalSince1970
-            var t0 = entries.compactMap { $0.1.series?.first?.first }.min() ?? now - 84 * 3600
-            var t1 = max(entries.compactMap { $0.1.reset_ts }.max() ?? 0, now + 6 * 3600)
-            t0 = min(t0, now - 3600)
-            t1 += (t1 - t0) * 0.02
-            let padL: CGFloat = 22, padR: CGFloat = 40, padT: CGFloat = 8, padB: CGFloat = 16
-            func X(_ t: Double) -> CGFloat { padL + CGFloat((t - t0) / (t1 - t0)) * (size.width - padL - padR) }
-            func Y(_ v: Double) -> CGFloat { padT + CGFloat(1 - min(105, max(0, v)) / 105) * (size.height - padT - padB) }
-            func line(_ a: CGPoint, _ b: CGPoint) -> Path {
-                var p = Path(); p.move(to: a); p.addLine(to: b); return p
+            let t0 = (entries.map { $0.start }.min() ?? now - 7 * 86400) - 3600
+            var t1 = max(entries.map { $0.reset }.max() ?? now, now) + 3600
+            t1 += (t1 - t0) * 0.01
+            func X(_ t: Double) -> CGFloat {
+                CGFloat((min(max(t, t0), t1) - t0) / (t1 - t0)) * size.width
             }
-            for v: Double in [0, 50, 100] {
-                ctx.stroke(line(CGPoint(x: padL, y: Y(v)), CGPoint(x: size.width - padR, y: Y(v))),
-                           with: .color(v == 100 ? sevColor(95).opacity(0.45) : Color.primary.opacity(0.08)),
-                           style: StrokeStyle(lineWidth: 1, dash: v == 100 ? [3, 3] : []))
-                ctx.draw(Text("\(Int(v))").font(.system(size: 8)).foregroundColor(.secondary),
-                         at: CGPoint(x: padL - 11, y: Y(v)))
-            }
-            let df = DateFormatter(); df.dateFormat = "EEE"
+            func rowTop(_ i: Int) -> CGFloat { CGFloat(i) * (Self.rowH + Self.gap) }
+            let axisY = H - Self.axisH
+            // shared day grid + weekday labels, once, under all rows
             var day = Calendar.current.startOfDay(for: Date(timeIntervalSince1970: t0)).addingTimeInterval(86400)
             while day.timeIntervalSince1970 < t1 {
                 let x = X(day.timeIntervalSince1970)
-                ctx.stroke(line(CGPoint(x: x, y: padT), CGPoint(x: x, y: size.height - padB)),
-                           with: .color(Color.primary.opacity(0.05)))
-                ctx.draw(Text(df.string(from: day)).font(.system(size: 8)).foregroundColor(.secondary),
-                         at: CGPoint(x: x, y: size.height - padB + 8))
+                var p = Path(); p.move(to: CGPoint(x: x, y: 0)); p.addLine(to: CGPoint(x: x, y: axisY))
+                ctx.stroke(p, with: .color(Color.primary.opacity(0.06)))
+                // "now" owns its stretch of the axis — nearby day labels yield to it
+                if x > 12 && x < size.width - 12 && abs(x - X(now)) > 17 {
+                    ctx.draw(Text(Self.dayFmt.string(from: day)).font(.system(size: 7.5)).foregroundColor(.secondary),
+                             at: CGPoint(x: x, y: axisY + Self.axisH / 2 + 1))
+                }
                 day = day.addingTimeInterval(86400)
             }
-            ctx.stroke(line(CGPoint(x: X(now), y: padT), CGPoint(x: X(now), y: size.height - padB)),
-                       with: .color(Color.primary.opacity(0.22)))
-            for (i, (name, t)) in entries.enumerated() {
-                let color = Self.palette[i % Self.palette.count]
-                let s = t.series ?? []
-                var p = Path()
-                for (j, pt) in s.enumerated() where pt.count >= 2 {
-                    let point = CGPoint(x: X(pt[0]), y: Y(pt[1]))
-                    if j == 0 { p.move(to: point) } else { p.addLine(to: point) }
+            for (i, e) in entries.enumerated() {
+                let color = e.color, ws = e.start, rt = e.reset
+                let top = rowTop(i)
+                let band = CGRect(x: X(ws), y: top, width: X(rt) - X(ws), height: Self.rowH)
+                func Y(_ v: Double) -> CGFloat {
+                    top + 3 + CGFloat(1 - min(100, max(0, v)) / 100) * (Self.rowH - 6)
                 }
-                ctx.stroke(p, with: .color(color), style: StrokeStyle(lineWidth: 1.6, lineJoin: .round))
-                guard let last = s.last, last.count >= 2 else { continue }
-                let lastT = last[0], lastV = last[1]
-                var endT = lastT, endV = lastV
-                if let rt = t.reset_ts, rt > lastT {
-                    endT = rt
-                    var d = Path()
-                    d.move(to: CGPoint(x: X(lastT), y: Y(lastV)))
-                    if let pace = t.pace_per_hour, pace > 0 {
-                        let capT = lastT + (100 - lastV) / pace * 3600
-                        if capT < rt {                       // the pace hits the cap before the reset
-                            d.addLine(to: CGPoint(x: X(capT), y: Y(100)))
-                            d.addLine(to: CGPoint(x: X(rt), y: Y(100)))
-                            endV = 100
-                        } else {
-                            endV = lastV + (rt - lastT) / 3600 * pace
-                            d.addLine(to: CGPoint(x: X(rt), y: Y(endV)))
-                        }
-                    } else {
-                        d.addLine(to: CGPoint(x: X(rt), y: Y(lastV)))
+                ctx.drawLayer { layer in
+                    layer.clip(to: Path(roundedRect: band, cornerRadius: 5))
+                    layer.fill(Path(band), with: .color(Color.primary.opacity(0.05)))
+                    if now > ws {   // the stretch still to come sits slightly brighter
+                        layer.fill(Path(CGRect(x: X(now), y: top, width: band.maxX - X(now),
+                                               height: Self.rowH)),
+                                   with: .color(Color.primary.opacity(0.03)))
                     }
-                    ctx.stroke(d, with: .color(color.opacity(0.8)),
-                               style: StrokeStyle(lineWidth: 1.4, dash: [3, 3]))
-                    ctx.stroke(line(CGPoint(x: X(rt), y: Y(endV) - 5), CGPoint(x: X(rt), y: Y(endV) + 5)),
-                               with: .color(color), style: StrokeStyle(lineWidth: 2))
+                    // burn line with a soft area fill beneath it
+                    let pts = (e.trend.series ?? []).filter { $0.count >= 2 && $0[0] >= ws }
+                    if pts.count >= 2 {
+                        var lp = Path(), ap = Path()
+                        for (j, pt) in pts.enumerated() {
+                            let p = CGPoint(x: X(pt[0]), y: Y(pt[1]))
+                            if j == 0 {
+                                lp.move(to: p)
+                                ap.move(to: CGPoint(x: p.x, y: band.maxY)); ap.addLine(to: p)
+                            } else { lp.addLine(to: p); ap.addLine(to: p) }
+                        }
+                        ap.addLine(to: CGPoint(x: X(pts.last![0]), y: band.maxY))
+                        ap.closeSubpath()
+                        layer.fill(ap, with: .color(color.opacity(0.13)))
+                        layer.stroke(lp, with: .color(color),
+                                     style: StrokeStyle(lineWidth: 1.5, lineJoin: .round))
+                        let lastP = CGPoint(x: X(pts.last![0]), y: Y(pts.last![1]))
+                        layer.fill(Path(ellipseIn: CGRect(x: lastP.x - 2, y: lastP.y - 2,
+                                                          width: 4, height: 4)),
+                                   with: .color(color))
+                    }
                 }
-                ctx.draw(Text(name).font(.system(size: 8.5, weight: .semibold)).foregroundColor(color),
-                         at: CGPoint(x: X(endT) + 3, y: Y(endV) - 7), anchor: .leading)
+                // reset label just inside the band's end
+                ctx.draw(Text("↺ \(Self.resetFmt.string(from: Date(timeIntervalSince1970: rt)))")
+                            .font(.system(size: 8.5)).foregroundColor(.secondary),
+                         at: CGPoint(x: band.maxX - 4, y: top + 8), anchor: .trailing)
+            }
+            // one now-line through every row
+            var nowLine = Path()
+            nowLine.move(to: CGPoint(x: X(now), y: 0)); nowLine.addLine(to: CGPoint(x: X(now), y: axisY))
+            ctx.stroke(nowLine, with: .color(Color.primary.opacity(0.45)), style: StrokeStyle(lineWidth: 1.5))
+            ctx.draw(Text("now").font(.system(size: 7.5, weight: .semibold)).foregroundColor(.secondary),
+                     at: CGPoint(x: X(now), y: axisY + Self.axisH / 2 + 1))
+            // hover: crosshair across all rows, values where a row has data at that time
+            if let h = hover, h.x >= 0, h.x <= size.width {
+                let t = t0 + Double(h.x / size.width) * (t1 - t0)
+                var cross = Path()
+                cross.move(to: CGPoint(x: h.x, y: 0)); cross.addLine(to: CGPoint(x: h.x, y: axisY))
+                ctx.stroke(cross, with: .color(Color.primary.opacity(0.3)))
+                var rows: [(String, Color)] = [(Self.hoverFmt.string(from: Date(timeIntervalSince1970: t)), .primary)]
+                for e in entries {
+                    // answer only inside the band — pre-window samples belong to a previous week
+                    // and would contradict the drawn line
+                    let pts = (e.trend.series ?? []).filter { $0.count >= 2 && $0[0] >= e.start }
+                    if t >= e.start, t <= e.reset, let v = Self.value(of: pts, at: t) {
+                        rows.append(("\(e.name)  \(Int(v.rounded()))%", e.color))
+                    }
+                }
+                let boxW: CGFloat = 122, lineH: CGFloat = 12.5
+                let boxH = CGFloat(rows.count) * lineH + 9
+                var bx = h.x + 9
+                if bx + boxW > size.width { bx = h.x - 9 - boxW }
+                let by = max(0, min(h.y - boxH / 2, axisY - boxH))
+                let box = CGRect(x: bx, y: by, width: boxW, height: boxH)
+                ctx.fill(Path(roundedRect: box, cornerRadius: 6),
+                         with: .color(Color(nsColor: .windowBackgroundColor).opacity(0.96)))
+                ctx.stroke(Path(roundedRect: box, cornerRadius: 6),
+                           with: .color(Color.primary.opacity(0.15)))
+                for (j, (text, color)) in rows.enumerated() {
+                    ctx.draw(Text(text).font(.system(size: 9, weight: j == 0 ? .semibold : .regular,
+                                                     design: .monospaced))
+                                .foregroundColor(j == 0 ? .primary : color),
+                             at: CGPoint(x: box.minX + 7, y: box.minY + 4.5 + CGFloat(j) * lineH + lineH / 2),
+                             anchor: .leading)
+                }
             }
         }
+        .frame(height: H)
+        .onContinuousHover { phase in
+            switch phase {
+            case .active(let p): hover = p
+            case .ended: hover = nil
+            }
+        }
+    }
+}
+
+extension WindowStrips {
+    // linear interpolation within the sampled span; nil outside it (no invented values)
+    static func value(of series: [[Double]], at t: Double) -> Double? {
+        let pts = series.filter { $0.count >= 2 }
+        guard let first = pts.first, let last = pts.last, t >= first[0], t <= last[0] else { return nil }
+        var prev = first
+        for p in pts {
+            if p[0] >= t {
+                let span = p[0] - prev[0]
+                if span <= 0 { return p[1] }
+                return prev[1] + (p[1] - prev[1]) * (t - prev[0]) / span
+            }
+            prev = p
+        }
+        return last[1]
+    }
+}
+
+struct ModelMixPanel: View {
+    let insights: InsightsPayload?
+    let error: String?
+    // keyed by the backend's family field — versions within a family share its hue
+    static let colors: [String: Color] = [
+        "Opus": seriesPalette[0], "Fable": seriesPalette[1],
+        "Sonnet": seriesPalette[2], "Haiku": Color(red: 0.79, green: 0.52, blue: 0.0),
+    ]
+    static func color(for row: ModelRow) -> Color {
+        colors[row.family ?? String(row.name.split(separator: " ").first ?? "")] ?? .gray
+    }
+    // effort shows as opacity within a row's bar: deeper effort, fuller ink. Levels the backend
+    // adds later still separate via their rank.
+    static func effortOpacity(_ effort: String?, rank: Int?) -> Double {
+        switch effort {
+        case "max": return 1.0
+        case "xhigh": return 0.86
+        case "high": return 0.72
+        case "medium": return 0.48
+        case "low": return 0.3
+        case nil: return 0.6
+        default: return rank.map { max(0.25, 1.0 - 0.14 * Double($0)) } ?? 0.6
+        }
+    }
+    static func effortLabel(_ effort: String?) -> String {
+        effort == "medium" ? "med" : (effort ?? "unset")
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if let ins = insights, let rows = ins.models, !rows.isEmpty {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(dollars(ins.total_cost)).font(.system(size: 20, weight: .bold))
+                    Text("this week · \(dollars(ins.today_cost)) today")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                }
+                let total = max(ins.total_cost ?? 0, 0.01)
+                ForEach(rows, id: \.name) { row in
+                    HStack(spacing: 6) {
+                        Text(row.name)
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .frame(width: 64, alignment: .leading)
+                        GeometryReader { geo in
+                            let rowCost = max(row.cost ?? 0, 0.001)
+                            let rowW = max(3, geo.size.width * rowCost / total)
+                            let segs = row.efforts ?? []
+                            // segment widths share rowW minus the inter-segment gaps, so the
+                            // stack never overflows the capsule and clips its last section
+                            let usable = max(1, rowW - 1.5 * CGFloat(max(0, segs.count - 1)))
+                            ZStack(alignment: .leading) {
+                                Capsule().fill(Color.primary.opacity(0.08))
+                                HStack(spacing: 1.5) {
+                                    ForEach(Array(segs.enumerated()), id: \.offset) { _, seg in
+                                        Rectangle()
+                                            .fill(Self.color(for: row)
+                                                .opacity(Self.effortOpacity(seg.effort, rank: seg.rank)))
+                                            .frame(width: max(0.5, usable * (seg.cost ?? 0) / rowCost))
+                                    }
+                                }
+                                .frame(width: rowW, alignment: .leading)
+                                .clipShape(Capsule())
+                            }
+                        }
+                        .frame(height: 8)
+                        Text(dollars(row.cost))
+                            .font(.system(size: 10.5, design: .monospaced))
+                            .frame(width: 52, alignment: .trailing)
+                        Text("\(row.msgs ?? 0) msgs")
+                            .font(.system(size: 10)).foregroundStyle(.secondary)
+                            .frame(width: 74, alignment: .trailing)
+                    }
+                }
+                // legend deduped on the raw effort keys; labels applied only at render
+                let effortKeys: [EffortSlice] = {
+                    var seen = Set<String>()
+                    var out: [EffortSlice] = []
+                    for row in rows {
+                        for seg in row.efforts ?? [] where seen.insert(seg.effort ?? "unset").inserted {
+                            out.append(seg)
+                        }
+                    }
+                    return out
+                }()
+                if effortKeys.count > 1 {
+                    HStack(spacing: 10) {
+                        Text("effort:").font(.system(size: 9.5)).foregroundStyle(.secondary)
+                        ForEach(Array(effortKeys.enumerated()), id: \.offset) { _, seg in
+                            HStack(spacing: 4) {
+                                RoundedRectangle(cornerRadius: 2)
+                                    .fill(Color.primary.opacity(Self.effortOpacity(seg.effort, rank: seg.rank)))
+                                    .frame(width: 8, height: 8)
+                                Text(Self.effortLabel(seg.effort))
+                                    .font(.system(size: 9.5)).foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    .padding(.top, 2)
+                }
+                Text("API list-price equivalents, not a bill · scanned \(agoText(since: ins.as_of))")
+                    .font(.system(size: 9.5)).foregroundStyle(.secondary).padding(.top, 2)
+            } else if let error = error {
+                Text("⚠ couldn't read the transcript scan — \(error)")
+                    .font(.system(size: 10.5)).foregroundStyle(sevColor(70))
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.vertical, 8)
+            } else {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("scanning the week's transcripts…")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                }
+                .padding(.vertical, 10)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 9)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.03)))
+    }
+
+    private func dollars(_ v: Double?) -> String {
+        guard let v = v else { return "—" }
+        if v >= 10 { return "$\(Int(v.rounded()))" }
+        return String(format: "$%.2f", v)
     }
 }
 
@@ -507,9 +808,21 @@ struct AccountCard: View {
 
     private var header: some View {
         HStack(alignment: .firstTextBaseline, spacing: 6) {
-            if account.active == true {
-                Text("▶").font(.system(size: 9)).foregroundStyle(.primary)
+            // One reserved leading slot for all rows keeps every name on the same left edge, and
+            // gives the hover affordance a meaningful home: ⇄ appears exactly where the ▶ will sit
+            // once this account is the active one. The plan pill never moves.
+            Group {
+                if model.switching == account.uuid {
+                    ProgressView().controlSize(.mini)
+                } else if account.active == true {
+                    Text("▶").font(.system(size: 9)).foregroundStyle(.primary)
+                } else if hovered && account.display?.can_switch == true {
+                    Text("⇄").font(.system(size: 11, weight: .semibold)).foregroundStyle(Color.accentColor)
+                } else {
+                    Text(" ").font(.system(size: 9))
+                }
             }
+            .frame(width: 13, alignment: .leading)
             Text(account.label ?? account.uuid)
                 .font(.system(size: 13, weight: .semibold))
             if let em = account.email, em.contains("@"), em != account.label {
@@ -520,33 +833,16 @@ struct AccountCard: View {
                     .truncationMode(.middle)
             }
             Spacer(minLength: 4)
-            // The pill stays in the layout and the switch button draws over it, so hovering never
-            // changes the header's metrics — a swap would bump every row below by a pixel.
-            ZStack(alignment: .trailing) {
-                if let plan = account.display?.plan, !plan.isEmpty {
-                    Text(plan)
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 1)
-                        .background(Capsule().fill(Color.primary.opacity(0.07)))
-                        .opacity(showSwitch ? 0 : 1)
-                }
-                if showSwitch {
-                    // passive label: the card itself is the button
-                    if model.switching == account.uuid {
-                        ProgressView().controlSize(.mini)
-                    } else {
-                        Text("⇄ Switch")
-                            .font(.system(size: 10.5, weight: .medium))
-                            .foregroundStyle(Color.accentColor)
-                    }
-                }
+            if let plan = account.display?.plan, !plan.isEmpty {
+                Text(plan)
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 1)
+                    .background(Capsule().fill(Color.primary.opacity(0.07)))
             }
         }
     }
-
-    private var showSwitch: Bool { hovered && account.display?.can_switch == true }
 }
 
 struct BarRow: View {
@@ -711,9 +1007,7 @@ struct FooterView: View {
 
     private func updatedText(now: Date) -> String {
         guard let ts = model.payload?.updated_ts else { return "—" }
-        let ago = Int(now.timeIntervalSince(Date(timeIntervalSince1970: ts)))
-        let agoText = ago < 90 ? "just now" : (ago < 3600 ? "\(ago / 60)m ago" : "\(ago / 3600)h ago")
-        return "Updated \(agoText) · refreshes every \(model.intervalMinutes)m"
+        return "Updated \(agoText(since: ts)) · refreshes every \(model.intervalMinutes)m"
     }
 }
 
