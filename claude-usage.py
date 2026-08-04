@@ -39,8 +39,9 @@ Usage:
   claude-usage setup      guided first-time setup (register account, optional menu bar + PATH)
   claude-usage            table of all known accounts (default)
   claude-usage install    add the menu-bar view (installs xbar if needed, links + launches it)
+  claude-usage app        build + launch the native menu-bar app (needs Xcode Command Line Tools)
   claude-usage doctor     check the setup and report what needs fixing
-  claude-usage interval N set the menu-bar refresh cadence (1m / 5m / 10m / 30m)
+  claude-usage interval N set the xbar plugin's refresh cadence (the native app has its own, in its gear menu)
   claude-usage --json     machine-readable JSON
   claude-usage --xbar     xbar/SwiftBar menu-bar format
   claude-usage capture    explicitly ingest the active account (same as a run)
@@ -405,6 +406,104 @@ def data_ts():
     c = load_cache()
     return c.get("ts") if c else None
 
+# ---- usage history ----------------------------------------------------------
+# One JSON line per fresh fetch: {"ts": ..., "a": {"<uuid>": {"fh": pct, "wk": pct}}}. This exists to
+# answer the rate questions — trend, pace, cap forecast — that a point-in-time reading can't. It holds
+# percentages keyed by the uuids the index already carries: no secrets, no identity, so it lives in
+# the state dir like the cache. Current state is still always the endpoint's answer, never read back
+# from here — an out-of-band usage reset simply appears, and only the trend line remembers it.
+
+HISTORY = os.path.join(STATE_DIR, "history.jsonl")
+HISTORY_KEEP_S = 14 * 86400           # two weeks: the trend window with room for longer-range views
+TREND_S = int(84 * 3600)              # the dropdown trend window: 3½ days
+PACE_S = 24 * 3600                    # pace = weekly delta over the trailing day
+
+def append_history(rows, ts):
+    entry = {}
+    for r in rows:
+        if r.get("error") or r.get("stale"):
+            continue                   # last-known values would flatten the very trend they'd enter
+        if r.get("provider") == "codex":
+            wins = codex_display_windows(r)
+            if wins:
+                # positional longest, matching codex_ring_spec's ring — filtering blanks first would
+                # let a 5-hour reading stand in for an expired weekly and corrupt the series. Only a
+                # window longer than a day is a weekly sample at all.
+                w = wins[-1]
+                if w.get("pct") is not None and (w.get("minutes") or 0) > 1440:
+                    entry[r["uuid"]] = {"wk": w["pct"]}
+        else:
+            fh = (r.get("five_hour") or {}).get("pct")
+            wk = (r.get("seven_day") or {}).get("pct")
+            if fh is not None or wk is not None:
+                entry[r["uuid"]] = {"fh": fh, "wk": wk}
+    if not entry:
+        return
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(HISTORY, "a") as f:
+            f.write(json.dumps({"ts": round(ts, 1), "a": entry}, separators=(",", ":")) + "\n")
+        # Trim only when there is actually something to drop: the size check alone would rewrite the
+        # whole file on every append once past the threshold, and the day of slack past the horizon
+        # keeps back-to-back rewrites from chasing the boundary.
+        if os.path.getsize(HISTORY) > 512 * 1024 and _history_oldest() < ts - HISTORY_KEEP_S - 86400:
+            kept = [s for s in load_history() if s["ts"] >= ts - HISTORY_KEEP_S]
+            tmp = f"{HISTORY}.{os.getpid()}.tmp"       # per-process: two pollers may trim at once
+            with open(tmp, "w") as f:
+                f.writelines(json.dumps(s, separators=(",", ":")) + "\n" for s in kept)
+            os.replace(tmp, HISTORY)
+    except Exception:
+        pass                           # history is an enrichment; a full disk must not break the render
+
+def _history_oldest():
+    """ts of the first (oldest) line, cheaply — the trim decision must not parse the whole file."""
+    try:
+        with open(HISTORY) as f:
+            return json.loads(f.readline())["ts"]
+    except Exception:
+        return float("-inf")           # unreadable first line: the rewrite is the repair
+
+def load_history(max_age_s=None):
+    out = []
+    try:
+        with open(HISTORY) as f:
+            for line in f:
+                try:
+                    s = json.loads(line)
+                except Exception:
+                    continue           # a half-written last line (crash mid-append) skips cleanly
+                if isinstance(s, dict) and isinstance(s.get("ts"), (int, float)) and isinstance(s.get("a"), dict):
+                    out.append(s)
+    except Exception:
+        return []
+    if max_age_s is not None:
+        cut = time.time() - max_age_s
+        out = [s for s in out if s["ts"] >= cut]
+    out.sort(key=lambda s: s["ts"])    # appends are chronological until a clock step; series code isn't
+    return out
+
+def weekly_series(hist, uuid):
+    pts = []
+    for s in hist:
+        e = s["a"].get(uuid)
+        if isinstance(e, dict) and isinstance(e.get("wk"), (int, float)):
+            pts.append((s["ts"], e["wk"]))
+    return pts
+
+def weekly_pace(pts, now=None):
+    """%/hour over the trailing day — computed from the most recent weekly reset visible in the
+    samples onward, since spanning a reset would read as negative pace. None until the samples cover
+    at least three hours, so a single refresh can't invent a rate."""
+    now = now or time.time()
+    day = [(t, v) for t, v in pts if t >= now - PACE_S]
+    for i in range(len(day) - 1, 0, -1):
+        if day[i][1] < day[i - 1][1] - 1:              # a drop >1pt is a reset, not endpoint jitter
+            day = day[i:]
+            break
+    if len(day) < 2 or day[-1][0] - day[0][0] < 3 * 3600:
+        return None
+    return (day[-1][1] - day[0][1]) / ((day[-1][0] - day[0][0]) / 3600)
+
 def collect(ingest=True):
     """Cached wrapper: debounce rapid refreshes, and fall back to last-known values on a rate-limit.
 
@@ -422,6 +521,7 @@ def collect(ingest=True):
     codex  = [r for r in rows if r.get("provider") == "codex"]
     if not claude or any(not r.get("error") for r in claude):  # got fresh Claude data (or none to fetch)
         save_cache(rows, now)
+        append_history(rows, now)
         return rows
     if cache and cache.get("rows"):                           # every Claude read errored → last known Claude
         stale = [r for r in cache["rows"] if r.get("provider", "claude") == "claude"]
@@ -936,8 +1036,113 @@ def render_table(rows):
         print(f"{C['dim']}{lead} — log into your other accounts with the `claude` CLI "
               f"(`claude` → /login) to add them.{C['x']}\n")
 
+def has_usage(r):
+    return not r.get("error") and (r.get("five_hour") or {}).get("pct") is not None
+
+def pace_note(pace):
+    """The trend row's caption. Sub-half-percent days read as noise ("+0%/day"), so they say what
+    they mean instead."""
+    if pace is None:
+        return "past 3½ days"
+    day = max(0, pace) * 24
+    return "steady" if day < 0.5 else f"+{day:.0f}%/day"
+
+def title_specs(rows):
+    """(ring pct, pie pct) per active provider — the menu-bar gauge pair. One definition feeds both
+    renderers: the xbar title draws it as a PNG, the native app as an NSImage."""
+    claude_rows = [r for r in rows if r.get("provider", "claude") == "claude"]
+    head = next((r for r in claude_rows if r.get("active") and has_usage(r)), None)
+    specs = []
+    if head:
+        specs.append((head["seven_day"]["pct"] or 0, head["five_hour"]["pct"] or 0))
+    cs = codex_ring_spec(rows)
+    if cs is not None:
+        specs.append(cs)
+    return specs
+
+def can_switch(r):
+    """Whether clicking this account's row can switch to it — a Codex row knows (its credential must
+    have been captured); a Claude row only needs to be parked and readable."""
+    if r.get("provider") == "codex":
+        return bool(r.get("switchable"))
+    return not r.get("active") and not r.get("error")
+
+def _row(label, pct, meta, resets_at=None):
+    """One dropdown line as data. A line that counts down also carries the split — meta_prefix plus
+    resets_at — so the native app can keep "Xh Ym left" ticking by recomposing prefix + countdown
+    instead of parsing the finished text."""
+    row = {"label": label, "pct": pct, "meta": meta, "resets_at": resets_at}
+    dt = parse_dt(resets_at) if resets_at else None
+    if dt:
+        tail = f"{rel(dt)} left"
+        if meta.endswith(tail):
+            row["meta_prefix"] = meta[:-len(tail)]     # "" | "~" | "Tue 5pm · " | "~Tue 5pm · "
+    return row
+
+def _display_rows(r):
+    """The account's dropdown lines as data: {label, pct, meta, resets_at, meta_prefix?}. pct None is
+    a text-only line. Both dropdowns render exactly this list, so their content can't drift. Text
+    arrives raw — escaping for a renderer's syntax (xbar's `|`) is that renderer's job."""
+    rows = []
+    if r.get("provider") == "codex":
+        for w in codex_display_windows(r):
+            if w.get("expired"):
+                rows.append(_row((w.get("label") or "")[:6], None, "window reset — run codex to refresh"))
+            else:
+                rows.append(_row((w.get("label") or "")[:6], w.get("pct") or 0,
+                                 resets_phrase(w.get("resets_at"), "week"), w.get("resets_at")))
+        cr = r.get("credits") or {}
+        if cr.get("has") and cr.get("balance") not in (None, "0"):
+            rows.append(_row("credits", None, str(cr["balance"])))
+        return rows
+    fh, wk = r.get("five_hour") or {}, r.get("seven_day") or {}
+    scoped = [s for s in r.get("scoped", []) if s.get("pct") is not None]
+    rows.append(_row("5-hour", fh.get("pct") or 0, resets_phrase(fh.get("resets_at"), "short"),
+                     fh.get("resets_at")))
+    rows.append(_row("weekly", wk.get("pct") or 0,
+                     wk_phrase(wk, "short") if scoped else wk_phrase(wk, "week"), wk.get("resets_at")))
+    for i, s in enumerate(scoped):
+        rows.append(_row((s.get("model") or "scoped")[:6], s["pct"], week_abs_label(wk) if i == 0 else ""))
+    sp = r.get("spend") or {}
+    if sp.get("enabled") and sp.get("limit"):
+        rows.append(_row("extra", None, f"{usd(sp.get('used') or 0)} / {usd(sp['limit'])} used"))
+    return rows
+
+def trend_view(hist, r):
+    """(series, pace, note) for the trend row, or Nones until an hour of samples exists — minutes of
+    history draw a speck, not a shape."""
+    series = weekly_series(hist, r["uuid"])
+    if len(series) < 2 or series[-1][0] - series[0][0] < 3600:
+        return None, None, None
+    pace = weekly_pace(series)
+    return series, pace, pace_note(pace)
+
+def attach_display(rows):
+    """Give every row a `display` view-model: plan text, switchability, formatted lines, and the
+    trend (series + numeric pace + reset epoch, for charts). All phrasing and strategy stays here,
+    in one place — a consumer that renders `display` verbatim shows what the xbar dropdown shows."""
+    hist = load_history(TREND_S + 3600)
+    for r in rows:
+        d = {"plan": plan_of(r), "can_switch": can_switch(r)}
+        d["rows"] = _display_rows(r) if not r.get("error") else []
+        series, pace, note = trend_view(hist, r)
+        if series and not r.get("error"):
+            t = {"series": [[round(a, 1), b] for a, b in _resample(series, 48)], "note": note}
+            if pace is not None:
+                t["pace_per_hour"] = round(pace, 3)
+            src = (r.get("windows") or [{}])[-1] if r.get("provider") == "codex" else (r.get("seven_day") or {})
+            reset = parse_dt(src.get("resets_at"))
+            if reset:
+                t["reset_ts"] = round(reset.timestamp())
+            d["trend"] = t
+        r["display"] = d
+    return rows
+
 def render_json(rows):
-    print(json.dumps({"accounts": sort_rows(rows),
+    rows = attach_display(sort_rows(rows))
+    print(json.dumps({"accounts": rows, "spend_next": spend_next_display(rows),
+                      "gauges": [list(s) for s in title_specs(rows)],
+                      "updated_ts": data_ts(),
                       "generated_at": datetime.now(timezone.utc).isoformat()}, indent=2))
 
 # ---- menu-bar icon (dynamic ring gauges) ------------------------------------
@@ -1030,10 +1235,115 @@ def menu_icon_b64(specs, scale=4):
                 if a:
                     out[oo], out[oo + 1], out[oo + 2] = r // a, g // a, b // a
                 out[oo + 3] = a // (SS * SS)
-        # Declare the bitmap at 36·scale DPI so the display size is scale-invariant (matching what a
-        # plain 72-DPI scale-2 image showed) while the extra pixels land as retina sharpness.
-        ppm = round(36 * scale / 0.0254)
-        return base64.b64encode(_png(W, H, out, ppm)).decode()
+        return _png_b64(W, H, out, scale)
+    except Exception:
+        return None
+
+def _png_b64(W, H, px, scale):
+    """Encode raw RGBA as a base64 PNG declared at 36·scale DPI — the display size stays
+    scale-invariant while the extra pixels land as retina sharpness. One home for the density
+    convention, so every menu bitmap renders at the same physical size."""
+    import base64
+    return base64.b64encode(_png(W, H, px, round(36 * scale / 0.0254))).decode()
+
+# Menu-line images: xbar renders `image=` on any line, not just the title, placing the bitmap left
+# of the line's text. That is the lane the dropdown bars and trend sparklines ride in — the graphic
+# carries severity and shape, the text keeps the numbers and resets, and menu appearance (light or
+# dark) stays the text's problem, which it already solves. Same conventions as the title gauge:
+# transparent ground, fill at full alpha over a track of the same hue at alpha 55, pHYs for retina.
+# Any failure returns None and the caller falls back to the ANSI text bar.
+
+_BAR_CACHE = {}       # per-run memo — 0% and 100% bars recur across accounts in one render
+
+def _bar_b64(pct, w=64, h=4, scale=4, pad=10):
+    """Rounded meter bar for one window: severity-colored fill on a neutral gray track, analytic edge
+    coverage (distance to the rounded rect), so no supersampling pass is needed. `pad` is transparent
+    left margin baked into the bitmap — xbar always draws an image at the line's left edge, so the
+    indent that nests a bar under its account name has to travel inside the image."""
+    key = (None if pct is None else round(pct, 1), w, h, scale, pad)
+    if key in _BAR_CACHE:
+        return _BAR_CACHE[key]
+    try:
+        import math
+        r0, g0, b0 = _ring_rgb(pct)
+        d0, d1, d2 = RING_RGB["dim"]
+        frac = max(0.0, min(1.0, (pct or 0) / 100.0))
+        PL = pad * scale
+        W, H = PL + w * scale, h * scale
+        rad = H / 2
+        fillw = 0 if frac <= 0 else max(H * 1.0, frac * w * scale)   # any nonzero pct shows one cap
+        px = bytearray(W * H * 4)
+        def cov(x, y, x0, x1):    # pixel-centre coverage of the rounded rect [x0,x1]×[0,H]
+            nx = min(max(x + .5, x0 + rad), x1 - rad)
+            ny = min(max(y + .5, rad), H - rad)
+            d = math.hypot(x + .5 - nx, y + .5 - ny) - rad
+            return max(0.0, min(1.0, .5 - d))
+        for y in range(H):
+            for x in range(W):
+                at = cov(x, y, PL, W) * 60 / 255                 # track: quiet, appearance-neutral
+                af = cov(x, y, PL, PL + fillw) if fillw else 0.0
+                a = af + at * (1 - af)                           # fill composited over track
+                if a <= 0: continue
+                o = (y * W + x) * 4
+                px[o]     = int((r0 * af + d0 * at * (1 - af)) / a)
+                px[o + 1] = int((g0 * af + d1 * at * (1 - af)) / a)
+                px[o + 2] = int((b0 * af + d2 * at * (1 - af)) / a)
+                px[o + 3] = int(a * 255)
+        _BAR_CACHE[key] = _png_b64(W, H, px, scale)
+        return _BAR_CACHE[key]
+    except Exception:
+        return None
+
+def _pad_b64(scale=4):
+    """A transparent strip as wide as the bars' baked-in left inset, so text-only detail lines share
+    the bar images' left edge (the NB text indent is narrower)."""
+    try:
+        return _png_b64(10 * scale, scale, bytearray(10 * scale * scale * 4), scale)
+    except Exception:
+        return None
+
+def _resample(pts, n=24):
+    """At most n of the (ts, value) samples, last-per-bucket — enough shape for a 74-pt sparkline,
+    few enough segments to paint quickly."""
+    if len(pts) <= n: return pts
+    t0, t1 = pts[0][0], pts[-1][0]
+    buckets = [[] for _ in range(n)]
+    for t, v in pts:
+        buckets[min(n - 1, int((t - t0) / ((t1 - t0) or 1) * n))].append((t, v))
+    return [b[-1] for b in buckets if b]
+
+def _spark_b64(pts, w=64, h=12, scale=4, pad=10):
+    """Sparkline of (ts, pct) samples — a 1.5-pt polyline on the 0–100 scale with a dot on the newest
+    sample, colored by that sample's severity. A weekly reset inside the window draws as the dip it
+    is. None when there's no line to draw (fewer than two samples). `pad` as in _bar_b64."""
+    try:
+        import math, base64
+        pts = _resample(pts)
+        if len(pts) < 2 or pts[-1][0] <= pts[0][0]: return None
+        r0, g0, b0 = _ring_rgb(pts[-1][1])
+        PL = pad * scale
+        W, H = PL + w * scale, h * scale
+        inset = 2.2 * scale
+        t0, t1 = pts[0][0], pts[-1][0]
+        XY = [(PL + inset + (t - t0) / (t1 - t0) * (W - PL - 2 * inset),
+               inset + (1 - max(0, min(100, v)) / 100) * (H - 2 * inset)) for t, v in pts]
+        px = bytearray(W * H * 4)
+        def paint(cx, cy, ex, ey, r):          # capsule from (cx,cy) to (ex,ey), radius r, max-alpha
+            dx, dy = ex - cx, ey - cy
+            L2 = dx * dx + dy * dy or 1e-9
+            for y in range(max(0, int(min(cy, ey) - r - 1)), min(H, int(max(cy, ey) + r + 2))):
+                for x in range(max(0, int(min(cx, ex) - r - 1)), min(W, int(max(cx, ex) + r + 2))):
+                    t = max(0.0, min(1.0, ((x + .5 - cx) * dx + (y + .5 - cy) * dy) / L2))
+                    a = max(0.0, min(1.0, .5 - (math.hypot(x + .5 - cx - t * dx, y + .5 - cy - t * dy) - r)))
+                    if a <= 0: continue
+                    o = (y * W + x) * 4
+                    na = int(a * 255)
+                    if na > px[o + 3]:
+                        px[o], px[o + 1], px[o + 2], px[o + 3] = r0, g0, b0, na
+        for (a_, b_) in zip(XY, XY[1:]):
+            paint(a_[0], a_[1], b_[0], b_[1], 0.75 * scale)
+        paint(XY[-1][0], XY[-1][1], XY[-1][0], XY[-1][1], 1.6 * scale)
+        return _png_b64(W, H, px, scale)
     except Exception:
         return None
 
@@ -1046,6 +1356,38 @@ def xb(s):
     """
     return re.sub(r"[|\r\n]", "/", str(s))
 
+def spend_next(rows):
+    """The strategy from the README, computed: among Claude accounts with headroom in both windows,
+    the one whose weekly reset comes soonest — its unspent week is the one about to expire.
+    (reset_dt, row), or None."""
+    best = None
+    for r in rows:
+        if r.get("error") or r.get("stale"):
+            continue      # a recommendation that switches credentials must not ride on last-known values
+        fh = (r.get("five_hour") or {}).get("pct")
+        wk = (r.get("seven_day") or {}).get("pct")
+        if wk is None or wk >= 90 or (fh is not None and fh >= 90):
+            continue
+        reset = parse_dt((r.get("seven_day") or {}).get("resets_at"))
+        if reset and (best is None or reset < best[0]):
+            best = (reset, r)
+    return best
+
+def spend_next_display(rows):
+    """The recommendation as its display dict {uuid, label, active, text}, or None — one builder for
+    every renderer, so the menu and the app can't word it differently."""
+    claude = [r for r in rows if r.get("provider", "claude") == "claude"]
+    if sum(1 for r in claude if has_usage(r)) < 2:
+        return None                    # with one usable account there is nothing to choose between
+    pick = spend_next(claude)
+    if not pick:
+        return None
+    reset, pr = pick
+    left = 100 - int((pr.get("seven_day") or {}).get("pct") or 0)
+    tilde = "~" if (pr.get("seven_day") or {}).get("projected") else ""
+    return {"uuid": pr["uuid"], "label": pr.get("label"), "active": bool(pr.get("active")),
+            "text": f"{left}% left, weekly resets {tilde}{local_short(reset)}"}
+
 def render_xbar(rows):
     if not rows:
         print("Claude · —")
@@ -1054,12 +1396,6 @@ def render_xbar(rows):
         print("Refresh now | refresh=true")
         return
     claude_rows = sort_rows([r for r in rows if r.get("provider", "claude") == "claude"])
-    xlw = min(14, max([6] + [len(r.get("label") or "") for r in rows if not r.get("error")]))  # align plan col
-    # Display names collide (several of one person's logins share a name), so each Claude row also
-    # carries its email — the real identity — padded so the plan column stays aligned, mirroring the
-    # CLI table. Plain text: xbar's ANSI parser has no gray/faint, and color= paints the whole line.
-    xew = min(26, max([0] + [len(r.get("email") or "") for r in claude_rows
-                             if not r.get("error") and "@" in (r.get("email") or "")]))
     # xbar trims leading whitespace from a menu title, and its trim set is the Unicode Zs category —
     # which includes the regular space AND the non-breaking space, so neither indents. U+2800 (the blank
     # Braille cell) renders as empty space but is category So, not Zs, so it survives the trim. All
@@ -1069,16 +1405,8 @@ def render_xbar(rows):
     # that account's weekly window; the pie in its centre is the 5-hour window. No numbers; fill +
     # severity carry the state, position carries which provider. If the PNG can't be built, fall back
     # to one severity dot per provider, colored by its worst window (still no numbers).
-    def has_usage(r): return not r.get("error") and (r.get("five_hour") or {}).get("pct") is not None
     def dot(p): return "🟢" if p < 65 else ("🟡" if p < 90 else "🔴")
-    # the gauge tracks the account you're actually on, matching the Codex rule below
-    head = next((r for r in claude_rows if r.get("active") and has_usage(r)), None)
-    specs = []
-    if head:
-        specs.append((head["seven_day"]["pct"] or 0, head["five_hour"]["pct"] or 0))
-    cs = codex_ring_spec(rows)
-    if cs is not None:
-        specs.append(cs)
+    specs = title_specs(rows)      # the gauge tracks the account you're actually on, per provider
     img = menu_icon_b64(specs)
     if img:
         print(f"|image={img}")
@@ -1088,81 +1416,80 @@ def render_xbar(rows):
     else:
         print("🔴" if any(has_usage(r) for r in claude_rows) else "Claude · ⏳")
     print("---")
-    def barline(label, pct, meta=""):
-        # Severity belongs to the gauge, not the clock: the bar and % carry the red/amber/green,
-        # while the label and the reset text stay the menu's default color. That needs two colors on
-        # one line, which `color=` can't do (it paints the whole item) — hence ANSI spans.
-        # Detail lines sit at the SAME indent as the account name (one cell under the provider header) —
-        # the name row and its bars share a left edge.
+    hist = load_history(TREND_S + 3600)      # one trend window (+ slack), shared across the rows
+    pad = _pad_b64()
+    def barline(label, pct, meta="", img=None):
+        # Severity belongs to the gauge, not the clock: the bar carries the red/amber/green, while
+        # the label and the reset text stay the menu's default color. The bar itself is a rendered
+        # image on the line — xbar puts it left of the text — so the text needs no ANSI at all. If
+        # the image can't be built, an ANSI text bar takes over (which needs two colors on one
+        # line — `color=` paints the whole item — hence the spans).
         tail = f"  · {meta}" if meta else ""
+        if img:
+            print(f"{label:<6} {int(pct):>3}%{tail} | image={img} font=Menlo size=11")
+            return
         print(f"{NB}{label:<6} {color(pct)}{bar(pct)} {int(pct):>3}%{C['x']}{tail} "
               f"| font=Menlo size=12 ansi=true")
-    def xbar_claude_row(r):
-        # Account name one cell under the provider header, matching the Codex section; the ▶ on the
-        # account you're on takes that cell instead, so it hangs left of the shared name edge.
+    def detail(row):
+        # One dropdown line from the shared view-model: a bar for pct rows, gray text for the rest.
+        # The transparent pad keeps text-only lines on the bar images' left edge.
+        if row["pct"] is None:
+            lead = "" if pad else NB
+            padp = f"image={pad} " if pad else ""
+            print(f"{lead}{xb(row['label']):<7} {xb(row['meta'])} | {padp}color=#8b949e font=Menlo size=11")
+            return
+        barline(xb(row["label"]), row["pct"], xb(row["meta"]), img=_bar_b64(row["pct"]))
+    def trendline(r):
+        # The weekly window's recent shape and pace — the one thing a point-in-time % can't say.
+        # Skipped without comment until the history has something to draw.
+        series, pace, note = trend_view(hist, r)
+        spark = _spark_b64(series) if series else None
+        if spark:
+            print(f"{'trend':<6} {note} | image={spark} color=#8b949e font=Menlo size=11")
+    def xbar_account_row(r):
+        # Name rows wear the system font at medium weight, like native menu items; the ▶ marks the
+        # account you're on. Display names collide (several of one person's logins share a name),
+        # so a row also carries its email — the real identity — when it has one.
         lead = ACTIVE_MARK if r.get("active") else NB
-        # Click-to-switch, no confirm — the account row itself is the target.
-        switchable = not r.get("active") and not r.get("error")
+        switchable = can_switch(r)
         hint = "  ⇄" if switchable else ""      # the only thing marking a row as clickable
-        # macOS draws an actionless menu item at reduced alpha, so the active row reads dimmer than
-        # the switchable ones. The ▶ and the menu-bar title carry the signal instead.
-        params = "font=Menlo size=13"
+        # macOS draws an actionless menu item at reduced alpha, which would gray out exactly the
+        # account you're on — so the active row gets refresh as its action, keeping it full-strength
+        # (and a click on it harmlessly refreshes the menu).
+        params = "font=HelveticaNeue-Medium size=13"
         if switchable:
             params += (f' bash="{os.path.realpath(__file__)}" param1=switch param2={r["uuid"]}'
                        f" terminal=false refresh=true")
+        elif r.get("active"):
+            params += " refresh=true"
         em = r.get("email") or ""
         em = em if "@" in em and em != r.get("label") else ""   # label falls back to the email — don't repeat it
-        mail = f"{xb(em):<{xew}}  " if xew else ""
-        print(f"{lead}{xb(r['label']):<{xlw}}  {mail}{xb(plan_of(r))}{hint} | {params}")
+        mail = f"{xb(em)}   " if em else ""
+        print(f"{lead}{xb(r['label'])}   {mail}{xb(plan_of(r))}{hint} | {params}")
         if switchable:   # holding ⌥ swaps the row for what the click actually does
             print(f"{lead}⇄ Switch to {xb(r['label'])}{'  ' + xb(em) if em else ''} | alternate=true {params}")
         if r.get("error"):
             print(f"{NB}{xb(r['error'])} | color=#e5534b font=Menlo size=12"); print("---"); return
-        fh, wk = r["five_hour"], r["seven_day"]
-        fp, wp = fh["pct"] or 0, wk["pct"] or 0
-        scoped = [s for s in r.get("scoped", []) if s.get("pct") is not None]
-        barline("5-hour", fp, resets_phrase(fh["resets_at"], "short"))
-        barline("weekly", wp, wk_phrase(wk, "short") if scoped else wk_phrase(wk, "week"))
-        for i, s in enumerate(scoped):
-            barline(xb(s["model"] or "scoped")[:6], s["pct"], week_abs_label(wk) if i == 0 else "")
-        sp = r.get("spend") or {}
-        if sp.get("enabled") and sp.get("limit"):
-            print(f"{NB}extra  {usd(sp['used'])} / {usd(sp['limit'])} used | color=#8b949e font=Menlo size=12")
-        print("---")
-    def xbar_codex_row(r):
-        # Name and window rows share the same one-cell indent, matching the Claude section. Only an
-        # account whose credential was captured can be switched to; the rest carry no affordance.
-        lead = ACTIVE_MARK if r.get("active") else NB
-        switchable = r.get("switchable")
-        hint = "  ⇄" if switchable else ""
-        params = "font=Menlo size=13"
-        if switchable:
-            params += (f' bash="{os.path.realpath(__file__)}" param1=switch param2={r["uuid"]}'
-                       f" terminal=false refresh=true")
-        print(f"{lead}{xb(r['label']):<{xlw}}  {xb(plan_of(r))}{hint} | {params}")
-        if switchable:   # holding ⌥ swaps the row for what the click actually does
-            print(f"{NB}⇄ Switch to {xb(r['label'])} | alternate=true {params}")
-        if r.get("error"):
-            print(f"{NB}{xb(r['error'])} | color=#e5534b font=Menlo size=12"); print("---"); return
-        for w in codex_display_windows(r):
-            if w.get("expired"):
-                print(f"{NB}{xb(w['label'])[:6]:<6} window reset — run codex to refresh | color=#8b949e font=Menlo size=12")
-            else:
-                barline(xb(w["label"])[:6], w["pct"] or 0, resets_phrase(w["resets_at"], "week"))
-        cr = r.get("credits") or {}
-        if cr.get("has") and cr.get("balance") not in (None, "0"):
-            print(f"{NB}credits {xb(cr['balance'])} | color=#8b949e font=Menlo size=12")
+        for row in _display_rows(r):
+            detail(row)
+        if r.get("provider", "claude") == "claude":
+            trendline(r)
         print("---")
     groups = by_provider(rows)
     multi = len(groups) > 1
     for key, name, grp in groups:
         if multi:
-            print(f"{name.upper()} | color=#8b949e font=Menlo size=11")
+            print(f"{name.upper()} | color=#8b949e size=10")
             print("---")   # divider under the header, matching the one after every account below it
-        if key == "codex":
-            for r in grp: xbar_codex_row(r)
-        else:
-            for r in grp: xbar_claude_row(r)
+        for r in grp:
+            xbar_account_row(r)
+    # The spend-next strategy, computed instead of recalled — shown only when it names a different
+    # account than the one you're on (agreement isn't news), and clicking it performs the switch.
+    sn = spend_next_display(rows)
+    if sn and not sn["active"]:
+        print(f"⇄ Spend next: {xb(sn['label'])} — {xb(sn['text'])} "
+              f'| font=Menlo size=12 bash="{os.path.realpath(__file__)}" param1=switch '
+              f"param2={sn['uuid']} terminal=false refresh=true")
     if any(r.get("stale") for r in claude_rows):
         print("⚠ last known values — rate-limited; updates on the next refresh | color=#d9a13b font=Menlo size=12")
     if len([r for r in claude_rows if not r.get("is_team")]) <= 1:
@@ -1949,12 +2276,68 @@ def cmd_setup():
 
 # ---- commands ---------------------------------------------------------------
 
+def cmd_app():
+    """Compile native/ClaudeUsageBar.swift into "Claude Usage.app" and (re)launch it — /Applications
+    when writable, else ~/Applications.
+
+    Built locally with the Command Line Tools' swiftc, so there is nothing to sign or notarize —
+    Gatekeeper doesn't quarantine binaries built on the machine itself. The bundle embeds this
+    script's absolute path (CUBackend), which is how the app finds its backend; rebuilding from a
+    different checkout repoints it."""
+    src_dir = os.path.dirname(os.path.realpath(__file__))
+    src = os.path.join(src_dir, "native", "ClaudeUsageBar.swift")
+    if not os.path.exists(src):
+        print("native/ClaudeUsageBar.swift not found next to this script", file=sys.stderr)
+        sys.exit(1)
+    swiftc = shutil.which("swiftc")
+    if not swiftc:
+        print("swiftc not found — install the Xcode Command Line Tools first:", file=sys.stderr)
+        print("  xcode-select --install", file=sys.stderr)
+        sys.exit(1)
+    # /Applications when writable (login items and app registries treat it as home), else ~/Applications
+    apps_dir = "/Applications" if os.access("/Applications", os.W_OK) else os.path.expanduser("~/Applications")
+    app = os.path.join(apps_dir, "Claude Usage.app")
+    macos_dir = os.path.join(app, "Contents", "MacOS")
+    os.makedirs(macos_dir, exist_ok=True)
+    binary = os.path.join(macos_dir, "ClaudeUsage")
+    print("compiling the menu-bar app (takes a moment the first time)…")
+    r = subprocess.run([swiftc, "-O", "-swift-version", "5", "-parse-as-library", src, "-o", binary],
+                      capture_output=True, text=True)
+    if r.returncode != 0:
+        print(r.stderr, file=sys.stderr)
+        print("build failed", file=sys.stderr)
+        sys.exit(1)
+    import plistlib
+    with open(os.path.join(app, "Contents", "Info.plist"), "wb") as f:
+        plistlib.dump({
+            "CFBundleIdentifier": "com.allenmervia.claude-usage",
+            "CFBundleName": "Claude Usage",
+            "CFBundleDisplayName": "Claude Usage",
+            "CFBundleExecutable": "ClaudeUsage",
+            "CFBundlePackageType": "APPL",
+            "CFBundleShortVersionString": "1.0",
+            "CFBundleVersion": "1",
+            "LSMinimumSystemVersion": "13.0",
+            "LSUIElement": True,          # menu-bar only: no Dock icon, no app switcher entry
+            "NSHighResolutionCapable": True,
+            "CUBackend": os.path.realpath(__file__),
+        }, f)
+    subprocess.run(["codesign", "--force", "--sign", "-", app], capture_output=True)
+    subprocess.run(["pkill", "-x", "ClaudeUsage"], capture_output=True)   # replace a running copy
+    time.sleep(0.3)
+    subprocess.run(["open", app])
+    print(f"launched {app}")
+    print("the xbar plugin keeps running alongside — when the native bar has won, remove the "
+          "claude-usage.*.sh symlink from xbar's plugin folder")
+
 def main():
     arg = sys.argv[1] if len(sys.argv) > 1 else ""
     if arg == "setup":
         cmd_setup(); return
     if arg == "install":
         cmd_install(); return
+    if arg == "app":
+        cmd_app(); return
     if arg == "doctor":
         cmd_doctor(); return
     if arg == "interval":

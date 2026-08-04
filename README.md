@@ -121,8 +121,9 @@ Two things to know:
 claude-usage setup      guided first-time setup (register account + optional menu bar & PATH)
 claude-usage            table of all known accounts (default)
 claude-usage install    add the menu-bar view (see below)
+claude-usage app        build + launch the native menu-bar app (see below)
 claude-usage doctor     check the setup and report what needs fixing
-claude-usage interval N set the menu-bar refresh cadence (1m / 5m / 10m / 30m)
+claude-usage interval N set the xbar plugin's refresh cadence (1m / 5m / 10m / 30m)
 claude-usage --json     machine-readable JSON
 claude-usage --xbar     xbar / SwiftBar menu-bar format
 claude-usage capture    register the active account now (same as any run)
@@ -189,8 +190,41 @@ The title is a pair of **ring gauges** — one per active provider (Claude on th
 Codex on the right). Each ring is that account's **weekly** window, filled clockwise
 and tinted green/amber/red; the **pie in its centre** is the **5-hour** window, filled
 the same way in the same colors. So the slow budget and the burst budget each read at
-a glance, with no numbers to parse. The dropdown lists every account with its bars and
-resets, grouped by provider and tabbed under a `CLAUDE` / `CODEX` header.
+a glance, with no numbers to parse.
+
+The dropdown lists every account, grouped under a `CLAUDE` / `CODEX` header. Each
+window is a rendered meter bar in the same colors as the rings, with the number and
+reset beside it. Two lines appear as the bar collects data:
+
+- **trend** — a sparkline of the weekly window over the past 3½ days, with the
+  current pace (`+29%/day`, measured over the trailing day). A weekly reset inside
+  the window draws as the dip it is. It appears once a few hours of history exist.
+- **⇄ Spend next** in the footer — the strategy from
+  [Which account to use, and when](#which-account-to-use-and-when), computed: the
+  account whose weekly reset comes soonest among those with headroom in both
+  windows. Shown only when it names an account other than the one you're on;
+  clicking it switches.
+
+### Native app
+
+```bash
+claude-usage app
+```
+
+builds a native macOS menu-bar app from the same data and installs it to
+`/Applications` — or `~/Applications` when that isn't writable (needs the Xcode
+Command Line Tools — `xcode-select --install` — and macOS 13+). Same gauges in the bar, same accounts, bars, and trend in the
+dropdown — plus what a native window can do that a menu can't: countdowns that
+tick while it's open, click-anywhere-to-switch account cards, and plan chips.
+Refresh cadence, launch-at-login, and quit live behind the gear.
+
+The app is a shell over this script: it runs `claude-usage --json` on its timer and
+calls `claude-usage switch` when you click, so every number, phrase, and rule comes
+from the same place as the other views and the two can't drift. It's compiled
+locally, so there is nothing to sign or notarize; rebuilding after a `git pull` is
+the same command again. It runs happily alongside the xbar plugin — keep whichever
+you prefer and drop the other (remove the xbar symlink, or quit the app from its
+gear menu).
 
 ### Refresh interval
 
@@ -336,11 +370,15 @@ Two properties keep the reporting side safe:
   live falls back to matching the stored credential when the profile lookup can't be
   reached, so an expired token or a dropped network can't cause the live account to be
   mistaken for a parked one and refreshed.
-- The tool is a **live mirror** of the usage endpoint. It stores no usage numbers, so
-  if Anthropic issues an out-of-band usage reset, it simply appears as lower usage on
-  the next refresh. The one remembered schedule is each account's weekly boundary (see
-  [The `~` on a weekly reset](#the--on-a-weekly-reset)), which is only ever *shown*
-  when the endpoint reports none, and always marked as the guess it is.
+- The tool is a **live mirror** of the usage endpoint: every number it *shows as
+  current* comes from the endpoint on that refresh, so if Anthropic issues an
+  out-of-band usage reset, it simply appears as lower usage on the next one. Two
+  things are remembered alongside, and both only ever describe the past: each
+  account's weekly boundary (see [The `~` on a weekly reset](#the--on-a-weekly-reset)),
+  shown only when the endpoint reports none and always marked as the guess it is; and
+  a history of the percentages already shown (`~/.claude-usage/history.jsonl`, trimmed
+  back to the trailing two weeks as it grows), which feeds the trend sparkline and its
+  pace — never a current reading.
 
 **Switching is the one exception, by design.** [Switching accounts](#switching-accounts)
 deliberately *writes* Claude Code's credential — that's the whole mechanism. It replaces
@@ -357,9 +395,9 @@ this write is the one that fails, the switch says so — a working switch that r
 the wrong account is worse discovered silently than reported.
 
 Nothing sensitive is written into the repo or into `~/.claude-usage/` — that
-directory holds only non-secret state (account identity, cached usage numbers, the last
-failure's message, which provider was switched last). **Every credential, including
-the pre-switch backup, lives in the Keychain.**
+directory holds only non-secret state (account identity, cached and historical usage
+percentages, the last failure's message, which provider was switched last). **Every
+credential, including the pre-switch backup, lives in the Keychain.**
 
 ## Caveats
 
