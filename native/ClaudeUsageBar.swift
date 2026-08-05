@@ -19,6 +19,7 @@ struct Payload: Decodable {
     var accounts: [Account]
     var gauges: [[Double?]]?
     var desktop: Desktop?
+    var mock: Bool?
     var updated_ts: Double?
 }
 
@@ -477,6 +478,18 @@ struct MenuView: View {
                 .frame(width: 200)
                 .frame(maxWidth: .infinity)
                 .padding(.bottom, 4)
+                if model.payload?.mock == true {
+                    // Invented figures look exactly like real ones, so the panel says so on both
+                    // tabs rather than trusting anyone to remember they turned it on.
+                    Text("MOCK DATA — every figure below is invented")
+                        .font(.system(size: 10, weight: .semibold))
+                        .tracking(0.8)
+                        .foregroundStyle(sevColor(70))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 4)
+                        .background(RoundedRectangle(cornerRadius: 6).fill(sevColor(70).opacity(0.14)))
+                        .padding(.bottom, 2)
+                }
                 if model.tab == 1 {
                     InsightsTab()
                 } else {
@@ -652,6 +665,10 @@ struct WindowStrips: View {
         let H = CGFloat(entries.count) * Self.rowH + CGFloat(entries.count - 1) * Self.gap + Self.axisH
         return Canvas { ctx, size in
             let now = Date().timeIntervalSince1970
+            // A week back and a week forward: the span of the current windows themselves. Earlier
+            // history is drawn where it falls inside this, and simply runs off the left edge where
+            // it does not — widening the axis to fit it would shrink every live window to pay for
+            // context.
             let t0 = (entries.map { $0.start }.min() ?? now - 7 * 86400) - 3600
             var t1 = max(entries.map { $0.reset }.max() ?? now, now) + 3600
             t1 += (t1 - t0) * 0.01
@@ -686,6 +703,34 @@ struct WindowStrips: View {
                 let band = CGRect(x: X(ws), y: top, width: X(rt) - X(ws), height: Self.rowH)
                 func Y(_ v: Double) -> CGFloat {
                     top + 3 + CGFloat(1 - min(100, max(0, v)) / 100) * (Self.rowH - 6)
+                }
+                // The window before this one, drawn faintly behind: last week's shape is the only
+                // thing that says whether this week's is normal. It is context, so it stays quiet
+                // enough that the live window still reads first.
+                let win = rt - ws
+                let pStart = max(ws - win, t0)     // clipped to the axis; X() would otherwise
+                                                   // stack everything earlier onto the left edge
+                if X(ws) - X(pStart) > 6 {
+                    let pBand = CGRect(x: X(pStart), y: top + 4, width: X(ws) - X(pStart),
+                                       height: Self.rowH - 8)
+                    ctx.drawLayer { layer in
+                        layer.clip(to: Path(roundedRect: pBand, cornerRadius: 4))
+                        layer.fill(Path(pBand), with: .color(Color.primary.opacity(0.025)))
+                        let pp = (e.trend.series ?? []).filter {
+                            $0.count >= 2 && $0[0] >= pStart && $0[0] < ws
+                        }
+                        if pp.count >= 2 {
+                            var lp = Path()
+                            for (j, pt) in pp.enumerated() {
+                                // squeezed into the shorter band so it cannot be mistaken for live
+                                let y = top + 4 + CGFloat(1 - min(100, max(0, pt[1])) / 100) * (Self.rowH - 11)
+                                let p = CGPoint(x: X(pt[0]), y: y)
+                                j == 0 ? lp.move(to: p) : lp.addLine(to: p)
+                            }
+                            layer.stroke(lp, with: .color(color.opacity(0.32)),
+                                         style: StrokeStyle(lineWidth: 1, lineJoin: .round))
+                        }
+                    }
                 }
                 ctx.drawLayer { layer in
                     layer.clip(to: Path(roundedRect: band, cornerRadius: 5))

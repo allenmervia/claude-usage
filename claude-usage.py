@@ -456,6 +456,8 @@ def _history_oldest():
         return float("-inf")           # unreadable first line: the rewrite is the repair
 
 def load_history(max_age_s=None):
+    if mock_enabled():
+        return mock_history(max_age_s)
     out = []
     try:
         with open(HISTORY) as f:
@@ -488,6 +490,8 @@ def collect(ingest=True):
     ingest=False reports on the accounts already known without registering the live one — for
     diagnostics, which should describe the current state rather than change it.
     """
+    if mock_enabled():
+        return mock_rows()
     now = time.time()
     cache = load_cache()
     if cache and 0 <= now - cache.get("ts", 0) < COOLDOWN:
@@ -832,6 +836,193 @@ def collect_codex(persist=True):
         })
     return rows
 
+# ---- mock mode --------------------------------------------------------------
+# A synthetic machine, for working on the display without waiting for real windows to move.
+# It substitutes the three inputs the renderers read — usage rows, history, and the insights
+# scan — and nothing downstream knows the difference, so what appears is the real formatting,
+# the real severity thresholds and the real chart code, not an approximation of them.
+# Deliberately loud: `doctor` reports it and the table prints a banner, because numbers that
+# look plausible and are invented are worse than obviously broken ones.
+
+MOCK_FLAG = os.path.join(STATE_DIR, "mock-mode")
+
+def mock_enabled():
+    return os.path.exists(MOCK_FLAG)
+
+def cmd_mock(arg):
+    if arg == "on":
+        os.makedirs(STATE_DIR, exist_ok=True)
+        open(MOCK_FLAG, "w").close()
+        clear_cache()
+        print("mock mode ON — every surface now shows invented data.\n"
+              "turn it off with:  claude-usage mock off")
+    elif arg == "off":
+        try: os.remove(MOCK_FLAG)
+        except OSError: pass
+        clear_cache()
+        print("mock mode off")
+    else:
+        print("mock mode is " + ("ON" if mock_enabled() else "off"))
+
+# One fictional week per account, staggered so the burn chart shows windows that opened on
+# different days, and spanning idle to nearly spent so every severity colour appears.
+MOCK_ACCOUNTS = [
+    # label, email, tier, 5-hour %, weekly %, scoped %, days until weekly reset, burn shape
+    ("work",     "work@example.com",     "default_claude_max_20x", 34, 22, 17, 4.8, "even"),
+    ("personal", "personal@example.com", "default_claude_max_20x", 68, 78, 91, 0.4, "late"),
+    ("side",     "side@example.com",     "default_claude_max_5x",   9,  9,  3, 6.2, "sparse"),
+    ("archive",  "archive@example.com",  "default_claude_max_20x", 47, 63, 55, 3.7, "early"),
+]
+
+_MOCK_CODEX = []
+
+def mock_codex_window():
+    """A weekly window timed like the machine's real Codex one, so the band sits on a plausible
+    schedule instead of an invented offset that can collide with a Claude account's. Only the
+    timing is borrowed — the name, address and percentage are invented, because mock output gets
+    screenshotted and pasted into places real addresses should not go."""
+    if _MOCK_CODEX:
+        return _MOCK_CODEX[0]
+    for aid, e in load_codex_index().items():
+        if not isinstance(e, dict):
+            continue
+        for w in e.get("windows") or []:
+            if (w.get("minutes") or 0) >= 10080 and w.get("resets_at"):
+                dt = parse_dt(w["resets_at"])
+                if not dt:
+                    continue
+                _MOCK_CODEX.append(
+                    {"label": "codex", "email": "codex@example.com", "plan": "pro",
+                     "resets_at": w["resets_at"], "minutes": w.get("minutes") or 10080,
+                     "days": (dt.timestamp() - time.time()) / 86400})
+                return _MOCK_CODEX[0]
+    _MOCK_CODEX.append(
+        {"label": "codex", "email": "codex@example.com", "plan": "pro",
+         "resets_at": datetime.fromtimestamp(time.time() + 1.6 * 86400, timezone.utc).isoformat(),
+         "minutes": 10080, "days": 1.6})
+    return _MOCK_CODEX[0]
+
+def _mock_uuid(i):
+    return f"00000000-0000-4000-8000-{i:012d}"
+
+def mock_rows():
+    now = time.time()
+    rows = []
+    for i, (label, email, tier, fh, wk, sc, days, _shape) in enumerate(MOCK_ACCOUNTS):
+        reset = now + days * 86400
+        rows.append({
+            "provider": "claude", "uuid": _mock_uuid(i), "email": email, "label": label,
+            "tier": tier, "org_type": "claude_max", "is_team": False,
+            "active": label == "archive", "error": None,
+            "five_hour": {"pct": fh, "resets_at": datetime.fromtimestamp(
+                now + (5 - fh / 25) * 3600, timezone.utc).isoformat()},
+            "seven_day": {"pct": wk, "resets_at": datetime.fromtimestamp(reset, timezone.utc).isoformat()},
+            "scoped": [{"model": "Fable", "pct": sc,
+                        "resets_at": datetime.fromtimestamp(reset, timezone.utc).isoformat()}],
+            "spend": {"enabled": False},
+        })
+    cw = mock_codex_window()
+    rows.append({
+        "provider": "codex", "uuid": "mock-codex", "account_id": "mock-codex",
+        "email": cw["email"], "label": cw["label"], "plan": cw["plan"], "active": True,
+        "switchable": False, "error": None, "as_of": now - 900,
+        "windows": [{"label": "weekly", "minutes": cw["minutes"], "pct": 41.0,
+                     "resets_at": cw["resets_at"]}],
+        "credits": {"has": False},
+    })
+    return rows
+
+def mock_history(max_age_s=None):
+    """Two weeks of readings: every account's current window in full, and the one before it.
+
+    Usage arrives in shifts rather than a smooth ramp, because only one account is being spent at
+    a time — whoever holds the session climbs for a few hours while the rest sit flat, and a reset
+    drops that account back to zero. Deterministic, so the chart looks the same on every refresh.
+    """
+    now = time.time()
+    step = 1800
+    horizon = 14 * 86400
+    t_start = now - horizon
+    n_steps = int(horizon / step) + 1
+    # the Codex account draws a band as well, so it takes part in the rotation
+    specs = [(_mock_uuid(i), wk, days) for i, (_l, _e, _t, _fh, wk, _sc, days, _s)
+             in enumerate(MOCK_ACCOUNTS)] + [("mock-codex", 41, mock_codex_window()["days"])]
+    ids = [sp[0] for sp in specs]
+
+    # Which account holds the session in each ~3h block. A fixed shuffle per block keeps the
+    # rotation uneven — real switching is not round-robin — while staying reproducible.
+    def holder(block, n):
+        return (block * 7 + (block // 5) * 3) % n
+
+    # raw work units per account per step, then normalised per window to the target percentage
+    raw = {i: [0.0] * n_steps for i in range(len(specs))}
+    for k in range(n_steps):
+        ts = t_start + k * step
+        lt = time.localtime(ts)
+        hour = lt.tm_hour + lt.tm_min / 60      # local, so the flat nights line up with the axis
+        if not (8 <= hour <= 23.5):
+            continue                      # asleep: nothing moves on any account
+        block = int(ts // (3 * 3600))
+        who = holder(block, len(specs))
+        # within a block the pace still varies, and short gaps break the line into steps
+        pace = 1.0 if (k % 7) else 0.15
+        raw[who][k] = pace
+
+    out = [{"ts": t_start + k * step, "a": {}} for k in range(n_steps)]
+    for i, (uid, wk, days) in enumerate(specs):
+        reset = now + days * 86400
+        win = 7 * 86400
+        # walk each window separately so the reading drops to zero at the boundary
+        for w_end in (reset - win, reset):
+            w_start = w_end - win
+            idx = [k for k in range(n_steps)
+                   if w_start <= t_start + k * step < min(w_end, now)]
+            if not idx:
+                continue
+            total = sum(raw[i][k] for k in idx) or 1.0
+            # the window still running lands on its live percentage; a finished one ran hotter
+            target = wk if w_end == reset else min(96, wk + 21)
+            cum = 0.0
+            for k in idx:
+                cum += raw[i][k]
+                out[k]["a"][uid] = {"wk": round(cum / total * target, 1)}
+    return [s for s in out if s["a"]]
+
+def mock_insights():
+    now = time.time()
+    def eff(*pairs):
+        return [{"effort": e, "rank": r, "cost": c, "msgs": m} for e, r, c, m in pairs]
+    return {
+        "as_of": now, "ttl_s": 900, "window_days": 7,
+        "total_cost": 4654.0, "today_cost": 1192.0,
+        "models": [
+            {"name": "Fable 5", "family": "Fable", "msgs": 412, "cost": 2607.0,
+             "output": 386412, "cache_read": 14662301,
+             "efforts": eff(("max", 0, 1355.0, 190), ("high", 1, 808.0, 142), ("medium", 2, 444.0, 80))},
+            {"name": "Opus 5", "family": "Opus", "msgs": 268, "cost": 1894.0,
+             "output": 221004, "cache_read": 9120455,
+             "efforts": eff(("xhigh", 0, 1250.0, 160), ("medium", 1, 644.0, 108))},
+            {"name": "GPT-5.6 sol", "family": "GPT", "msgs": 41, "cost": 62.0,
+             "output": 30122, "cache_read": 411203, "efforts": eff(("high", 0, 44.0, 28), ("low", 1, 18.0, 13))},
+            {"name": "Sonnet 5", "family": "Sonnet", "msgs": 96, "cost": 52.0,
+             "output": 51221, "cache_read": 880110, "efforts": eff(("high", 0, 26.0, 40), ("low", 1, 26.0, 56))},
+            {"name": "Sonnet 4.6", "family": "Sonnet", "msgs": 54, "cost": 28.0,
+             "output": 24110, "cache_read": 402118, "efforts": eff((None, 0, 28.0, 54))},
+            {"name": "Opus 4.8", "family": "Opus", "msgs": 12, "cost": 7.21,
+             "output": 6120, "cache_read": 90210, "efforts": eff((None, 0, 7.21, 12))},
+            {"name": "Haiku 4.5", "family": "Haiku", "msgs": 320, "cost": 4.50,
+             "output": 88120, "cache_read": 1200310, "efforts": eff((None, 0, 4.50, 320))},
+        ],
+    }
+
+def mock_desktop():
+    return {"active": "side",
+            "stashes": [{"label": l, "files": 34, "age_days": 0.4, "app_version": desktop_app_version(),
+                         "stale": False, "active": l == "side", "can_switch": l != "side"}
+                        for l, *_ in MOCK_ACCOUNTS],
+            "needs_repair": False, "app_running": True, "needs_confirm": True,
+            "app_version": desktop_app_version()}
+
 # ---- the desktop app's account ----------------------------------------------
 # The desktop app signs in separately from the CLI, and its account is a set of files rather
 # than a token we can read — tools/desktop-switch.py stashes them per account and swaps them in.
@@ -854,6 +1045,11 @@ def _read_json_file(path):
         return None
 
 def desktop_state():
+    if mock_enabled():
+        return mock_desktop()
+    return _desktop_state()
+
+def _desktop_state():
     """The desktop app's switchable accounts, or None when the feature isn't set up here.
 
     None means "say nothing": no desktop app installed, or nothing captured yet. A surface
@@ -1072,6 +1268,9 @@ def _table_codex_row(r, w):
     print()
 
 def render_table(rows):
+    if mock_enabled():
+        print(f"\n{C['y']}⚠ MOCK MODE — every figure below is invented. "
+              f"turn it off with `claude-usage mock off`{C['x']}")
     if not rows:
         print(f"\n{C['b']}Usage{C['x']}\n")
         print(f"{C['y']}No accounts found.{C['x']} Log in with the `claude` CLI "
@@ -1160,7 +1359,7 @@ def _display_rows(r):
         rows.append(_row("extra", None, f"{usd(sp.get('used') or 0)} / {usd(sp['limit'])} used"))
     return rows
 
-def _resample(pts, n=48):
+def _resample(pts, n=168):
     """Cap a (ts, value) series at n points, last-per-bucket — the JSON trend series the burn
     chart draws; interpolation happens at render time, so density beyond this is wasted bytes."""
     if len(pts) <= n:
@@ -1252,6 +1451,9 @@ def render_json(rows):
     print(json.dumps({"accounts": rows,
                       "gauges": [list(s) for s in title_specs(rows)],
                       "desktop": ds,
+                      # the bar has no other way to know, and unmarked invented numbers are
+                      # worse than no numbers — they get screenshotted and believed
+                      "mock": True if mock_enabled() else None,
                       "updated_ts": data_ts(),
                       "generated_at": datetime.now(timezone.utc).isoformat()}, indent=2))
 
@@ -1668,6 +1870,9 @@ def cmd_doctor():
     def section(name): print(f"\n{C['b']}{name}{C['x']}")
 
     print(f"\n{C['b']}claude-usage doctor{C['x']}")
+    if mock_enabled():
+        print(f"\n  {C['y']}⚠{C['x']} mock mode is ON — the app and table are showing invented data")
+        print(f"      {C['dim']}turn it off with: claude-usage mock off{C['x']}")
 
     section("Environment")
     if shutil.which("security"):
@@ -2073,6 +2278,12 @@ def _scan_codex(agg, cut, cut_iso, today_utc):
     return today
 
 def cmd_insights(as_json):
+    if mock_enabled():
+        data = mock_insights()
+        if as_json:
+            print(json.dumps(data, indent=2)); return
+        print(f"\nmock insights — ${data['total_cost']:,.0f} this week\n"); return
+
     """Print the trailing-week transcript aggregate, computing at most once per INSIGHTS_TTL —
     callers poll freely and the scan runs only when it's due. A cache from another schema or
     another local day recomputes: the shape must match this printer, and the "today" figure must
@@ -2186,6 +2397,8 @@ def main():
         cmd_doctor(); return
     if arg == "switch":
         cmd_switch(sys.argv[2] if len(sys.argv) > 2 else ""); return
+    if arg == "mock":
+        cmd_mock(sys.argv[2] if len(sys.argv) > 2 else ""); return
     if arg == "desktop-switch":
         cmd_desktop_switch(sys.argv[2] if len(sys.argv) > 2 else ""); return
     if arg == "capture":
