@@ -67,6 +67,8 @@ it apart from.
 - [Claude Code](https://claude.com/claude-code), signed in to at least one account
 - Optional: the [Codex](https://openai.com/codex) CLI, signed in — its usage then
   appears alongside (nothing to set up; see [Codex](#codex))
+- Optional: the Xcode Command Line Tools, for the native menu-bar app
+  (`claude-usage app`; the xbar plugin needs neither)
 
 ## Install
 
@@ -78,9 +80,10 @@ chmod +x claude-usage.py claude-usage.5m.sh
 ```
 
 `setup` tells you what it will do, asks before doing it, and walks you through the
-menu-bar view: if [xbar](https://xbarapp.com) (the app that renders the bar) isn't
-installed, it offers to install it with Homebrew, links the plugin, and launches it,
-so the bar appears when setup finishes. It also registers the account you're signed
+menu-bar view: if [xbar](https://xbarapp.com) (the plugin host) isn't installed, it
+offers to install it with Homebrew, links the plugin, and launches it, so a bar
+appears when setup finishes. For the native app instead, run `claude-usage app`
+afterwards (see [Menu bar](#menu-bar)). It also registers the account you're signed
 into and can put `claude-usage` on your `PATH`. Everything it does is also available
 as an individual command (see [Commands](#commands)) if you'd rather do it by hand.
 
@@ -170,81 +173,74 @@ Two things to know:
 - **This switches the CLI account**, not the desktop app — the desktop app keeps its
   credentials in its own sandbox, out of reach (see [Registering your accounts](#registering-your-accounts)).
 
-## Menu-bar view (xbar / SwiftBar)
+## Menu bar
 
-The menu bar is rendered by [xbar](https://xbarapp.com) (or
-[SwiftBar](https://github.com/swiftbar/SwiftBar)), a small app that runs plugins on a
-schedule; `claude-usage` ships a plugin for it. `claude-usage setup` handles all of
-this. To wire up the bar on its own later:
+Two ways to put the bar up; both draw the same title icon. One ring gauge per active
+provider (Claude left, Codex right): the ring is that account's **weekly** window,
+filled clockwise and tinted green/amber/red; the **pie in its centre** is the
+**5-hour** window, same colors. Slow budget and burst budget each read at a glance,
+with no numbers to parse. Refreshes are cheap either way — one small `/usage` request
+per account, and these are **status calls that don't count against your usage
+limits** — so short intervals are fine.
 
-```bash
-claude-usage install
-```
-
-`install` installs xbar with Homebrew if no host is present (it asks first), links
-the plugin in, and launches the host. From then on the bar updates every 5 minutes;
-click the menu-bar icon → Refresh to update immediately. If Homebrew isn't installed,
-it points you to https://xbarapp.com instead.
-
-The title is a pair of **ring gauges** — one per active provider (Claude on the left,
-Codex on the right). Each ring is that account's **weekly** window, filled clockwise
-and tinted green/amber/red; the **pie in its centre** is the **5-hour** window, filled
-the same way in the same colors. So the slow budget and the burst budget each read at
-a glance, with no numbers to parse.
-
-The dropdown lists every account, grouped under a `CLAUDE` / `CODEX` header. Each
-window is a rendered meter bar in the same colors as the rings, with the number and
-reset beside it. A **trend** line appears once a few hours of history exist — a
-sparkline of the weekly window over the past 3½ days, with the current pace
-(`+29%/day`, measured over the trailing day). A weekly reset inside the window
-draws as the dip it is.
-
-### Native app
+### The native app (recommended)
 
 ```bash
 claude-usage app
 ```
 
-builds a native macOS menu-bar app from the same data and installs it to
-`/Applications` — or `~/Applications` when that isn't writable (needs the Xcode
-Command Line Tools — `xcode-select --install` — and macOS 13+). Same gauges in the bar, and two tabs in the dropdown: **Usage**
-(the accounts, bars, and trend, plus what a native window can do that a menu
-can't — countdowns that tick while it's open, click-anywhere-to-switch account
-cards, plan chips) and **Insights** (the weekly burn chart, and the trailing
-week's model mix priced from local transcripts — see `claude-usage insights`).
-Refresh cadence, launch-at-login, and quit live behind the gear.
+compiles a small macOS app from `native/` and installs it to `/Applications` — or
+`~/Applications` when that isn't writable. It needs the Xcode Command Line Tools
+(`xcode-select --install`) and macOS 13+; it's built locally, so there is nothing to
+sign or notarize, and rebuilding after a `git pull` is the same command again.
 
-The app is a shell over this script: it runs `claude-usage --json` on its timer and
-calls `claude-usage switch` when you click, so every number, phrase, and rule comes
-from the same place as the other views and the two can't drift. It's compiled
-locally, so there is nothing to sign or notarize; rebuilding after a `git pull` is
-the same command again. It runs happily alongside the xbar plugin — keep whichever
-you prefer and drop the other (remove the xbar symlink, or quit the app from its
-gear menu).
+The dropdown has two tabs:
 
-### Refresh interval
+- **Usage** — the account cards: meter bars whose countdowns tick while the window
+  is open, plan tags, and click-anywhere-to-switch on parked accounts (the ⇄ appears
+  on hover where the ▶ will land).
+- **Insights** — the weekly burn (each account's current week as a band on one
+  shared timeline, its recorded burn inside, one line marking now — hover for values,
+  hover a name for its email and provider) and the model mix (see
+  [Insights](#insights) — hover a row for its ledger).
 
-The bar refreshes every **5 minutes** by default. Change it from the menu — the
-**⏱ Refresh every** submenu at the bottom offers 1m / 5m / 10m / 30m and ticks the
-current one — or from the terminal:
+Refresh cadence, launch at login, and quit live behind the gear. The app is a shell
+over this script — it runs `claude-usage --json` on its timer and `claude-usage
+switch` when you click — so every number and phrase comes from the same place as the
+terminal table.
+
+### The xbar / SwiftBar plugin
+
+The same view without Command Line Tools: [xbar](https://xbarapp.com) (or
+[SwiftBar](https://github.com/swiftbar/SwiftBar)) runs it as a plugin.
 
 ```bash
-claude-usage interval 1m
+claude-usage install
 ```
 
-Each refresh is cheap — one small `/usage` request per account (a few KB, well under a
-second) — and these are **status calls that don't count against your Claude usage
-limits**. So a shorter interval is fine; it mainly changes how quickly a newly
-signed-into account appears on its own. You can always click the menu-bar icon →
-Refresh for an instant update.
+installs xbar with Homebrew if no host is present (it asks first), links the plugin,
+and launches it; if Homebrew isn't installed, it points you to https://xbarapp.com.
+The dropdown lists the accounts with the same meter bars, click-to-switch rows, and a
+**trend** sparkline once a few hours of history exist — the weekly window over the
+past 3½ days with its current pace, a reset drawing as the dip it is.
 
-The cadence lives in the filename of the symlink in the host's plugin folder (that's
-how xbar and SwiftBar read it), so `interval` just renames that link — your checkout
-is untouched. Changing it **restarts the menu-bar app**, which is why the bar blinks for
-a second: the host holds the plugin's old path in memory and won't follow a rename on
-its own.
+The plugin refreshes every **5 minutes** by default; change it with the ⏱ submenu or
+`claude-usage interval 1m`. The cadence lives in the plugin symlink's filename —
+that's how xbar reads it — so `interval` renames the link and restarts the host,
+which is why the bar blinks for a second.
 
-To remove the bar: delete the `claude-usage.*.sh` symlink from xbar's plugin folder.
+### Switching surface, cleaning up
+
+The two bars run side by side, which is handy while deciding. To retire one:
+
+- **xbar plugin** — delete the `claude-usage.*.sh` symlink from
+  `~/Library/Application Support/xbar/plugins/`, and `brew uninstall xbar` if nothing
+  else uses it. (`claude-usage app` reminds you while the link exists.)
+- **native app** — quit it from its gear menu (turn off launch-at-login there too),
+  then delete `/Applications/Claude Usage.app`.
+
+Nothing else needs cleaning: both surfaces share `~/.claude-usage/` and the Keychain
+entries, which belong to the tool, not to either bar.
 
 ### When something looks wrong
 
@@ -257,6 +253,27 @@ every registered account's usage read and whether it's switchable, the menu-bar 
 and plugin link, the `python3` the plugin will find, and the `PATH` symlink — and for
 anything that fails, names the command that fixes it. This is the fastest way to tell a
 revoked token (from `/logout`) apart from an unlinked plugin.
+
+## Insights
+
+The Insights tab prices where the week's tokens went, from data already on disk:
+every Claude Code transcript records each message's model, effort, and token counts,
+and Codex rollouts record the same per turn. `claude-usage insights` scans the
+trailing 7 days of both (a couple of seconds, cached for 30 minutes), dedupes
+replayed messages, and totals tokens per model version with effort split out:
+
+```
+past 7 days · API list-price equivalent (not billing) · today $919
+model           msgs     input    output   cache wr   cache rd      cost
+Fable 5        4,697    13,121 4,469,532 39,722,852 1,681,900,198     $2402
+Opus 5        15,129   230,268 5,730,719 90,425,713 2,951,623,044     $2185
+GPT-5.6 sol    2,916 17,884,445 1,838,994          0 213,207,040       $67
+```
+
+Costs are **API list-price equivalents, not a bill** — you pay subscriptions; the
+figure is what the same usage would have cost through the API, which makes models and
+days comparable in one unit. The list rates are pinned in one dated table in the
+script (`PRICING`); when prices move, that is the one place to update.
 
 ## Which account to use, and when
 

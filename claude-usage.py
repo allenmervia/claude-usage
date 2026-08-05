@@ -2525,8 +2525,10 @@ def cmd_app():
     time.sleep(0.3)
     subprocess.run(["open", app])
     print(f"launched {app}")
-    print("the xbar plugin keeps running alongside — when the native bar has won, remove the "
-          "claude-usage.*.sh symlink from xbar's plugin folder")
+    link, _ = find_plugin_link()
+    if link:
+        print(f"the xbar plugin is still linked at {link} — the two bars run side by side; "
+              "remove that symlink to retire it")
 
 def main():
     arg = sys.argv[1] if len(sys.argv) > 1 else ""
