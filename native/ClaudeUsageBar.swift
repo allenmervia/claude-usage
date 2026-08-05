@@ -19,8 +19,17 @@ struct Payload: Decodable {
     var accounts: [Account]
     var gauges: [[Double?]]?
     var desktop: Desktop?
+    var auto_switch: AutoSwitch?
     var mock: Bool?
     var updated_ts: Double?
+}
+
+// An auto-switch changes which account gets billed without a click, so the panel keeps a visible
+// record of the last one. `line` arrives preformatted (and pre-aged: absent once the event is
+// stale) so this surface can never drift from the CLI table's wording or recency window.
+struct AutoSwitch: Decodable {
+    var enabled: Bool?
+    var line: String?
 }
 
 // The desktop app's account is a set of files rather than a token, so it carries no usage and
@@ -538,6 +547,17 @@ struct MenuView: View {
             Text("A desktop switch was interrupted. Run `desktop-switch.py repair` before switching again.")
                 .font(.system(size: 11)).foregroundStyle(sevColor(95))
                 .padding(.horizontal, 6).padding(.bottom, 2)
+        }
+        if let aw = model.payload?.auto_switch {
+            if let line = aw.line {
+                Text(line)
+                    .font(.system(size: 10.5)).foregroundStyle(.secondary)
+                    .padding(.horizontal, 6).padding(.bottom, 2)
+            } else if aw.enabled == true {
+                Text("auto-switch armed — switches accounts when a limit hits")
+                    .font(.system(size: 10)).foregroundStyle(.tertiary)
+                    .padding(.horizontal, 6).padding(.bottom, 2)
+            }
         }
         if model.multiProvider { SectionHeader("CLAUDE") }
         ForEach(model.claude) { AccountCard(account: $0) }

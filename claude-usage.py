@@ -242,6 +242,9 @@ def token_for_parked(uuid, force=False):
 def is_team_entry(e):
     return bool(e.get("seat_tier")) or e.get("org_type") in ("claude_team", "claude_enterprise")
 
+def is_claude(r):
+    return r.get("provider", "claude") == "claude"    # pre-Codex cached rows have no field
+
 def match_live_uuid():
     """Which known account holds the live credential, by matching stored refresh tokens.
 
@@ -484,12 +487,17 @@ def weekly_series(hist, uuid):
             pts.append((s["ts"], e["wk"]))
     return pts
 
-def collect(ingest=True):
+def collect(ingest=True, act=None):
     """Cached wrapper: debounce rapid refreshes, and fall back to last-known values on a rate-limit.
 
     ingest=False reports on the accounts already known without registering the live one — for
-    diagnostics, which should describe the current state rather than change it.
+    diagnostics, which should describe the current state rather than change it. act says whether
+    this refresh may auto-switch the live credential; it defaults to following ingest, but a
+    caller that reads for its own narration (setup) opts out — registering accounts must never
+    swap them as a side effect.
     """
+    if act is None:
+        act = ingest
     if mock_enabled():
         return mock_rows()
     now = time.time()
@@ -504,6 +512,8 @@ def collect(ingest=True):
     if not claude or any(not r.get("error") for r in claude):  # got fresh Claude data (or none to fetch)
         save_cache(rows, now)
         append_history(rows, now)
+        if act:
+            rows = maybe_auto_switch(rows)
         return rows
     if cache and cache.get("rows"):                           # every Claude read errored → last known Claude
         stale = [r for r in cache["rows"] if r.get("provider", "claude") == "claude"]
@@ -1278,7 +1288,6 @@ def render_table(rows):
         print(f"{C['dim']}It reads the account the CLI is signed into; log into each of your "
               f"accounts once to add them all.{C['x']}\n")
         return
-    def is_claude(r): return r.get("provider", "claude") == "claude"   # pre-Codex cached rows have no field
     groups = by_provider(rows)
     print(f"\n{C['b']}Usage{C['x']}  {C['dim']}· {datetime.now().astimezone().strftime('%-I:%M %p')}{C['x']}\n")
     multi = len(groups) > 1   # only label the sections when there's more than one provider to tell apart
@@ -1292,6 +1301,9 @@ def render_table(rows):
             for r in grp: _table_claude_row(r, w)
     if any(r.get("stale") for r in rows if is_claude(r)):
         print(f"{C['y']}⚠ Showing last known values — the usage API rate-limited this refresh.{C['x']}\n")
+    line = None if mock_enabled() else last_auto_line()   # a real switch under invented data
+    if line:                                              # would read as part of the fiction
+        print(f"{C['dim']}{line}{C['x']}\n")
     n = len([r for r in rows if is_claude(r) and not r.get("is_team")])
     if n <= 1:
         lead = "No personal accounts tracked yet" if n == 0 else "Only one account tracked so far"
@@ -1448,9 +1460,17 @@ def render_json(rows):
     rows = attach_display(sort_rows(rows))
     # `desktop` is its own key rather than more `accounts`: those rows carry usage windows and
     # drive the title gauges, and a desktop stash has neither — it is a switch target only.
+    aw = load_autoswitch()
     print(json.dumps({"accounts": rows,
                       "gauges": [list(s) for s in title_specs(rows)],
                       "desktop": ds,
+                      # the record of an identity change belongs in every surface. `line` is the
+                      # sentence, preformatted here so the bar and the table can never disagree
+                      # on wording or recency; `enabled` marks the mode as armed.
+                      "auto_switch": ({"enabled": bool(aw.get("enabled")),
+                                       "last": aw.get("last_auto"),
+                                       "line": last_auto_line(aw)}
+                                      if aw.get("enabled") or aw.get("last_auto") else None),
                       # the bar has no other way to know, and unmarked invented numbers are
                       # worse than no numbers — they get screenshotted and believed
                       "mock": True if mock_enabled() else None,
@@ -1468,18 +1488,26 @@ MISMATCH_NOTE = " — but ~/.claude.json still names the other account, so the C
 # `switch --undo` reverses whichever provider was switched last, so the switch records which it was.
 LAST_SWITCH = os.path.join(STATE_DIR, "last-switch.json")
 
-def record_last_switch(provider):
+def record_last_switch(provider, auto=False):
     try:
         os.makedirs(STATE_DIR, exist_ok=True)
-        with open(LAST_SWITCH, "w") as f: json.dump({"provider": provider}, f)
+        with open(LAST_SWITCH, "w") as f:
+            json.dump({"provider": provider, "ts": time.time(), "auto": auto}, f)
     except Exception:
         pass
 
-def last_switch_provider():
+def last_switch_info():
+    """The last switch as recorded: {provider, ts?, auto?}. ts is absent in records written
+    by versions that predate auto-switch — treat those as 'long ago'."""
     try:
-        with open(LAST_SWITCH) as f: return json.load(f).get("provider") or "claude"
+        with open(LAST_SWITCH) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
     except Exception:
-        return "claude"      # written by a version that only switched Claude, or never written
+        return {}
+
+def last_switch_provider():
+    return last_switch_info().get("provider") or "claude"
 
 def _fail(msg):
     print(msg, file=sys.stderr); sys.exit(1)
@@ -1727,6 +1755,7 @@ def cmd_codex_undo():
     aid = codex_identity(prev)[0]
     if aid: codex_mark_signed_in(aid)
     keychain_delete(STORE_SVC, CODEX_PREV_KEY)
+    record_last_switch("codex")     # an undo is a manual choice — the holdoff must protect it
     clear_cache()
     _report_switch("restored the previous Codex account", "")
 
@@ -1770,24 +1799,34 @@ def cmd_switch(target):
             except Exception: pass
         else:
             note = MISMATCH_NOTE
+        record_last_switch("claude")   # an undo is a manual choice — the holdoff must protect it
         clear_cache()
         _report_switch(f"restored the previous account", note); return
 
     e = resolve_account(target)
     if not e:
         _fail(f"unknown account: {target}")
+    ok, msg, note = _switch_claude(e)
+    if not ok:
+        _fail(msg)
+    record_last_switch("claude")
+    clear_cache()                                     # so the post-switch refresh shows the new active account
+    _report_switch(msg, note)
+
+def _switch_claude(e):
+    """Move the live credential + profile to account entry `e`. Returns (ok, message, note):
+    ok False means nothing moved; a non-empty note means the credential moved but the profile
+    didn't. No exits — the auto-switch path calls this where dying would kill a render."""
     sec = load_secret(e["uuid"])
-    if not sec or not sec.get("refreshToken"):
-        _fail(f"{e['email']} isn't captured — log into it once with the claude CLI")
-    if not sec.get("scopes"):
-        # captured before we stored the full blob; writing a partial one could break the CLI login
-        _fail(f"{e['email']} needs one login with the claude CLI to store its full credentials, "
-              f"then switching will work")
+    gap = _secret_gap(sec)
+    if gap:
+        return False, f"{e['email']} {gap}", ""
 
     token, err = token_for_parked(e["uuid"])          # refreshes if the cached token is stale
     if err:
-        _fail(f"can't switch to {e['email']}: {err}")
-    sec = load_secret(e["uuid"])                      # re-read: the refresh may have rotated it
+        return False, f"can't switch to {e['email']}: {err}", ""
+    sec = load_secret(e["uuid"]) or sec               # re-read: the refresh may have rotated it;
+                                                      # a failed re-read falls back, never crashes
 
     blob = {"accessToken": sec.get("accessToken") or token,
             "refreshToken": sec.get("refreshToken"),
@@ -1795,7 +1834,7 @@ def cmd_switch(target):
     blob.update({k: sec[k] for k in BLOB_META if sec.get(k) is not None})   # never write nulls
 
     if live_store() is None:
-        _fail("no Claude Code credential store found — sign in with the claude CLI first")
+        return False, "no Claude Code credential store found — sign in with the claude CLI first", ""
     cur = read_live_raw()                             # back up (to the Keychain) before overwriting
     if cur: keychain_write(STORE_SVC, PREV_KEY, cur)
     cur_prof = read_live_profile()                    # ditto for the profile, so --undo restores both
@@ -1806,7 +1845,7 @@ def cmd_switch(target):
         except Exception:
             pass
     if not write_live(blob):
-        _fail(f"couldn't write the credential — switch to {e['email']} did not happen")
+        return False, f"couldn't write the credential — switch to {e['email']} did not happen", ""
 
     # The credential is the switch; the profile is the label on it. A failure here leaves a working
     # switch that reads as the wrong account, which is worse to discover silently than to be told.
@@ -1819,9 +1858,316 @@ def cmd_switch(target):
         if not new_prof or not write_live_profile(new_prof):
             note = MISMATCH_NOTE
 
-    record_last_switch("claude")
-    clear_cache()                                     # so the post-switch refresh shows the new active account
-    _report_switch(f"switched to {e['email']}", note)
+    return True, f"switched to {e['email']}", note
+
+# ---- auto-switch on limit hit ------------------------------------------------
+# Opt-in: when the ACTIVE account's 5-hour or weekly window is spent, move the CLI credential to
+# the best parked account so new work continues. The check rides the normal refresh (every surface
+# funnels through collect()), so reaction time is bounded by the refresh interval — that latency is
+# accepted; there is no event to hook when a limit trips. It only ever moves the CLI credential:
+# the desktop app's account is a file swap that requires quitting the app, which would kill its
+# hosted sessions, so the notification points at the menu bar's confirm flow instead.
+
+AUTOSWITCH = os.path.join(STATE_DIR, "autoswitch.json")
+AUTO_COOLDOWN_S   = 15 * 60   # after an auto-switch: absorb API lag on the new window, no flapping
+MANUAL_HOLDOFF_S  = 10 * 60   # after a manual switch: the user chose an account — don't fight them
+STRANDED_RENOTIFY_S = 60 * 60 # while every account is spent, remind at most hourly
+WEEKLY_REFUGE_MAX = 95        # a candidate this close to its weekly cap isn't a refuge
+DRAIN_MIN_HEADROOM = 40       # 5-hour room a drain target must have — landing on a nearly-spent
+                              # window would just trigger the next swap within the hour
+
+def load_autoswitch():
+    try:
+        with open(AUTOSWITCH) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+def save_autoswitch(st):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        _replace_file(AUTOSWITCH, json.dumps(st, indent=2))
+    except Exception:
+        pass
+
+def update_autoswitch(updates):
+    """Merge runtime keys into autoswitch.json against a FRESH read. The refresh holds its loaded
+    copy across network calls, and the user can flip `enabled`/`scoped` in that window — writing
+    the held copy back whole would silently revert their toggle."""
+    st = load_autoswitch()
+    st.update(updates)
+    save_autoswitch(st)
+    return st
+
+def last_auto_line(st=None):
+    """The one sentence describing the last auto-switch, shared by every text surface — or None
+    when there is nothing recent to say (no record, older than a day, or unusable ts)."""
+    last = (st if st is not None else load_autoswitch()).get("last_auto") or {}
+    ts = last.get("ts")
+    if not isinstance(ts, (int, float)) or time.time() - ts >= 86400:
+        return None
+    when = local_short(datetime.fromtimestamp(ts, timezone.utc))
+    tail = " — profile name mismatch, see notification" if last.get("partial") else ""
+    return (f"auto-switched {last.get('from')} → {last.get('to')} "
+            f"({last.get('reason')}, {when}){tail}")
+
+def _win_pct(r, key):
+    return (r.get(key) or {}).get("pct")
+
+def _limit_windows(r, scoped=False):
+    """Every window that can bind this account, as (name, pct, resets_at, refuge_max). A window
+    triggers exhaustion at 100; it disqualifies a refuge at its refuge_max — the weekly-flavored
+    ones disqualify early (WEEKLY_REFUGE_MAX) because they won't reset within hours. Exhaustion,
+    refuge-fitness, relief time, and the reason string all read this one list, so a new window
+    kind added here binds everywhere at once."""
+    wins = [("5-hour", _win_pct(r, "five_hour"), (r.get("five_hour") or {}).get("resets_at"), 100),
+            ("weekly", _win_pct(r, "seven_day"), (r.get("seven_day") or {}).get("resets_at"),
+             WEEKLY_REFUGE_MAX)]
+    if scoped:
+        wins += [(f"{s.get('model') or 'scoped'} weekly", s.get("pct"), s.get("resets_at"),
+                  WEEKLY_REFUGE_MAX) for s in r.get("scoped") or []]
+    return wins
+
+def exhaustion_reason(r, scoped=False):
+    """The window at its cap, as notification text — or None, which is also the exhaustion test.
+    Hard exhaustion only, never predictive: switching early strands paid budget on the account
+    being left. With scoped on, a model-scoped weekly cap (e.g. Fable) counts too: for
+    model-heavy work it is the binding limit long before the overall weekly is."""
+    for name, pct, _ra, _cap in _limit_windows(r, scoped):
+        if pct is not None and pct >= 100:
+            return f"{name} limit"
+    return None
+
+def account_exhausted(r, scoped=False):
+    return exhaustion_reason(r, scoped) is not None
+
+TIER_RANK = {"Max 20x": 4, "Max 5x": 3, "Max": 2, "Pro": 1}   # ranks plan_name's spellings
+
+def _tier_rank(r):
+    return TIER_RANK.get(plan_name(r), 0)
+
+def _weekly_reset_ts(r):
+    dt = parse_dt((r.get("seven_day") or {}).get("resets_at"))
+    return dt.timestamp() if dt else float("inf")
+
+def auto_pick(rows, has_full_creds, scoped=False):
+    """Parked accounts worth switching to, best first. Drain strategy: among accounts with at
+    least DRAIN_MIN_HEADROOM of 5-hour room, spend the weekly budget that expires soonest —
+    unspent weekly capacity evaporates at reset, so the account resetting first is the one to
+    burn (ties: higher plan tier, then more 5-hour room). Thin-headroom accounts come after
+    those, best-room first — a last resort, not a drain target. Rows missing either window
+    number are excluded — a refuge must be verifiably usable, not just not-known-bad."""
+    roomy, thin = [], []
+    for r in rows:
+        if not is_claude(r): continue
+        if r.get("active") or r.get("error") or r.get("is_team"): continue
+        fh, wk = _win_pct(r, "five_hour"), _win_pct(r, "seven_day")
+        if fh is None or wk is None: continue
+        if any(pct is not None and pct >= cap for _n, pct, _ra, cap in _limit_windows(r, scoped)):
+            continue
+        if not has_full_creds(r.get("uuid")): continue
+        (roomy if 100 - fh >= DRAIN_MIN_HEADROOM else thin).append(r)
+    return (sorted(roomy, key=lambda r: (_weekly_reset_ts(r), -_tier_rank(r),
+                                         _win_pct(r, "five_hour")))
+            + sorted(thin, key=lambda r: (_win_pct(r, "five_hour"), -_tier_rank(r),
+                                          _weekly_reset_ts(r))))
+
+def _usable_at(r, scoped=False):
+    """When this account next has room: the latest reset among its binding windows. None if any
+    binding window's reset can't be determined — an unknown blocker makes the whole answer
+    unknown, not optimistic."""
+    blockers = []
+    for _name, pct, resets_at, cap in _limit_windows(r, scoped):
+        if pct is not None and pct >= cap:
+            dt = parse_dt(resets_at)
+            if dt is None: return None
+            blockers.append(dt.timestamp())
+    return max(blockers) if blockers else None
+
+def earliest_relief(rows, scoped=False):
+    """The soonest moment any personal account frees up, or None."""
+    times = []
+    for r in rows:
+        if not is_claude(r) or r.get("error") or r.get("is_team"): continue
+        t = _usable_at(r, scoped)
+        if t is not None: times.append(t)
+    return min(times) if times else None
+
+def auto_decision(rows, last_switch, now, has_full_creds, scoped=False):
+    """The pure core: ('idle'|'cooldown'|'stranded'|'switch', payload). payload is the ordered
+    candidate list for 'switch', the earliest-relief epoch (or None) for 'stranded'."""
+    active = next((r for r in rows if is_claude(r) and r.get("active")), None)
+    if not active or active.get("error") or active.get("stale") \
+            or not account_exhausted(active, scoped):
+        return "idle", None
+    ts = (last_switch or {}).get("ts")
+    if ts:
+        # any provider's manual switch holds: the record is single-slot, so filtering by provider
+        # would let a Codex switch erase a Claude switch's holdoff
+        hold = AUTO_COOLDOWN_S if last_switch.get("auto") else MANUAL_HOLDOFF_S
+        if 0 <= now - ts < hold:
+            return "cooldown", None
+    cands = auto_pick(rows, has_full_creds, scoped)
+    if not cands:
+        return "stranded", earliest_relief(rows, scoped)
+    return "switch", cands
+
+def _secret_gap(sec):
+    """Why this stored secret can't be switched to, or None if it can. The one predicate both
+    the candidate filter and the switch itself apply — they must never disagree."""
+    if not sec or not sec.get("refreshToken"):
+        return "isn't captured — log into it once with the claude CLI"
+    if not sec.get("scopes"):
+        # captured before we stored the full blob; writing a partial one could break the CLI login
+        return "needs one login with the claude CLI to store its full credentials"
+    return None
+
+def _has_full_creds(uuid):
+    return _secret_gap(load_secret(uuid)) is None
+
+def _notify(title, body):
+    """Post a macOS notification. Auto-switching changes which account gets billed, so it must
+    never be silent — but a notification failure must not take the refresh down. ensure_ascii
+    stays off: AppleScript has no \\uXXXX escape, so an escaped name would render garbled."""
+    try:
+        subprocess.run(["osascript", "-e",
+                        f"display notification {json.dumps(body, ensure_ascii=False)} "
+                        f"with title {json.dumps(title, ensure_ascii=False)}"],
+                       capture_output=True, timeout=10)
+    except Exception:
+        pass
+
+def _notify_hourly(state_key, title, body):
+    """A notification that repeats at most hourly while its condition persists."""
+    now = time.time()
+    if now - (load_autoswitch().get(state_key) or 0) >= STRANDED_RENOTIFY_S:
+        _notify(title, body)
+        update_autoswitch({state_key: now})
+
+AUTOSWITCH_LOCK = os.path.join(STATE_DIR, "autoswitch.lock")
+
+def _switch_lock():
+    """One switcher at a time: concurrent refreshes (menu-bar tick + a CLI run) that both see an
+    exhausted account must not both switch — the second would back up the first's freshly written
+    credential, destroying the undo path. O_EXCL is the arbiter; a stale lock (holder crashed)
+    expires after 2 minutes. Returns an fd to close+unlink, or None if another switcher holds it."""
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        return os.open(AUTOSWITCH_LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        try:
+            if time.time() - os.path.getmtime(AUTOSWITCH_LOCK) > 120:
+                os.remove(AUTOSWITCH_LOCK)
+                return os.open(AUTOSWITCH_LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except Exception:
+            pass
+        return None
+    except Exception:
+        return None
+
+def _release_switch_lock(fd):
+    try:
+        os.close(fd)
+        os.remove(AUTOSWITCH_LOCK)
+    except Exception:
+        pass
+
+def maybe_auto_switch(rows):
+    """Called on every fresh refresh; returns the rows to render (active flags moved if a switch
+    fired)."""
+    st = load_autoswitch()
+    if not st.get("enabled") or mock_enabled():
+        return rows
+    now = time.time()
+    scoped = bool(st.get("scoped"))
+    kind, payload = auto_decision(rows, last_switch_info(), now, _has_full_creds, scoped)
+    if kind == "stranded":
+        when = (f"earliest reset {local_short(datetime.fromtimestamp(payload, timezone.utc))}"
+                if payload else "reset times unknown")   # unknown must still notify — silence
+                                                         # here reads as "everything is fine"
+        _notify_hourly("last_stranded_notify", "claude-usage",
+                       f"Every account is at its limit — {when}.")
+        return rows
+    if kind != "switch":
+        return rows
+    lock = _switch_lock()
+    if lock is None:
+        return rows                                    # another refresh is mid-switch; its tick wins
+    try:
+        if auto_decision(rows, last_switch_info(), time.time(), _has_full_creds, scoped)[0] \
+                != "switch":
+            return rows                                # the lock wait outdated the decision
+        active = next(r for r in rows if is_claude(r) and r.get("active"))
+        idx = {e["uuid"]: e for e in load_index()}
+        for cand in payload:
+            e = idx.get(cand.get("uuid"))
+            if not e: continue
+            try:
+                ok, msg, note = _switch_claude(e)
+            except Exception:                          # a crash here must not take down the render
+                ok, note = False, ""
+            if not ok: continue                        # dead refresh token etc. — try the next one
+            reason = exhaustion_reason(active, scoped)
+            update_autoswitch({"last_auto": {"ts": now, "from": active.get("email"),
+                                             "to": e["email"], "reason": reason,
+                                             "partial": bool(note)},
+                               "last_stranded_notify": None, "last_failed_notify": None})
+            record_last_switch("claude", auto=True)
+            body = f"{active.get('email')} hit its {reason} — CLI now on {e['email']}."
+            if desktop_state():
+                body += " Desktop app unchanged; switch it from the menu bar."
+            if note:
+                body += note
+            _notify("claude-usage auto-switch", body)
+            for r in rows:                             # this tick renders the switch it just made —
+                if is_claude(r):                       # usage numbers can't have changed, only who
+                    r["active"] = r is cand            # is active, so no second network sweep
+            clear_cache()
+            save_cache(rows, time.time())
+            return rows
+        # every candidate refused to switch — that's as wrong as stranded and must not be silent
+        _notify_hourly("last_failed_notify", "claude-usage",
+                       f"{active.get('email')} is at its limit but no account could be switched "
+                       f"to — check `claude-usage doctor`.")
+        return rows
+    finally:
+        _release_switch_lock(lock)
+
+def cmd_autoswitch(args):
+    arg = args[0] if args else ""
+    if arg not in ("", "on", "off", "scoped"):
+        # an unknown word must not fall through to the status view: `autoswitch onn` read as
+        # "show status" leaves the user believing they armed a feature that is still off
+        print("usage: claude-usage autoswitch [on|off|scoped on|scoped off]", file=sys.stderr)
+        sys.exit(2)
+    if arg == "on":
+        update_autoswitch({"enabled": True})
+        print("auto-switch ON — when the active account's 5-hour or weekly window hits 100%,\n"
+              "the CLI moves to the parked account whose weekly window resets soonest\n"
+              "(among those with real 5-hour room).\n"
+              "turn it off with:  claude-usage autoswitch off\n"
+              "also switch when a model-scoped weekly cap (e.g. Fable) fills:\n"
+              "  claude-usage autoswitch scoped on")
+    elif arg == "off":
+        update_autoswitch({"enabled": False})
+        print("auto-switch off")
+    elif arg == "scoped":
+        sub = args[1] if len(args) > 1 else ""
+        if sub not in ("on", "off"):
+            print("usage: claude-usage autoswitch scoped on|off", file=sys.stderr); sys.exit(2)
+        st = update_autoswitch({"scoped": sub == "on"})
+        print("scoped trigger " + ("ON — a model-scoped weekly cap at 100% now switches too"
+                                   if st["scoped"] else "off"))
+        if st["scoped"] and not st.get("enabled"):
+            print("note: auto-switch itself is off — arm it with `claude-usage autoswitch on`")
+    else:
+        st = load_autoswitch()
+        print("auto-switch is " + ("ON" if st.get("enabled") else "off")
+              + (" (scoped trigger on)" if st.get("scoped") else ""))
+        line = last_auto_line(st)
+        if line:
+            print(line)
 
 # ---- native app presence (for doctor) ---------------------------------------
 
@@ -2070,7 +2416,7 @@ def cmd_setup():
             print("  the build didn't finish — fix the error above and run `claude-usage app`.")
 
     print("\nRegistering the account you're signed into…")
-    rows = collect()
+    rows = collect(act=False)
     render_table(rows)
     if rows:
         print("From now on, sign into another Claude account (CLI or desktop app) and it appears on")
@@ -2399,6 +2745,8 @@ def main():
         cmd_switch(sys.argv[2] if len(sys.argv) > 2 else ""); return
     if arg == "mock":
         cmd_mock(sys.argv[2] if len(sys.argv) > 2 else ""); return
+    if arg == "autoswitch":
+        cmd_autoswitch(sys.argv[2:]); return
     if arg == "desktop-switch":
         cmd_desktop_switch(sys.argv[2] if len(sys.argv) > 2 else ""); return
     if arg == "capture":

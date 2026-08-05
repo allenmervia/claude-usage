@@ -130,6 +130,7 @@ claude-usage capture    register the active account now (same as any run)
 claude-usage list       list registered accounts, Claude and Codex
 claude-usage switch X   switch the CLI to that account (see below)
 claude-usage switch --undo   put the previous account back
+claude-usage autoswitch on   switch automatically when the active account hits a limit (see below)
 claude-usage forget X   drop an account by email, label or id (and delete its stored credential)
 ```
 
@@ -170,6 +171,41 @@ Two things to know:
 - **This command switches the CLI account.** The desktop app has its own session and
   its own command; see [Switching the desktop app](#switching-the-desktop-app). In the
   menu bar the two move together, so one click is usually all you need.
+
+## Auto-switch on limit hit
+
+Opt in with `claude-usage autoswitch on` (off with `off`, state with no argument).
+From then on, every refresh — the menu bar's tick or any run of this command — checks
+the active account, and when a 5-hour or weekly window is actually at 100%, moves the
+CLI to another account. The pick drains budget that's about to expire: among parked
+accounts with at least 40 points of 5-hour headroom (less would just set up the next
+swap), it takes the one whose weekly window resets soonest — unspent weekly capacity
+evaporates at reset, so the account resetting first is the one to burn (ties: higher
+plan tier, then more 5-hour room). Only if no account has that much room does it fall
+back to whoever has the most. Accounts at 95%+ of their weekly window are skipped —
+they're not a refuge. Team accounts are never chosen.
+
+`claude-usage autoswitch scoped on` adds model-scoped weekly caps (e.g. Fable) as a
+trigger: for model-heavy work the scoped cap is the binding limit long before the
+overall weekly, and without this the tool would sit on a capped account that looks
+healthy. While it's on, a scoped cap at 100% switches exactly like a spent window,
+and accounts whose own scoped cap is at 95%+ aren't chosen as targets.
+
+It fires only on hard exhaustion, never predictively, so no paid budget is stranded
+on the account being left. Reaction time is bounded by the refresh interval (up to a
+few minutes); a switch happens at most once per 15 minutes, and never within 10
+minutes of a manual switch — your explicit choice wins. If every account is spent,
+nothing moves and a notification names the earliest reset instead.
+
+Because an auto-switch changes which account gets billed without a click, it is never
+silent: each one posts a macOS notification and leaves a record in the menu bar
+dropdown and the table output. Only the CLI credential moves — the desktop app is
+never touched (see [Switching the desktop app](#switching-the-desktop-app)); the
+notification reminds you to move it from the menu bar if you want both.
+
+A new `claude` run is on the new account immediately; a session already
+mid-conversation picks up the new credential on its own within about ten minutes,
+no restart needed.
 
 ## Switching the desktop app
 
