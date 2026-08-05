@@ -14,7 +14,7 @@ enum Snapshot {
     static func main() {
         let args = CommandLine.arguments
         guard args.count >= 3 else {
-            FileHandle.standardError.write(Data("usage: snap payload.json out.png [light|dark]\n".utf8))
+            FileHandle.standardError.write(Data("usage: snap payload.json out.png [light|dark] [usage|insights] [insights.json]\n".utf8))
             exit(2)
         }
         let appearance = args.count > 3 ? args[3] : "dark"

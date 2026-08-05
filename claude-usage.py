@@ -407,8 +407,6 @@ def data_ts():
 
 HISTORY = os.path.join(STATE_DIR, "history.jsonl")
 HISTORY_KEEP_S = 14 * 86400           # two weeks: the trend window with room for longer-range views
-TREND_S = int(84 * 3600)              # the dropdown trend window: 3½ days
-PACE_S = 24 * 3600                    # pace = weekly delta over the trailing day
 
 def append_history(rows, ts):
     entry = {}
@@ -478,20 +476,6 @@ def weekly_series(hist, uuid):
         if isinstance(e, dict) and isinstance(e.get("wk"), (int, float)):
             pts.append((s["ts"], e["wk"]))
     return pts
-
-def weekly_pace(pts, now=None):
-    """%/hour over the trailing day — computed from the most recent weekly reset visible in the
-    samples onward, since spanning a reset would read as negative pace. None until the samples cover
-    at least three hours, so a single refresh can't invent a rate."""
-    now = now or time.time()
-    day = [(t, v) for t, v in pts if t >= now - PACE_S]
-    for i in range(len(day) - 1, 0, -1):
-        if day[i][1] < day[i - 1][1] - 1:              # a drop >1pt is a reset, not endpoint jitter
-            day = day[i:]
-            break
-    if len(day) < 2 or day[-1][0] - day[0][0] < 3 * 3600:
-        return None
-    return (day[-1][1] - day[0][1]) / ((day[-1][0] - day[0][0]) / 3600)
 
 def collect(ingest=True):
     """Cached wrapper: debounce rapid refreshes, and fall back to last-known values on a rate-limit.
@@ -1025,21 +1009,12 @@ def render_table(rows):
         print(f"{C['dim']}{lead} — log into your other accounts with the `claude` CLI "
               f"(`claude` → /login) to add them.{C['x']}\n")
 
-def has_usage(r):
-    return not r.get("error") and (r.get("five_hour") or {}).get("pct") is not None
-
-def pace_note(pace):
-    """The trend row's caption. Sub-half-percent days read as noise ("+0%/day"), so they say what
-    they mean instead."""
-    if pace is None:
-        return "past 3½ days"
-    day = max(0, pace) * 24
-    return "steady" if day < 0.5 else f"+{day:.0f}%/day"
-
 def title_specs(rows):
     """(ring pct, pie pct) per active provider — the menu-bar gauge pair the app draws."""
     claude_rows = [r for r in rows if r.get("provider", "claude") == "claude"]
-    head = next((r for r in claude_rows if r.get("active") and has_usage(r)), None)
+    head = next((r for r in claude_rows
+                 if r.get("active") and not r.get("error")
+                 and (r.get("five_hour") or {}).get("pct") is not None), None)
     specs = []
     if head:
         specs.append((head["seven_day"]["pct"] or 0, head["five_hour"]["pct"] or 0))
@@ -1095,24 +1070,25 @@ def _display_rows(r):
         rows.append(_row("extra", None, f"{usd(sp.get('used') or 0)} / {usd(sp['limit'])} used"))
     return rows
 
-def _resample(pts, n=24):
-    """At most n of the (ts, value) samples, last-per-bucket — enough shape for a 74-pt sparkline,
-    few enough segments to paint quickly."""
-    if len(pts) <= n: return pts
+def _resample(pts, n=48):
+    """Cap a (ts, value) series at n points, last-per-bucket — the JSON trend series the burn
+    chart draws; interpolation happens at render time, so density beyond this is wasted bytes."""
+    if len(pts) <= n:
+        return pts
     t0, t1 = pts[0][0], pts[-1][0]
-    buckets = [[] for _ in range(n)]
+    span = max(1e-9, t1 - t0)
+    buckets = {}
     for t, v in pts:
-        buckets[min(n - 1, int((t - t0) / ((t1 - t0) or 1) * n))].append((t, v))
-    return [b[-1] for b in buckets if b]
+        buckets[min(n - 1, int((t - t0) / span * n))] = (t, v)
+    return [buckets[k] for k in sorted(buckets)]
 
 def trend_view(hist, r):
-    """(series, pace, note) for the trend row, or Nones until an hour of samples exists — minutes of
-    history draw a speck, not a shape."""
+    """The account's trend samples, or None until an hour of them exists — minutes of history draw
+    a speck, not a shape."""
     series = weekly_series(hist, r["uuid"])
     if len(series) < 2 or series[-1][0] - series[0][0] < 3600:
-        return None, None, None
-    pace = weekly_pace(series)
-    return series, pace, pace_note(pace)
+        return None
+    return series
 
 def attach_display(rows):
     """Give every row a `display` view-model: plan text, switchability, formatted lines, and the
@@ -1123,11 +1099,9 @@ def attach_display(rows):
     for r in rows:
         d = {"plan": plan_of(r), "can_switch": can_switch(r)}
         d["rows"] = _display_rows(r) if not r.get("error") else []
-        series, pace, note = trend_view(hist, r)
+        series = trend_view(hist, r)
         if series and not r.get("error"):
-            t = {"series": [[round(a, 1), b] for a, b in _resample(series, 48)], "note": note}
-            if pace is not None:
-                t["pace_per_hour"] = round(pace, 3)
+            t = {"series": [[round(a, 1), b] for a, b in _resample(series)]}
             # The reset only anchors a chart if it belongs to a genuinely weekly-scale window —
             # a Codex log carrying just its 5-hour window must not masquerade as a week.
             if r.get("provider") == "codex":
@@ -1156,11 +1130,9 @@ def render_json(rows):
 # the pre-switch credential lives in the Keychain like every other secret — never in a file
 PREV_KEY = "__previous__"
 # A switch moves the credential and the profile together. When only the credential lands, the CLI
-# spends one account under another's name, so the partial result is reported rather than announced
-# as a clean success — including through the menu, which has no stdout to print to.
+# spends one account under another's name — a partial result that must never read as a clean
+# success (see _report_switch).
 MISMATCH_NOTE = " — but ~/.claude.json still names the other account, so the CLI will show that name"
-ACTION   = os.path.join(STATE_DIR, "last-problem.json")   # non-secret: just an error message
-LEGACY_ACTION = os.path.join(STATE_DIR, "last-action.json")   # pre-rename name; swept on write
 # `switch --undo` reverses whichever provider was switched last, so the switch records which it was.
 LAST_SWITCH = os.path.join(STATE_DIR, "last-switch.json")
 
@@ -1177,50 +1149,17 @@ def last_switch_provider():
     except Exception:
         return "claude"      # written by a version that only switched Claude, or never written
 
-def record_problem(msg, kind="action"):
-    """Clicked menu items can't print and notifications may be suppressed — leave a *failure*
-    where the next render can show it (the click refreshes, so it appears immediately).
-
-    Only failures: a success already shows in the bar itself — the ▶ moves to the account row,
-    the title changes, the interval tick moves — so echoing it adds nothing.
-    """
-    try:
-        os.makedirs(STATE_DIR, exist_ok=True)
-        with open(ACTION, "w") as f: json.dump({"ts": time.time(), "kind": kind, "msg": msg}, f)
-    except Exception:
-        pass
-    try: os.remove(LEGACY_ACTION)      # left by versions that wrote successes here too
-    except Exception: pass
-
-def clear_problem(kind="action"):
-    """Drop the stale note once *that same* action succeeds. Scoped by kind: a working interval
-    change says nothing about a failed switch, and clearing it would erase a message the user
-    hasn't read yet."""
-    cur = last_problem(max_age=float("inf"))
-    if cur and cur.get("kind", "action") != kind:
-        return
-    try: os.remove(ACTION)
-    except Exception: pass
-
-def last_problem(max_age=90):
-    try:
-        with open(ACTION) as f: a = json.load(f)
-        return a if time.time() - a.get("ts", 0) < max_age else None
-    except Exception:
-        return None
-
-def _fail(msg, kind="action"):
-    record_problem(msg, kind)          # surfaced in the menu on the next render
+def _fail(msg):
     print(msg, file=sys.stderr); sys.exit(1)
 
 def _report_switch(msg, note):
-    """Announce a switch that went through. A note means it went through only in part, which the
-    menu has to be told about — a clicked item can't print."""
+    """Announce a switch. A note means it went through only in part — the credential moved but the
+    profile didn't — and a partial switch must reach the user wherever the switch came from: the
+    app surfaces stderr from a nonzero exit, and shells read the status."""
     if note:
-        record_problem(msg + note, "switch")
-    else:
-        clear_problem("switch")
-    print(msg + note)
+        print(msg + note, file=sys.stderr)
+        sys.exit(3)                    # partial: the credential DID move — not a clean failure
+    print(msg)
 
 ACCT_RE = re.compile(r'^\s*"acct"<blob>=(?:0x([0-9A-Fa-f]+)\s+)?"(.*)"\s*$')
 
@@ -1424,23 +1363,22 @@ def cmd_codex_switch(e):
     who = e.get("email") or aid
     stored = keychain_read(STORE_SVC, codex_key(aid))
     if not stored:
-        _fail(f"{who} isn't captured — sign into it with `codex login` once, then switching works",
-              "switch")
+        _fail(f"{who} isn't captured — sign into it with `codex login` once, then switching works")
     cur = codex_read_auth_raw()
     cur_aid = codex_identity(cur)[0]
     if cur and cur_aid:
         if not codex_store_auth(cur_aid, cur):     # keep the outgoing account switchable-back-to
-            _fail("couldn't stash the current Codex credential — unlock the Keychain and retry", "switch")
+            _fail("couldn't stash the current Codex credential — unlock the Keychain and retry")
         # compact, matching the stash: `security` hands back a newline-bearing secret hex-encoded,
         # and one encoding for one kind of blob keeps a backup comparable to a stash
         if not keychain_write(STORE_SVC, CODEX_PREV_KEY, json.dumps(json.loads(cur), separators=(",", ":"))):
-            _fail("couldn't back up the current Codex credential — switch did not happen", "switch")
+            _fail("couldn't back up the current Codex credential — switch did not happen")
     else:
         # Nothing identifiable is being displaced (signed out, or a file we can't read). Drop any
         # older backup rather than leave --undo pointing at an account this switch didn't replace.
         keychain_delete(STORE_SVC, CODEX_PREV_KEY)
     if not codex_write_auth(stored):
-        _fail(f"couldn't write ~/.codex/auth.json — switch to {who} did not happen", "switch")
+        _fail(f"couldn't write ~/.codex/auth.json — switch to {who} did not happen")
     codex_mark_signed_in(aid)
     record_last_switch("codex")
     clear_cache()
@@ -1451,9 +1389,9 @@ def cmd_codex_switch(e):
 def cmd_codex_undo():
     prev = keychain_read(STORE_SVC, CODEX_PREV_KEY)
     if not prev:
-        _fail("nothing to undo", "switch")
+        _fail("nothing to undo")
     if not codex_write_auth(prev):
-        _fail("couldn't restore the previous Codex account", "switch")
+        _fail("couldn't restore the previous Codex account")
     aid = codex_identity(prev)[0]
     if aid: codex_mark_signed_in(aid)
     keychain_delete(STORE_SVC, CODEX_PREV_KEY)
@@ -1470,7 +1408,7 @@ def cmd_switch(target):
     elif target:
         provider, e, note = resolve_target(target)
         if note and not e:
-            _fail(note, "switch")
+            _fail(note)
         if note:
             print(note, file=sys.stderr)
         if provider == "codex":
@@ -1484,7 +1422,7 @@ def cmd_switch(target):
         except Exception:
             blob = None
         if not blob or not write_live(blob):
-            _fail("couldn't restore the previous account — no writable credential store", "switch")
+            _fail("couldn't restore the previous account — no writable credential store")
         keychain_delete(STORE_SVC, PREV_KEY)
         try:
             with open(PREV_PROFILE) as f: prev_prof = json.load(f)
@@ -1505,18 +1443,18 @@ def cmd_switch(target):
 
     e = resolve_account(target)
     if not e:
-        _fail(f"unknown account: {target}", "switch")
+        _fail(f"unknown account: {target}")
     sec = load_secret(e["uuid"])
     if not sec or not sec.get("refreshToken"):
-        _fail(f"{e['email']} isn't captured — log into it once with the claude CLI", "switch")
+        _fail(f"{e['email']} isn't captured — log into it once with the claude CLI")
     if not sec.get("scopes"):
         # captured before we stored the full blob; writing a partial one could break the CLI login
         _fail(f"{e['email']} needs one login with the claude CLI to store its full credentials, "
-              f"then switching will work", "switch")
+              f"then switching will work")
 
     token, err = token_for_parked(e["uuid"])          # refreshes if the cached token is stale
     if err:
-        _fail(f"can't switch to {e['email']}: {err}", "switch")
+        _fail(f"can't switch to {e['email']}: {err}")
     sec = load_secret(e["uuid"])                      # re-read: the refresh may have rotated it
 
     blob = {"accessToken": sec.get("accessToken") or token,
@@ -1525,7 +1463,7 @@ def cmd_switch(target):
     blob.update({k: sec[k] for k in BLOB_META if sec.get(k) is not None})   # never write nulls
 
     if live_store() is None:
-        _fail("no Claude Code credential store found — sign in with the claude CLI first", "switch")
+        _fail("no Claude Code credential store found — sign in with the claude CLI first")
     cur = read_live_raw()                             # back up (to the Keychain) before overwriting
     if cur: keychain_write(STORE_SVC, PREV_KEY, cur)
     cur_prof = read_live_profile()                    # ditto for the profile, so --undo restores both
@@ -1536,7 +1474,7 @@ def cmd_switch(target):
         except Exception:
             pass
     if not write_live(blob):
-        _fail(f"couldn't write the credential — switch to {e['email']} did not happen", "switch")
+        _fail(f"couldn't write the credential — switch to {e['email']} did not happen")
 
     # The credential is the switch; the profile is the label on it. A failure here leaves a working
     # switch that reads as the wrong account, which is worse to discover silently than to be told.
@@ -1554,6 +1492,13 @@ def cmd_switch(target):
     _report_switch(f"switched to {e['email']}", note)
 
 # ---- native app presence (for doctor) ---------------------------------------
+
+def _app_bundle_path():
+    for base in ("/Applications", os.path.expanduser("~/Applications")):
+        p = os.path.join(base, APP_BUNDLE)
+        if os.path.isdir(p):
+            return p
+    return None
 
 def _app_installed(bundle):
     return any(os.path.isdir(os.path.join(base, bundle))
@@ -1648,12 +1593,33 @@ def cmd_doctor():
                     "sign into it with `codex login` once to capture its credential.")
 
     section("Menu bar")
-    if not _app_installed("Claude Usage.app"):
+    bundle = _app_bundle_path()
+    if not bundle:
         say("warn", "the menu-bar app isn't built", "run `claude-usage app` to build and launch it.")
-    elif subprocess.run(["pgrep", "-x", "ClaudeUsage"], capture_output=True).returncode != 0:
-        say("warn", "Claude Usage.app is built but not running", "open it, or run `claude-usage app`.")
     else:
-        say("ok", "Claude Usage.app is running")
+        if subprocess.run(["pgrep", "-x", APP_EXECUTABLE], capture_output=True).returncode != 0:
+            say("warn", f"{APP_BUNDLE} is built but not running", "open it, or run `claude-usage app`.")
+        else:
+            say("ok", f"{APP_BUNDLE} is running")
+        # the app runs the script at the absolute path baked in at build time — a moved or
+        # deleted checkout strands it with no other symptom than a failing refresh
+        try:
+            import plistlib
+            with open(os.path.join(bundle, "Contents", "Info.plist"), "rb") as f:
+                backend = plistlib.load(f).get("CUBackend")
+            if backend and not os.path.exists(backend):
+                say("bad", f"the app's backend script is missing: {backend}",
+                    "run `claude-usage app` from your current checkout to rebuild.")
+            elif backend and os.path.realpath(backend) != os.path.realpath(__file__):
+                say("warn", "the app was built from a different checkout than this command",
+                    f"it runs {backend}; rebuild with `claude-usage app` if that's stale.")
+        except Exception:
+            pass
+    stale = glob.glob(os.path.expanduser(
+        "~/Library/Application Support/xbar/plugins/claude-usage.*.sh"))
+    if stale:
+        say("warn", "an old xbar plugin link is still present",
+            "delete " + ", ".join(stale) + " — see the README's upgrade note.")
 
     section("Shell")
     cu = os.path.expanduser("~/.local/bin/claude-usage")
@@ -1718,9 +1684,7 @@ def cmd_setup():
         print("Menu bar: needs the Xcode Command Line Tools (xcode-select --install);")
         print("run `claude-usage app` once they're installed.")
     elif _ask("Build and launch the menu-bar app?", True):
-        try:
-            cmd_app()
-        except SystemExit:
+        if not build_app():
             print("  the build didn't finish — fix the error above and run `claude-usage app`.")
 
     print("\nRegistering the account you're signed into…")
@@ -1740,13 +1704,14 @@ def cmd_setup():
 
 CLAUDE_PROJECTS = os.path.expanduser(os.environ.get("CU_PROJECTS") or "~/.claude/projects")
 INSIGHTS_CACHE = os.path.join(STATE_DIR, "insights.json")   # non-secret: aggregates only
+INSIGHTS_SCHEMA = 3                   # bump when the payload shape or semantics change
 INSIGHTS_TTL = 1800                   # a scan is seconds; a menu open should never pay it twice
 INSIGHTS_WINDOW_D = 7
 # USD per MTok: (input, output, cache write, cache read) — API list prices as of Aug 2026.
 # The gpt row prices Codex turns: cache write is unused there (Codex reports cached input reads).
 PRICING = {"opus": (5.0, 25.0, 6.25, 0.50), "fable": (10.0, 50.0, 12.50, 1.00),
            "sonnet": (3.0, 15.0, 3.75, 0.30), "haiku": (1.0, 5.0, 1.25, 0.10),
-           "gpt": (1.25, 10.0, 1.25, 0.125)}
+           "gpt": (1.25, 10.0, None, 0.125)}
 FAMILY_NAMES = {"opus": "Opus", "fable": "Fable", "sonnet": "Sonnet", "haiku": "Haiku", "gpt": "GPT"}
 
 def _model_family(model):
@@ -1756,7 +1721,7 @@ def _model_family(model):
             return k
     return None
 
-EFFORT_ORDER = {"max": 0, "xhigh": 1, "high": 2, "medium": 3, "low": 4, "": 5}
+EFFORT_ORDER = {"max": 0, "xhigh": 1, "high": 2, "medium": 3, "low": 4, "minimal": 5, "": 6}
 
 def _model_display(model):
     """Row label for the mix: family + version — "Opus 4.8" and "Opus 5" are different spends.
@@ -1783,6 +1748,26 @@ def _msg_cost(fam, u):
     return ((u.get("input_tokens", 0) or 0) * pi + (u.get("output_tokens", 0) or 0) * po
             + (u.get("cache_creation_input_tokens", 0) or 0) * pw
             + (u.get("cache_read_input_tokens", 0) or 0) * pr) / 1e6
+
+APP_BUNDLE = "Claude Usage.app"
+APP_EXECUTABLE = "ClaudeUsage"
+
+def codex_session_files():
+    """Every Codex rollout file. Recursive: independent of the YYYY/MM/DD layout Codex uses today."""
+    return glob.glob(os.path.join(CODEX_SESSIONS, "**", "*.jsonl"), recursive=True)
+
+def _tally(agg, fam, name, effort, cost, tokens):
+    """One accounting entry for both scan loops — a single schema for a model row, so a field added
+    for one provider exists for the other."""
+    s = agg.setdefault(name, {"family": FAMILY_NAMES[fam], "msgs": 0, "input": 0, "output": 0,
+                              "cache_write": 0, "cache_read": 0, "cost": 0.0, "efforts": {}})
+    s["msgs"] += 1
+    for k, v in tokens.items():
+        s[k] += v
+    s["cost"] += cost
+    ef = s["efforts"].setdefault(effort or "", {"cost": 0.0, "msgs": 0})
+    ef["cost"] += cost
+    ef["msgs"] += 1
 
 def compute_insights(now=None):
     """Scan the trailing week's transcripts into per-model totals. A full rescan of the window
@@ -1826,19 +1811,12 @@ def compute_insights(now=None):
                     fam, name = _model_display(msg.get("model"))
                     if not fam:
                         continue
-                    s = agg.setdefault(name, {"family": FAMILY_NAMES[fam], "msgs": 0, "input": 0,
-                                              "output": 0, "cache_write": 0, "cache_read": 0,
-                                              "cost": 0.0, "efforts": {}})
-                    s["msgs"] += 1
-                    s["input"] += u.get("input_tokens", 0) or 0
-                    s["output"] += u.get("output_tokens", 0) or 0
-                    s["cache_write"] += u.get("cache_creation_input_tokens", 0) or 0
-                    s["cache_read"] += u.get("cache_read_input_tokens", 0) or 0
                     c = _msg_cost(fam, u)
-                    s["cost"] += c
-                    ef = s["efforts"].setdefault(rec.get("effort") or "", {"cost": 0.0, "msgs": 0})
-                    ef["cost"] += c
-                    ef["msgs"] += 1
+                    _tally(agg, fam, name, rec.get("effort"), c,
+                           {"input": u.get("input_tokens", 0) or 0,
+                            "output": u.get("output_tokens", 0) or 0,
+                            "cache_write": u.get("cache_creation_input_tokens", 0) or 0,
+                            "cache_read": u.get("cache_read_input_tokens", 0) or 0})
                     if ts >= today_utc:
                         today_cost += c
         except Exception:
@@ -1853,7 +1831,7 @@ def compute_insights(now=None):
                "cache_read": s["cache_read"], "cost": round(s["cost"], 2),
                "efforts": effort_slices(s["efforts"])}
               for n, s in sorted(agg.items(), key=lambda kv: -kv[1]["cost"])]
-    return {"schema": 2, "as_of": round(now, 1), "ttl_s": INSIGHTS_TTL,
+    return {"schema": INSIGHTS_SCHEMA, "as_of": round(now, 1), "ttl_s": INSIGHTS_TTL,
             "day": datetime.now().astimezone().strftime("%Y-%m-%d"),
             "window_days": INSIGHTS_WINDOW_D,
             "total_cost": round(sum(s["cost"] for s in agg.values()), 2),
@@ -1874,7 +1852,7 @@ def _scan_codex(agg, cut, cut_iso, today_utc):
     Returns the window's Codex today-cost. Resumed rollouts replay their history, so events dedupe
     on (timestamp, running total)."""
     seen, today = set(), 0.0
-    for fp in glob.glob(os.path.join(CODEX_SESSIONS, "**", "*.jsonl"), recursive=True):
+    for fp in codex_session_files():
         try:
             if os.path.getmtime(fp) < cut:
                 continue
@@ -1909,17 +1887,8 @@ def _scan_codex(agg, cut, cut_iso, today_utc):
                     cached = u.get("cached_input_tokens", 0) or 0
                     out = u.get("output_tokens", 0) or 0
                     c = (max(0, i_all - cached) * pi + cached * pr + out * po) / 1e6
-                    s = agg.setdefault(name, {"family": FAMILY_NAMES[fam], "msgs": 0, "input": 0,
-                                              "output": 0, "cache_write": 0, "cache_read": 0,
-                                              "cost": 0.0, "efforts": {}})
-                    s["msgs"] += 1
-                    s["input"] += max(0, i_all - cached)
-                    s["output"] += out
-                    s["cache_read"] += cached
-                    s["cost"] += c
-                    ef = s["efforts"].setdefault(effort or "", {"cost": 0.0, "msgs": 0})
-                    ef["cost"] += c
-                    ef["msgs"] += 1
+                    _tally(agg, fam, name, effort, c,
+                           {"input": max(0, i_all - cached), "output": out, "cache_read": cached})
                     if ts >= today_utc:
                         today += c
         except Exception:
@@ -1935,7 +1904,7 @@ def cmd_insights(as_json):
     try:
         with open(INSIGHTS_CACHE) as f:
             cached = json.load(f)
-        if (cached.get("schema") == 2 and time.time() - cached.get("as_of", 0) < INSIGHTS_TTL
+        if (cached.get("schema") == INSIGHTS_SCHEMA and time.time() - cached.get("as_of", 0) < INSIGHTS_TTL
                 and cached.get("day") == datetime.now().astimezone().strftime("%Y-%m-%d")):
             data = cached
     except Exception:
@@ -1962,7 +1931,7 @@ def cmd_insights(as_json):
              f"{m['cache_write']:,}", f"{m['cache_read']:,}", "$%.0f" % m["cost"])
     line("total", "", "", "", "", "", "$%.0f" % data["total_cost"])
 
-def cmd_app():
+def build_app():
     """Compile native/ClaudeUsageBar.swift into "Claude Usage.app" and (re)launch it — /Applications
     when writable, else ~/Applications.
 
@@ -1974,32 +1943,32 @@ def cmd_app():
     src = os.path.join(src_dir, "native", "ClaudeUsageBar.swift")
     if not os.path.exists(src):
         print("native/ClaudeUsageBar.swift not found next to this script", file=sys.stderr)
-        sys.exit(1)
+        return False
     swiftc = shutil.which("swiftc")
     if not swiftc:
         print("swiftc not found — install the Xcode Command Line Tools first:", file=sys.stderr)
         print("  xcode-select --install", file=sys.stderr)
-        sys.exit(1)
+        return False
     # /Applications when writable (login items and app registries treat it as home), else ~/Applications
     apps_dir = "/Applications" if os.access("/Applications", os.W_OK) else os.path.expanduser("~/Applications")
-    app = os.path.join(apps_dir, "Claude Usage.app")
+    app = os.path.join(apps_dir, APP_BUNDLE)
     macos_dir = os.path.join(app, "Contents", "MacOS")
     os.makedirs(macos_dir, exist_ok=True)
-    binary = os.path.join(macos_dir, "ClaudeUsage")
+    binary = os.path.join(macos_dir, APP_EXECUTABLE)
     print("compiling the menu-bar app (takes a moment the first time)…")
     r = subprocess.run([swiftc, "-O", "-swift-version", "5", "-parse-as-library", src, "-o", binary],
                       capture_output=True, text=True)
     if r.returncode != 0:
         print(r.stderr, file=sys.stderr)
         print("build failed", file=sys.stderr)
-        sys.exit(1)
+        return False
     import plistlib
     with open(os.path.join(app, "Contents", "Info.plist"), "wb") as f:
         plistlib.dump({
             "CFBundleIdentifier": "com.allenmervia.claude-usage",
             "CFBundleName": "Claude Usage",
             "CFBundleDisplayName": "Claude Usage",
-            "CFBundleExecutable": "ClaudeUsage",
+            "CFBundleExecutable": APP_EXECUTABLE,
             "CFBundlePackageType": "APPL",
             "CFBundleShortVersionString": "1.0",
             "CFBundleVersion": "1",
@@ -2009,10 +1978,14 @@ def cmd_app():
             "CUBackend": os.path.realpath(__file__),
         }, f)
     subprocess.run(["codesign", "--force", "--sign", "-", app], capture_output=True)
-    subprocess.run(["pkill", "-x", "ClaudeUsage"], capture_output=True)   # replace a running copy
+    subprocess.run(["pkill", "-x", APP_EXECUTABLE], capture_output=True)   # replace a running copy
     time.sleep(0.3)
     subprocess.run(["open", app])
     print(f"launched {app}")
+    return True
+
+def cmd_app():
+    sys.exit(0 if build_app() else 1)
 
 def main():
     arg = sys.argv[1] if len(sys.argv) > 1 else ""
@@ -2020,6 +1993,10 @@ def main():
         cmd_setup(); return
     if arg == "app":
         cmd_app(); return
+    if arg in ("install", "interval", "--xbar"):
+        print(f"`{arg}` went with the xbar plugin — the menu bar is `claude-usage app` now"
+              + ("; `--json` is the machine format" if arg == "--xbar" else ""), file=sys.stderr)
+        sys.exit(2)
     if arg == "insights":
         cmd_insights("--json" in sys.argv[2:]); return
     if arg == "doctor":

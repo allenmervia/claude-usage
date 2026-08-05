@@ -67,7 +67,8 @@ it apart from.
 - [Claude Code](https://claude.com/claude-code), signed in to at least one account
 - Optional: the [Codex](https://openai.com/codex) CLI, signed in — its usage then
   appears alongside (nothing to set up; see [Codex](#codex))
-- The Xcode Command Line Tools (`xcode-select --install`), for the menu-bar app
+- Optional: the Xcode Command Line Tools (`xcode-select --install`) — only the
+  menu-bar app needs them; the terminal commands run on stock `python3`
 
 ## Install
 
@@ -121,6 +122,7 @@ claude-usage setup      guided first-time setup (register account + optional men
 claude-usage            table of all known accounts (default)
 claude-usage app        build + launch the menu-bar app (see below)
 claude-usage doctor     check the setup and report what needs fixing
+claude-usage insights   trailing-week tokens + API-equivalent cost by model (see below)
 claude-usage --json     machine-readable JSON
 claude-usage capture    register the active account now (same as any run)
 claude-usage list       list registered accounts, Claude and Codex
@@ -203,8 +205,9 @@ table — which is also the fallback if you'd rather skip the app entirely.
 
 Earlier versions rendered the bar through an xbar/SwiftBar plugin. If you ran one,
 retire it by deleting the `claude-usage.*.sh` symlink from
-`~/Library/Application Support/xbar/plugins/` (and `brew uninstall xbar` if nothing
-else uses it). Nothing else to clean — the state in `~/.claude-usage/` and the
+`~/Library/Application Support/xbar/plugins/` — or from SwiftBar's plugin folder,
+shown in its preferences — and `brew uninstall xbar` if nothing else uses it.
+`claude-usage doctor` warns while an old link is still present. Nothing else to clean — the state in `~/.claude-usage/` and the
 Keychain entries belong to the tool and carry over.
 
 ### When something looks wrong
@@ -355,8 +358,8 @@ Two properties keep the reporting side safe:
   account's weekly boundary (see [The `~` on a weekly reset](#the--on-a-weekly-reset)),
   shown only when the endpoint reports none and always marked as the guess it is; and
   a history of the percentages already shown (`~/.claude-usage/history.jsonl`, trimmed
-  back to the trailing two weeks as it grows), which feeds the trend sparkline and its
-  pace — never a current reading.
+  back to the trailing two weeks as it grows), which feeds the Insights tab's weekly
+  burn — never a current reading.
 
 **Switching is the one exception, by design.** [Switching accounts](#switching-accounts)
 deliberately *writes* Claude Code's credential — that's the whole mechanism. It replaces
@@ -374,7 +377,8 @@ the wrong account is worse discovered silently than reported.
 
 Nothing sensitive is written into the repo or into `~/.claude-usage/` — that
 directory holds only non-secret state (account identity, cached and historical usage
-percentages, the last failure's message, which provider was switched last). **Every
+percentages, the transcript-scan aggregates, the last failure's message, which
+provider was switched last). **Every
 credential, including the pre-switch backup, lives in the Keychain.**
 
 ## Caveats

@@ -51,7 +51,6 @@ struct DisplayRow: Decodable {
 
 struct Trend: Decodable {
     var series: [[Double]]?
-    var note: String?
     var reset_ts: Double?
     var window_s: Double?
 }
@@ -103,7 +102,7 @@ func sevNSColor(_ pct: Double?) -> NSColor {
     if p >= 65 { return NSColor(red: 0.85, green: 0.63, blue: 0.23, alpha: 1) }
     return NSColor(red: 0.25, green: 0.73, blue: 0.31, alpha: 1) }
 
-// MARK: - Status-bar icon: one ring+pie gauge per provider, same design as the xbar title
+// MARK: - Status-bar icon: one gauge per provider — ring = weekly window, centre pie = 5-hour
 
 enum IconRenderer {
     static func render(specs: [[Double?]]) -> NSImage {
@@ -174,6 +173,11 @@ enum Backend {
 
     static func run(_ args: [String]) async throws -> Data {
         let py = python, script = script
+        // the script path is baked in at build time; if that checkout moved, every call would
+        // fail with a bare python error that never names the fix
+        guard FileManager.default.fileExists(atPath: script) else {
+            throw BackendError.failed("backend script missing at \(script) — run `claude-usage app` from your checkout to rebuild")
+        }
         return try await withCheckedThrowingContinuation { cont in
             DispatchQueue.global().async {
                 let p = Process()
@@ -220,6 +224,7 @@ final class Model: ObservableObject {
     @Published var lastError: String?
     @Published var insights: InsightsPayload?
     @Published var insightsError: String?
+    private var insightsFetching = false
     @Published var hoveredMixRow: String?      // drives the ledger drawn at the window root
     @Published var tab = 0                     // 0 Usage · 1 Insights
     // Plain @Published backed by UserDefaults — @AppStorage inside an ObservableObject doesn't
@@ -278,7 +283,9 @@ final class Model: ObservableObject {
         // TTL), so ordinary refreshes spawn nothing extra — and a cold scan never blocks the
         // usage data above, which has already landed.
         let age = Date().timeIntervalSince1970 - (insights?.as_of ?? 0)
-        if insights == nil || age > (insights?.ttl_s ?? 1800) {
+        if !insightsFetching, insights == nil || age > (insights?.ttl_s ?? 1800) {
+            insightsFetching = true
+            defer { insightsFetching = false }
             do {
                 let data = try await Backend.run(["insights", "--json"])
                 insights = try JSONDecoder().decode(InsightsPayload.self, from: data)
@@ -305,6 +312,22 @@ final class Model: ObservableObject {
     var claude: [Account] { payload?.accounts.filter { !$0.isCodex } ?? [] }
     var codex: [Account] { payload?.accounts.filter { $0.isCodex } ?? [] }
     var multiProvider: Bool { !claude.isEmpty && !codex.isEmpty }
+}
+
+// MARK: - Floating chip: the shared dress for hover popovers (mix ledger, strip identity)
+
+struct FloatingChip: ViewModifier {
+    let border: Color
+    func body(content: Content) -> some View {
+        content
+            .background(
+                RoundedRectangle(cornerRadius: 7)
+                    .fill(Color(nsColor: .windowBackgroundColor))
+                    .shadow(color: .black.opacity(0.35), radius: 10, y: 4)
+            )
+            .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(border))
+            .allowsHitTesting(false)
+    }
 }
 
 // MARK: - Countdown re-derivation ("3h 22m left" stays live while the window is open)
@@ -378,6 +401,7 @@ struct MenuView: View {
         }
         .padding(8)
         .frame(width: 420)
+        .onChange(of: model.tab) { _ in model.hoveredMixRow = nil }
         .overlayPreferenceValue(MixAnchorKey.self) { anchors in
             // drawn from the root so no sibling can paint over it; flipped above the row when the
             // window's bottom edge would clip it
@@ -397,10 +421,19 @@ struct MenuView: View {
             }
             .allowsHitTesting(false)
         }
-        .onAppear { Task { await model.refresh() } }
+        .onAppear {
+            model.hoveredMixRow = nil
+            Task { await model.refresh() }
+        }
     }
 
     @ViewBuilder private var accountsColumn: some View {
+        if model.claude.isEmpty && model.codex.isEmpty {
+            Text("No accounts found — run `claude`, then /login, and refresh.")
+                .font(.system(size: 11.5)).foregroundStyle(.secondary)
+                .padding(.vertical, 14)
+                .frame(maxWidth: .infinity)
+        }
         if model.multiProvider { SectionHeader("CLAUDE") }
         ForEach(model.claude) { AccountCard(account: $0) }
         if !model.codex.isEmpty {
@@ -423,7 +456,7 @@ struct InsightsTab: View {
                 .padding(.horizontal, 8)
                 .padding(.vertical, 10)
                 .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.03)))
-            SectionHeader("MODEL MIX · PAST 7 DAYS")
+            SectionHeader("MODEL MIX · PAST \(model.insights?.window_days ?? 7) DAYS")
             ModelMixPanel(insights: model.insights, error: model.insightsError)
         }
     }
@@ -478,16 +511,9 @@ struct WindowStrips: View {
                                     .font(.system(size: 9.5, design: .monospaced))
                                     .padding(.horizontal, 8)
                                     .padding(.vertical, 4)
-                                    .background(
-                                        RoundedRectangle(cornerRadius: 6)
-                                            .fill(Color(nsColor: .windowBackgroundColor))
-                                            .shadow(color: .black.opacity(0.3), radius: 8, y: 3)
-                                    )
-                                    .overlay(RoundedRectangle(cornerRadius: 6)
-                                        .strokeBorder(e.color.opacity(0.5)))
                                     .fixedSize()
+                                    .modifier(FloatingChip(border: e.color.opacity(0.5)))
                                     .offset(x: Self.labelW + 4)
-                                    .allowsHitTesting(false)
                             }
                         }
                     }
@@ -608,7 +634,7 @@ struct WindowStrips: View {
                 ctx.stroke(cross, with: .color(Color.primary.opacity(0.3)))
                 ctx.draw(Text(Self.hoverFmt.string(from: Date(timeIntervalSince1970: t)))
                             .font(.system(size: 8.5, design: .monospaced)).foregroundColor(.secondary),
-                         at: CGPoint(x: size.width - 4, y: 7), anchor: .trailing)
+                         at: CGPoint(x: 4, y: 7), anchor: .leading)
                 if let i = hoverRow {
                     let e = entries[i]
                     let pts = (e.trend.series ?? []).filter { $0.count >= 2 && $0[0] >= e.start }
@@ -619,7 +645,7 @@ struct WindowStrips: View {
                         let chipW = CGFloat(label.count) * 6 + 10
                         var cx = h.x + 8
                         if cx + chipW > size.width - 4 { cx = h.x - 8 - chipW }
-                        let chip = CGRect(x: cx, y: y - 8, width: chipW, height: 16)
+                        let chip = CGRect(x: cx, y: min(max(0, y - 8), axisY - 16), width: chipW, height: 16)
                         ctx.fill(Path(roundedRect: chip, cornerRadius: 5),
                                  with: .color(Color(nsColor: .windowBackgroundColor).opacity(0.95)))
                         ctx.stroke(Path(roundedRect: chip, cornerRadius: 5),
@@ -703,8 +729,8 @@ struct ModelMixPanel: View {
         VStack(alignment: .leading, spacing: 6) {
             if let ins = insights, let rows = ins.models, !rows.isEmpty {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text(dollars(ins.total_cost)).font(.system(size: 20, weight: .bold))
-                    Text("this week · \(dollars(ins.today_cost)) today")
+                    Text(Self.usd(ins.total_cost)).font(.system(size: 20, weight: .bold))
+                    Text("this week · \(Self.usd(ins.today_cost)) today")
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                 }
                 let maxCost = max(rows.first?.cost ?? 0, 0.001)
@@ -767,7 +793,7 @@ struct ModelMixPanel: View {
                 }
             }
             .frame(height: 8)
-            Text(dollars(row.cost))
+            Text(Self.usd(row.cost))
                 .font(.system(size: 10.5, design: .monospaced))
                 .frame(width: 52, alignment: .trailing)
         }
@@ -791,11 +817,11 @@ struct ModelMixPanel: View {
 
     static func ledger(_ row: ModelRow) -> some View {
         VStack(alignment: .leading, spacing: 2.5) {
-            Text("\(row.name) · \(Self.usdStatic(row.cost)) · \((row.msgs ?? 0).formatted()) msgs")
+            Text("\(row.name) · \(Self.usd(row.cost)) · \((row.msgs ?? 0).formatted()) msgs")
                 .font(.system(size: 10.5, weight: .semibold))
             ForEach(Array((row.efforts ?? []).enumerated()), id: \.offset) { _, seg in
                 Self.ledgerLine(Self.effortLabel(seg.effort),
-                           "\(Self.usdStatic(seg.cost)) · \((seg.msgs ?? 0).formatted()) msgs")
+                           "\(Self.usd(seg.cost)) · \((seg.msgs ?? 0).formatted()) msgs")
             }
             Divider().padding(.vertical, 1)
             if let out = row.output { Self.ledgerLine("output", Self.fmtTok(out)) }
@@ -804,13 +830,7 @@ struct ModelMixPanel: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
         .frame(width: 215, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 7)
-                .fill(Color(nsColor: .windowBackgroundColor))
-                .shadow(color: .black.opacity(0.35), radius: 10, y: 4)
-        )
-        .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(Color.primary.opacity(0.14)))
-        .allowsHitTesting(false)
+        .modifier(FloatingChip(border: Color.primary.opacity(0.14)))
     }
 
     static func ledgerLine(_ label: String, _ value: String) -> some View {
@@ -824,12 +844,11 @@ struct ModelMixPanel: View {
     static func fmtTok(_ v: Double) -> String {
         if v >= 1e9 { return String(format: "%.1fB tok", v / 1e9) }
         if v >= 1e6 { return String(format: "%.1fM tok", v / 1e6) }
-        return String(format: "%.0fK tok", v / 1e3)
+        if v >= 1e3 { return String(format: "%.0fK tok", v / 1e3) }
+        return String(format: "%.0f tok", v)
     }
 
-    private func dollars(_ v: Double?) -> String { Self.usdStatic(v) }
-
-    static func usdStatic(_ v: Double?) -> String {
+    static func usd(_ v: Double?) -> String {
         guard let v = v else { return "—" }
         if v >= 10 { return "$\(Int(v.rounded()))" }
         return String(format: "$%.2f", v)
@@ -915,7 +934,7 @@ struct AccountCard: View {
                 } else if hovered && account.display?.can_switch == true {
                     Text("⇄").font(.system(size: 11, weight: .semibold)).foregroundStyle(Color.accentColor)
                 } else {
-                    Text(" ").font(.system(size: 9))
+                    Color.clear
                 }
             }
             .frame(width: 13, alignment: .leading)
