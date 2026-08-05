@@ -1011,12 +1011,15 @@ struct FooterView: View {
                     .help("Refresh now")
                 }
                 Menu {
-                    ForEach([1, 5, 10, 30], id: \.self) { m in
-                        Button {
-                            model.intervalMinutes = m
-                            model.startTimer()
-                        } label: {
-                            if model.intervalMinutes == m { Text("✓ \(m)m") } else { Text("\(m)m") }
+                    Section("Refresh every") {
+                        ForEach([1, 5, 10, 30], id: \.self) { m in
+                            Button {
+                                model.intervalMinutes = m
+                                model.startTimer()
+                            } label: {
+                                let name = m == 1 ? "1 minute" : "\(m) minutes"
+                                if model.intervalMinutes == m { Text("✓ \(name)") } else { Text(name) }
+                            }
                         }
                     }
                     Divider()
@@ -1044,7 +1047,7 @@ struct FooterView: View {
 
     private func updatedText(now: Date) -> String {
         guard let ts = model.payload?.updated_ts else { return "—" }
-        return "Updated \(agoText(since: ts)) · refreshes every \(model.intervalMinutes)m"
+        return "Updated \(agoText(since: ts))"
     }
 }
 
