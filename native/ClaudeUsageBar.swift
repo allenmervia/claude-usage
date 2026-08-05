@@ -71,6 +71,8 @@ struct ModelRow: Decodable {
     var family: String?
     var msgs: Int?
     var cost: Double?
+    var output: Double?
+    var cache_read: Double?
     var efforts: [EffortSlice]?
 }
 
@@ -78,6 +80,7 @@ struct EffortSlice: Decodable {
     var effort: String?
     var rank: Int?
     var cost: Double?
+    var msgs: Int?
 }
 
 // Identity colors for series and model families — distinct from the severity palette so a line or
@@ -217,6 +220,7 @@ final class Model: ObservableObject {
     @Published var lastError: String?
     @Published var insights: InsightsPayload?
     @Published var insightsError: String?
+    @Published var hoveredMixRow: String?      // drives the ledger drawn at the window root
     @Published var tab = 0                     // 0 Usage · 1 Insights
     // Plain @Published backed by UserDefaults — @AppStorage inside an ObservableObject doesn't
     // fire objectWillChange, which would leave the gear menu's checkmark on the old cadence.
@@ -317,7 +321,9 @@ func relString(_ date: Date, now: Date) -> String {
 func agoText(since ts: Double?) -> String {
     guard let ts = ts else { return "—" }
     let secs = Int(Date().timeIntervalSince1970 - ts)
-    if secs < 90 { return "just now" }
+    // "just now" means it: only within a fresh-fetch buffer, then honest seconds/minutes
+    if secs < 15 { return "just now" }
+    if secs < 90 { return "\(secs)s ago" }
     if secs < 3600 { return "\(secs / 60)m ago" }
     return "\(secs / 3600)h ago"
 }
@@ -372,6 +378,25 @@ struct MenuView: View {
         }
         .padding(8)
         .frame(width: 420)
+        .overlayPreferenceValue(MixAnchorKey.self) { anchors in
+            // drawn from the root so no sibling can paint over it; flipped above the row when the
+            // window's bottom edge would clip it
+            GeometryReader { geo in
+                if model.tab == 1, let name = model.hoveredMixRow,
+                   let ins = model.insights, let rows = ins.models,
+                   let row = rows.first(where: { $0.name == name }),
+                   let anchor = anchors[name] {
+                    let rect = geo[anchor]
+                    let h = ModelMixPanel.ledgerHeight(row)
+                    let below = rect.maxY + 6
+                    let y = below + h > geo.size.height - 8 ? max(8, rect.minY - h - 6) : below
+                    let x = min(max(8, rect.minX + 60), geo.size.width - 223)
+                    ModelMixPanel.ledger(row)
+                        .offset(x: x, y: y)
+                }
+            }
+            .allowsHitTesting(false)
+        }
         .onAppear { Task { await model.refresh() } }
     }
 
@@ -398,8 +423,6 @@ struct InsightsTab: View {
                 .padding(.horizontal, 8)
                 .padding(.vertical, 10)
                 .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.03)))
-            Text("each band is that account's current week on one timeline · the line is now")
-                .font(.system(size: 9.5)).foregroundStyle(.secondary).padding(.horizontal, 4)
             SectionHeader("MODEL MIX · PAST 7 DAYS")
             ModelMixPanel(insights: model.insights, error: model.insightsError)
         }
@@ -412,6 +435,7 @@ struct InsightsTab: View {
 struct WindowStrips: View {
     let accounts: [Account]
     @State private var hover: CGPoint?
+    @State private var hoveredLabel: Int?
 
     private static let rowH: CGFloat = 34, gap: CGFloat = 9, axisH: CGFloat = 15, labelW: CGFloat = 60
 
@@ -423,7 +447,8 @@ struct WindowStrips: View {
             guard let t = a.display?.trend, (t.series?.count ?? 0) >= 2,
                   let rt = t.reset_ts else { return nil }
             let win = t.window_s ?? 7 * 86400
-            return Entry(name: a.label ?? a.uuid, trend: t,
+            let email = (a.email?.contains("@") == true && a.email != a.label) ? a.email : nil
+            return Entry(name: a.label ?? a.uuid, email: email, isCodex: a.isCodex, trend: t,
                          color: seriesPalette[idx % seriesPalette.count],
                          start: rt - win, reset: rt)
         }
@@ -433,7 +458,7 @@ struct WindowStrips: View {
         } else {
             HStack(alignment: .top, spacing: 8) {
                 VStack(alignment: .leading, spacing: Self.gap) {
-                    ForEach(Array(entries.enumerated()), id: \.offset) { _, e in
+                    ForEach(Array(entries.enumerated()), id: \.offset) { i, e in
                         VStack(alignment: .leading, spacing: 0) {
                             Text(e.name).font(.system(size: 10.5, weight: .semibold))
                                 .foregroundStyle(e.color)
@@ -441,8 +466,33 @@ struct WindowStrips: View {
                                 .font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary)
                         }
                         .frame(width: Self.labelW, height: Self.rowH, alignment: .leading)
+                        .contentShape(Rectangle())
+                        .onHover { inside in
+                            if inside { hoveredLabel = i }
+                            else if hoveredLabel == i { hoveredLabel = nil }
+                        }
+                        .overlay(alignment: .leading) {
+                            // identity on demand: the short name hides which login and provider
+                            if hoveredLabel == i {
+                                Text("\(e.email.map { "\($0) · " } ?? "")\(e.isCodex ? "Codex" : "Claude")")
+                                    .font(.system(size: 9.5, design: .monospaced))
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 4)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 6)
+                                            .fill(Color(nsColor: .windowBackgroundColor))
+                                            .shadow(color: .black.opacity(0.3), radius: 8, y: 3)
+                                    )
+                                    .overlay(RoundedRectangle(cornerRadius: 6)
+                                        .strokeBorder(e.color.opacity(0.5)))
+                                    .fixedSize()
+                                    .offset(x: Self.labelW + 4)
+                                    .allowsHitTesting(false)
+                            }
+                        }
                     }
                 }
+                .zIndex(hoveredLabel != nil ? 1 : 0)
                 canvas(entries)
             }
         }
@@ -450,6 +500,8 @@ struct WindowStrips: View {
 
     struct Entry {
         let name: String
+        let email: String?
+        let isCodex: Bool
         let trend: Trend
         let color: Color
         let start: Double
@@ -486,15 +538,22 @@ struct WindowStrips: View {
                 let x = X(day.timeIntervalSince1970)
                 var p = Path(); p.move(to: CGPoint(x: x, y: 0)); p.addLine(to: CGPoint(x: x, y: axisY))
                 ctx.stroke(p, with: .color(Color.primary.opacity(0.06)))
-                // "now" owns its stretch of the axis — nearby day labels yield to it
-                if x > 12 && x < size.width - 12 && abs(x - X(now)) > 17 {
+                if x > 12 && x < size.width - 12 {
                     ctx.draw(Text(Self.dayFmt.string(from: day)).font(.system(size: 7.5)).foregroundColor(.secondary),
                              at: CGPoint(x: x, y: axisY + Self.axisH / 2 + 1))
                 }
                 day = day.addingTimeInterval(86400)
             }
+            // the row under the pointer draws at full strength; its siblings recede
+            let hoverRow: Int? = hover.flatMap { h in
+                let slot = Self.rowH + Self.gap
+                let idx = Int(h.y / slot)
+                let within = h.y.truncatingRemainder(dividingBy: slot) <= Self.rowH
+                return (idx >= 0 && idx < entries.count && within) ? idx : nil
+            }
             for (i, e) in entries.enumerated() {
-                let color = e.color, ws = e.start, rt = e.reset
+                let dim: Double = (hoverRow == nil || hoverRow == i) ? 1 : 0.4
+                let color = e.color.opacity(dim), ws = e.start, rt = e.reset
                 let top = rowTop(i)
                 let band = CGRect(x: X(ws), y: top, width: X(rt) - X(ws), height: Self.rowH)
                 func Y(_ v: Double) -> CGFloat {
@@ -502,7 +561,7 @@ struct WindowStrips: View {
                 }
                 ctx.drawLayer { layer in
                     layer.clip(to: Path(roundedRect: band, cornerRadius: 5))
-                    layer.fill(Path(band), with: .color(Color.primary.opacity(0.05)))
+                    layer.fill(Path(band), with: .color(Color.primary.opacity(hoverRow == i ? 0.08 : 0.05)))
                     if now > ws {   // the stretch still to come sits slightly brighter
                         layer.fill(Path(CGRect(x: X(now), y: top, width: band.maxX - X(now),
                                                height: Self.rowH)),
@@ -539,39 +598,36 @@ struct WindowStrips: View {
             var nowLine = Path()
             nowLine.move(to: CGPoint(x: X(now), y: 0)); nowLine.addLine(to: CGPoint(x: X(now), y: axisY))
             ctx.stroke(nowLine, with: .color(Color.primary.opacity(0.45)), style: StrokeStyle(lineWidth: 1.5))
-            ctx.draw(Text("now").font(.system(size: 7.5, weight: .semibold)).foregroundColor(.secondary),
-                     at: CGPoint(x: X(now), y: axisY + Self.axisH / 2 + 1))
-            // hover: crosshair across all rows, values where a row has data at that time
+            // hover: crosshair, the time small in the chart's corner, and the hovered row's
+            // value as a chip at the intersection — the rest of the old tooltip restated what the
+            // chart already shows.
             if let h = hover, h.x >= 0, h.x <= size.width {
                 let t = t0 + Double(h.x / size.width) * (t1 - t0)
                 var cross = Path()
                 cross.move(to: CGPoint(x: h.x, y: 0)); cross.addLine(to: CGPoint(x: h.x, y: axisY))
                 ctx.stroke(cross, with: .color(Color.primary.opacity(0.3)))
-                var rows: [(String, Color)] = [(Self.hoverFmt.string(from: Date(timeIntervalSince1970: t)), .primary)]
-                for e in entries {
-                    // answer only inside the band — pre-window samples belong to a previous week
-                    // and would contradict the drawn line
+                ctx.draw(Text(Self.hoverFmt.string(from: Date(timeIntervalSince1970: t)))
+                            .font(.system(size: 8.5, design: .monospaced)).foregroundColor(.secondary),
+                         at: CGPoint(x: size.width - 4, y: 7), anchor: .trailing)
+                if let i = hoverRow {
+                    let e = entries[i]
                     let pts = (e.trend.series ?? []).filter { $0.count >= 2 && $0[0] >= e.start }
-                    if t >= e.start, t <= e.reset, let v = Self.value(of: pts, at: t) {
-                        rows.append(("\(e.name)  \(Int(v.rounded()))%", e.color))
+                    if t <= now, t >= e.start, let v = Self.value(of: pts, at: t) {
+                        let top = CGFloat(i) * (Self.rowH + Self.gap)
+                        let y = top + 3 + CGFloat(1 - min(100, max(0, v)) / 100) * (Self.rowH - 6)
+                        let label = "\(Int(v.rounded()))%"
+                        let chipW = CGFloat(label.count) * 6 + 10
+                        var cx = h.x + 8
+                        if cx + chipW > size.width - 4 { cx = h.x - 8 - chipW }
+                        let chip = CGRect(x: cx, y: y - 8, width: chipW, height: 16)
+                        ctx.fill(Path(roundedRect: chip, cornerRadius: 5),
+                                 with: .color(Color(nsColor: .windowBackgroundColor).opacity(0.95)))
+                        ctx.stroke(Path(roundedRect: chip, cornerRadius: 5),
+                                   with: .color(e.color.opacity(0.6)))
+                        ctx.draw(Text(label).font(.system(size: 9, weight: .semibold, design: .monospaced))
+                                    .foregroundColor(e.color),
+                                 at: CGPoint(x: chip.midX, y: chip.midY))
                     }
-                }
-                let boxW: CGFloat = 122, lineH: CGFloat = 12.5
-                let boxH = CGFloat(rows.count) * lineH + 9
-                var bx = h.x + 9
-                if bx + boxW > size.width { bx = h.x - 9 - boxW }
-                let by = max(0, min(h.y - boxH / 2, axisY - boxH))
-                let box = CGRect(x: bx, y: by, width: boxW, height: boxH)
-                ctx.fill(Path(roundedRect: box, cornerRadius: 6),
-                         with: .color(Color(nsColor: .windowBackgroundColor).opacity(0.96)))
-                ctx.stroke(Path(roundedRect: box, cornerRadius: 6),
-                           with: .color(Color.primary.opacity(0.15)))
-                for (j, (text, color)) in rows.enumerated() {
-                    ctx.draw(Text(text).font(.system(size: 9, weight: j == 0 ? .semibold : .regular,
-                                                     design: .monospaced))
-                                .foregroundColor(j == 0 ? .primary : color),
-                             at: CGPoint(x: box.minX + 7, y: box.minY + 4.5 + CGFloat(j) * lineH + lineH / 2),
-                             anchor: .leading)
                 }
             }
         }
@@ -603,9 +659,20 @@ extension WindowStrips {
     }
 }
 
+
+// Rows report where they are; the window root draws the ledger — an overlay attached to a row can
+// be painted over by later siblings and clipped at the window's bottom edge, the root can't be.
+struct MixAnchorKey: PreferenceKey {
+    static var defaultValue: [String: Anchor<CGRect>] = [:]
+    static func reduce(value: inout [String: Anchor<CGRect>], nextValue: () -> [String: Anchor<CGRect>]) {
+        value.merge(nextValue()) { _, new in new }
+    }
+}
+
 struct ModelMixPanel: View {
     let insights: InsightsPayload?
     let error: String?
+    @EnvironmentObject var model: Model
     // keyed by the backend's family field — versions within a family share its hue
     static let colors: [String: Color] = [
         "Opus": seriesPalette[0], "Fable": seriesPalette[1],
@@ -639,72 +706,11 @@ struct ModelMixPanel: View {
                     Text("this week · \(dollars(ins.today_cost)) today")
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                 }
-                let total = max(ins.total_cost ?? 0, 0.01)
+                let maxCost = max(rows.first?.cost ?? 0, 0.001)
+                let labelW = Self.labelWidth(rows)
                 ForEach(rows, id: \.name) { row in
-                    HStack(spacing: 6) {
-                        Text(row.name)
-                            .font(.system(size: 10, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .frame(width: 64, alignment: .leading)
-                        GeometryReader { geo in
-                            let rowCost = max(row.cost ?? 0, 0.001)
-                            let rowW = max(3, geo.size.width * rowCost / total)
-                            let segs = row.efforts ?? []
-                            // segment widths share rowW minus the inter-segment gaps, so the
-                            // stack never overflows the capsule and clips its last section
-                            let usable = max(1, rowW - 1.5 * CGFloat(max(0, segs.count - 1)))
-                            ZStack(alignment: .leading) {
-                                Capsule().fill(Color.primary.opacity(0.08))
-                                HStack(spacing: 1.5) {
-                                    ForEach(Array(segs.enumerated()), id: \.offset) { _, seg in
-                                        Rectangle()
-                                            .fill(Self.color(for: row)
-                                                .opacity(Self.effortOpacity(seg.effort, rank: seg.rank)))
-                                            .frame(width: max(0.5, usable * (seg.cost ?? 0) / rowCost))
-                                    }
-                                }
-                                .frame(width: rowW, alignment: .leading)
-                                .clipShape(Capsule())
-                            }
-                        }
-                        .frame(height: 8)
-                        Text(dollars(row.cost))
-                            .font(.system(size: 10.5, design: .monospaced))
-                            .frame(width: 52, alignment: .trailing)
-                        Text("\(row.msgs ?? 0) msgs")
-                            .font(.system(size: 10)).foregroundStyle(.secondary)
-                            .frame(width: 74, alignment: .trailing)
-                    }
+                    mixRow(row, maxCost: maxCost, labelW: labelW)
                 }
-                // legend deduped on the raw effort keys; labels applied only at render
-                let effortKeys: [EffortSlice] = {
-                    var seen = Set<String>()
-                    var out: [EffortSlice] = []
-                    for row in rows {
-                        for seg in row.efforts ?? [] where seen.insert(seg.effort ?? "unset").inserted {
-                            out.append(seg)
-                        }
-                    }
-                    return out
-                }()
-                if effortKeys.count > 1 {
-                    HStack(spacing: 10) {
-                        Text("effort:").font(.system(size: 9.5)).foregroundStyle(.secondary)
-                        ForEach(Array(effortKeys.enumerated()), id: \.offset) { _, seg in
-                            HStack(spacing: 4) {
-                                RoundedRectangle(cornerRadius: 2)
-                                    .fill(Color.primary.opacity(Self.effortOpacity(seg.effort, rank: seg.rank)))
-                                    .frame(width: 8, height: 8)
-                                Text(Self.effortLabel(seg.effort))
-                                    .font(.system(size: 9.5)).foregroundStyle(.secondary)
-                            }
-                        }
-                    }
-                    .padding(.top, 2)
-                }
-                Text("API list-price equivalents, not a bill · scanned \(agoText(since: ins.as_of))")
-                    .font(.system(size: 9.5)).foregroundStyle(.secondary).padding(.top, 2)
             } else if let error = error {
                 Text("⚠ couldn't read the transcript scan — \(error)")
                     .font(.system(size: 10.5)).foregroundStyle(sevColor(70))
@@ -724,7 +730,105 @@ struct ModelMixPanel: View {
         .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.03)))
     }
 
-    private func dollars(_ v: Double?) -> String {
+    // Resting rows carry name · sections · dollars; the counts, tokens, and comparisons live in
+    // the hover ledger, which also labels each effort section in place — no legend to decode.
+    // the label column fits the longest name, capped so the bars keep most of the row
+    static func labelWidth(_ rows: [ModelRow]) -> CGFloat {
+        let font = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
+        let widest = rows.map { ($0.name as NSString).size(withAttributes: [.font: font]).width }.max() ?? 64
+        return min(120, ceil(widest) + 4)
+    }
+
+    private func mixRow(_ row: ModelRow, maxCost: Double, labelW: CGFloat) -> some View {
+        HStack(spacing: 6) {
+            Text(row.name)
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .frame(width: labelW, alignment: .leading)
+            GeometryReader { geo in
+                let rowCost = max(row.cost ?? 0, 0.001)
+                let rowW = max(3, geo.size.width * rowCost / maxCost)
+                let segs = row.efforts ?? []
+                let usable = max(1, rowW - 1.5 * CGFloat(max(0, segs.count - 1)))
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.primary.opacity(0.08))
+                    HStack(spacing: 1.5) {
+                        ForEach(Array(segs.enumerated()), id: \.offset) { _, seg in
+                            Rectangle()
+                                .fill(Self.color(for: row)
+                                    .opacity(Self.effortOpacity(seg.effort, rank: seg.rank)))
+                                .frame(width: max(0.5, usable * (seg.cost ?? 0) / rowCost))
+                        }
+                    }
+                    .frame(width: rowW, alignment: .leading)
+                    .clipShape(Capsule())
+                }
+            }
+            .frame(height: 8)
+            Text(dollars(row.cost))
+                .font(.system(size: 10.5, design: .monospaced))
+                .frame(width: 52, alignment: .trailing)
+        }
+        .padding(.vertical, 1)
+        .contentShape(Rectangle())
+        .background(RoundedRectangle(cornerRadius: 4)
+            .fill(Color.primary.opacity(model.hoveredMixRow == row.name ? 0.05 : 0)))
+        .anchorPreference(key: MixAnchorKey.self, value: .bounds) { [row.name: $0] }
+        .onHover { inside in
+            if inside { model.hoveredMixRow = row.name }
+            else if model.hoveredMixRow == row.name { model.hoveredMixRow = nil }
+        }
+    }
+
+    static func ledgerHeight(_ row: ModelRow) -> CGFloat {
+        var lines = CGFloat((row.efforts ?? []).count)
+        if row.output != nil { lines += 1 }
+        if row.cache_read != nil { lines += 1 }
+        return 16 + 7 + lines * 15 + 17                      // header + divider + rows + padding
+    }
+
+    static func ledger(_ row: ModelRow) -> some View {
+        VStack(alignment: .leading, spacing: 2.5) {
+            Text("\(row.name) · \(Self.usdStatic(row.cost)) · \((row.msgs ?? 0).formatted()) msgs")
+                .font(.system(size: 10.5, weight: .semibold))
+            ForEach(Array((row.efforts ?? []).enumerated()), id: \.offset) { _, seg in
+                Self.ledgerLine(Self.effortLabel(seg.effort),
+                           "\(Self.usdStatic(seg.cost)) · \((seg.msgs ?? 0).formatted()) msgs")
+            }
+            Divider().padding(.vertical, 1)
+            if let out = row.output { Self.ledgerLine("output", Self.fmtTok(out)) }
+            if let cr = row.cache_read { Self.ledgerLine("cache read", Self.fmtTok(cr)) }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .frame(width: 215, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 7)
+                .fill(Color(nsColor: .windowBackgroundColor))
+                .shadow(color: .black.opacity(0.35), radius: 10, y: 4)
+        )
+        .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(Color.primary.opacity(0.14)))
+        .allowsHitTesting(false)
+    }
+
+    static func ledgerLine(_ label: String, _ value: String) -> some View {
+        HStack {
+            Text(label).font(.system(size: 9.5)).foregroundStyle(.secondary)
+            Spacer(minLength: 12)
+            Text(value).font(.system(size: 9.5, design: .monospaced))
+        }
+    }
+
+    static func fmtTok(_ v: Double) -> String {
+        if v >= 1e9 { return String(format: "%.1fB tok", v / 1e9) }
+        if v >= 1e6 { return String(format: "%.1fM tok", v / 1e6) }
+        return String(format: "%.0fK tok", v / 1e3)
+    }
+
+    private func dollars(_ v: Double?) -> String { Self.usdStatic(v) }
+
+    static func usdStatic(_ v: Double?) -> String {
         guard let v = v else { return "—" }
         if v >= 10 { return "$\(Int(v.rounded()))" }
         return String(format: "$%.2f", v)
@@ -782,7 +886,6 @@ struct AccountCard: View {
                         }
                     }
                 }
-                if let t = account.display?.trend { TrendRow(trend: t) }
             }
         }
         .padding(.horizontal, 10)
@@ -877,48 +980,6 @@ struct BarRow: View {
     }
 }
 
-struct TrendRow: View {
-    let trend: Trend
-    var body: some View {
-        HStack(spacing: 6) {
-            Text("trend")
-                .font(.system(size: 10.5, design: .monospaced))
-                .foregroundStyle(.secondary)
-                .frame(width: 44, alignment: .leading)
-            Sparkline(series: trend.series ?? [])
-                .frame(width: 64, height: 12)
-            Text(trend.note ?? "")
-                .font(.system(size: 10.5))
-                .foregroundStyle(.secondary)
-            Spacer()
-        }
-    }
-}
-
-struct Sparkline: View {
-    let series: [[Double]]
-    var body: some View {
-        let pts = series.filter { $0.count >= 2 }
-        GeometryReader { geo in
-            if pts.count >= 2, let t0 = pts.first?[0], let t1 = pts.last?[0], t1 > t0 {
-                let W = geo.size.width, H = geo.size.height
-                let path = Path { p in
-                    for (i, s) in pts.enumerated() {
-                        let x = (s[0] - t0) / (t1 - t0) * (W - 4) + 2
-                        let y = (1 - max(0, min(100, s[1])) / 100) * (H - 4) + 2
-                        if i == 0 { p.move(to: CGPoint(x: x, y: y)) }
-                        else { p.addLine(to: CGPoint(x: x, y: y)) }
-                    }
-                }
-                let color = sevColor(pts.last?[1])
-                path.stroke(color, style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
-                Circle().fill(color).frame(width: 3.5, height: 3.5)
-                    .position(x: W - 2, y: (1 - max(0, min(100, pts.last![1])) / 100) * (H - 4) + 2)
-            }
-        }
-    }
-}
-
 struct FooterView: View {
     @EnvironmentObject var model: Model
     @State private var loginItem = SMAppService.mainApp.status == .enabled
@@ -934,7 +995,7 @@ struct FooterView: View {
             }
             Divider()
             HStack(spacing: 10) {
-                TimelineView(.periodic(from: .now, by: 30)) { ctx in
+                TimelineView(.periodic(from: .now, by: 10)) { ctx in
                     Text(updatedText(now: ctx.date))
                         .font(.system(size: 10.5)).foregroundStyle(.secondary)
                 }
