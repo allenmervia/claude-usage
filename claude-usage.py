@@ -2254,10 +2254,12 @@ CLAUDE_PROJECTS = os.path.expanduser(os.environ.get("CU_PROJECTS") or "~/.claude
 INSIGHTS_CACHE = os.path.join(STATE_DIR, "insights.json")   # non-secret: aggregates only
 INSIGHTS_TTL = 1800                   # a scan is seconds; a menu open should never pay it twice
 INSIGHTS_WINDOW_D = 7
-# USD per MTok: (input, output, cache write, cache read) — API list prices as of Aug 2026
+# USD per MTok: (input, output, cache write, cache read) — API list prices as of Aug 2026.
+# The gpt row prices Codex turns: cache write is unused there (Codex reports cached input reads).
 PRICING = {"opus": (5.0, 25.0, 6.25, 0.50), "fable": (10.0, 50.0, 12.50, 1.00),
-           "sonnet": (3.0, 15.0, 3.75, 0.30), "haiku": (1.0, 5.0, 1.25, 0.10)}
-FAMILY_NAMES = {"opus": "Opus", "fable": "Fable", "sonnet": "Sonnet", "haiku": "Haiku"}
+           "sonnet": (3.0, 15.0, 3.75, 0.30), "haiku": (1.0, 5.0, 1.25, 0.10),
+           "gpt": (1.25, 10.0, 1.25, 0.125)}
+FAMILY_NAMES = {"opus": "Opus", "fable": "Fable", "sonnet": "Sonnet", "haiku": "Haiku", "gpt": "GPT"}
 
 def _model_family(model):
     m = (model or "").lower()
@@ -2276,6 +2278,12 @@ def _model_display(model):
     if not fam:
         return None, None
     m = (model or "").lower()
+    if fam == "gpt":
+        # conventional GPT rendering joins the version and spaces the variant: "GPT-5.6 sol"
+        t = re.match(r".*?gpt[-_](\d+(?:\.\d+)*)(?:[-_](.+))?$", m)
+        if t:
+            return fam, "GPT-" + t.group(1) + (f" {t.group(2)}" if t.group(2) else "")
+        return fam, "GPT"
     # version parts are 1-2 digits; an 8-digit date stamp is not a version. Modern ids put the
     # version after the family ("opus-4-5-20260805"), legacy ids before it ("3-5-sonnet-20241022").
     ver = (re.search(rf"{fam}[-_](\d{{1,2}}(?:[-.]\d{{1,2}})?)(?!\d)", m)
@@ -2351,6 +2359,7 @@ def compute_insights(now=None):
         return [{"effort": k or None, "rank": EFFORT_ORDER.get(k, 9),
                  "cost": round(v["cost"], 2), "msgs": v["msgs"]}
                 for k, v in sorted(e.items(), key=lambda kv: EFFORT_ORDER.get(kv[0], 9))]
+    today_cost += _scan_codex(agg, cut, cut_iso, today_utc)
     models = [{"name": n, "family": s["family"], "msgs": s["msgs"], "input": s["input"],
                "output": s["output"], "cache_write": s["cache_write"],
                "cache_read": s["cache_read"], "cost": round(s["cost"], 2),
@@ -2370,6 +2379,64 @@ def _replace_file(path, text):
     with open(tmp, "w") as f:
         f.write(text)
     os.replace(tmp, path)
+
+def _scan_codex(agg, cut, cut_iso, today_utc):
+    """Fold Codex rollouts into the mix. Each turn_context names the model and effort for the
+    token_count events that follow it; cost is (input − cached)·in + cached·cached-read + output·out.
+    Returns the window's Codex today-cost. Resumed rollouts replay their history, so events dedupe
+    on (timestamp, running total)."""
+    seen, today = set(), 0.0
+    for fp in glob.glob(os.path.join(CODEX_SESSIONS, "**", "*.jsonl"), recursive=True):
+        try:
+            if os.path.getmtime(fp) < cut:
+                continue
+            model = effort = None
+            with open(fp, errors="replace") as f:
+                for line in f:
+                    if '"turn_context"' not in line and 'token_usage' not in line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    p = rec.get("payload") or {}
+                    if rec.get("type") == "turn_context":
+                        model = p.get("model") or model
+                        effort = p.get("effort") or p.get("reasoning_effort") or effort
+                        continue
+                    info = p.get("info") or {}
+                    u = info.get("last_token_usage") or {}
+                    ts = rec.get("timestamp") or ""
+                    if not u or ts[:19] < cut_iso:
+                        continue
+                    fam, name = _model_display(model)
+                    if not fam:
+                        continue
+                    key = (ts, (info.get("total_token_usage") or {}).get("total_tokens"))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    pi, po, _, pr = PRICING[fam]
+                    i_all = u.get("input_tokens", 0) or 0
+                    cached = u.get("cached_input_tokens", 0) or 0
+                    out = u.get("output_tokens", 0) or 0
+                    c = (max(0, i_all - cached) * pi + cached * pr + out * po) / 1e6
+                    s = agg.setdefault(name, {"family": FAMILY_NAMES[fam], "msgs": 0, "input": 0,
+                                              "output": 0, "cache_write": 0, "cache_read": 0,
+                                              "cost": 0.0, "efforts": {}})
+                    s["msgs"] += 1
+                    s["input"] += max(0, i_all - cached)
+                    s["output"] += out
+                    s["cache_read"] += cached
+                    s["cost"] += c
+                    ef = s["efforts"].setdefault(effort or "", {"cost": 0.0, "msgs": 0})
+                    ef["cost"] += c
+                    ef["msgs"] += 1
+                    if ts >= today_utc:
+                        today += c
+        except Exception:
+            continue                                   # one unreadable rollout must not sink the scan
+    return today
 
 def cmd_insights(as_json):
     """Print the trailing-week transcript aggregate, computing at most once per INSIGHTS_TTL —

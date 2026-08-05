@@ -677,6 +677,7 @@ struct ModelMixPanel: View {
     static let colors: [String: Color] = [
         "Opus": seriesPalette[0], "Fable": seriesPalette[1],
         "Sonnet": seriesPalette[2], "Haiku": Color(red: 0.79, green: 0.52, blue: 0.0),
+        "GPT": seriesPalette[3],
     ]
     static func color(for row: ModelRow) -> Color {
         colors[row.family ?? String(row.name.split(separator: " ").first ?? "")] ?? .gray
