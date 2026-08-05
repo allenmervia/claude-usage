@@ -982,6 +982,9 @@ struct AccountCard: View {
     /// this: the desktop app when it has been set up, the CLI otherwise. Two lit cards would ask
     /// the reader to work out which one counts, and drift is not what this indicator is for.
     private var isCurrent: Bool {
+        // Alone in its section there is no question of which account you are on, so lighting the
+        // only card states the obvious in the loudest available color.
+        guard (account.isCodex ? model.codex : model.claude).count > 1 else { return false }
         // Codex has no desktop surface, so its own active flag is the whole answer. Letting the
         // desktop rule reach these rows would leave the Codex section with nothing lit as soon as
         // any desktop account was captured.

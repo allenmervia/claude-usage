@@ -233,7 +233,8 @@ The dropdown has two tabs:
 
 - **Usage** — the account cards: meter bars whose countdowns tick while the window
   is open, plan tags, and click-anywhere-to-switch on parked accounts (a ⇄ appears on
-  hover). The account you're on is the card that's lit. When the desktop app has
+  hover). The account you're on is the card that's lit, unless it's the only account in
+  its section, where there's nothing to distinguish it from. When the desktop app has
   captured accounts it's the surface that decides which card that is, since that's
   where the work happens; otherwise the CLI decides. One click moves both surfaces
   together, and if moving the desktop app would close sessions running inside it, the
