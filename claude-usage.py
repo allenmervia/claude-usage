@@ -72,7 +72,12 @@ CODEX_AUTH     = os.path.join(CODEX_HOME, "auth.json")
 CODEX_SESSIONS = os.path.join(CODEX_HOME, "sessions")
 CODEX_INDEX    = os.path.join(STATE_DIR, "codex-accounts.json")   # opportunistic registry, keyed by account_id
 CODEX_SCAN     = 60        # newest session files to search for a usable reading before giving up (see below)
-COOLDOWN = 30  # s — rapid re-refreshes within this window reuse the last result, sparing the API
+# Re-renders inside this window reuse the last result rather than hitting the API. The panel
+# refreshes every time it opens and a sweep costs one /usage call per registered account plus
+# /profile, so the window has to be long enough that opening the menu a few times in a minute
+# cannot multiply into account-count × opens requests and earn a 429. Usage moves slowly enough
+# that two minutes of staleness is invisible.
+COOLDOWN = 120
 
 # ---- keychain helpers -------------------------------------------------------
 
@@ -827,6 +832,91 @@ def collect_codex(persist=True):
         })
     return rows
 
+# ---- the desktop app's account ----------------------------------------------
+# The desktop app signs in separately from the CLI, and its account is a set of files rather
+# than a token we can read — tools/desktop-switch.py stashes them per account and swaps them in.
+# What is shown here is that tool's own state, read straight off disk: the stash list, and its
+# record of which one was last installed. Deliberately no hashing, unlike `desktop-switch.py
+# status` — this runs on every menu tick, and the stores drift on every app run anyway, so a
+# match would be false as often as not. The label is therefore a record, never a reading, and
+# every surface says so rather than implying we can see into the app.
+
+DESKTOP_STASHES = os.path.join(STATE_DIR, "desktop-stashes")
+DESKTOP_ACTIVE  = os.path.join(STATE_DIR, "desktop-active.json")
+DESKTOP_JOURNAL = os.path.join(STATE_DIR, "desktop-journal.json")
+DESKTOP_APP     = "/Applications/Claude.app"
+STASH_STALE_DAYS = 14      # past this a stash is old enough that its session may have lapsed
+
+def _read_json_file(path):
+    try:
+        with open(path) as f: return json.load(f)
+    except Exception:
+        return None
+
+def desktop_state():
+    """The desktop app's switchable accounts, or None when the feature isn't set up here.
+
+    None means "say nothing": no desktop app installed, or nothing captured yet. A surface
+    should not advertise switching to someone who has no stashes — the onboarding for that
+    lives in `doctor`, which is where a user goes to ask what's missing.
+    """
+    if not os.path.isdir(DESKTOP_APP):
+        return None
+    if not os.path.isdir(DESKTOP_STASHES):
+        return None
+    labels = sorted(d for d in os.listdir(DESKTOP_STASHES)
+                    if os.path.isdir(os.path.join(DESKTOP_STASHES, d)))
+    if not labels:
+        return None
+    active = (_read_json_file(DESKTOP_ACTIVE) or {}).get("label")
+    now = time.time()
+    stashes = []
+    for label in labels:
+        m = _read_json_file(os.path.join(DESKTOP_STASHES, label, "manifest.json")) or {}
+        age = (now - m.get("captured_at", now)) / 86400
+        stashes.append({
+            "label": label,
+            "files": len(m.get("files") or {}),
+            "age_days": round(age, 1),
+            "app_version": m.get("app_version"),
+            "stale": age > STASH_STALE_DAYS,
+            "active": label == active,
+            # Switching restarts the app, so a consumer must confirm rather than act on a click.
+            "can_switch": label != active,
+        })
+    # Whether a switch costs the user anything depends entirely on the app being open. With it
+    # closed there is nothing to quit and no session to lose, so the swap is as unremarkable as
+    # a CLI switch and a click can just do it. With it open the same click closes live sessions,
+    # which is a thing to be asked about rather than discovered afterwards.
+    running = desktop_app_running()
+    return {"active": active, "stashes": stashes,
+            "needs_repair": bool(_read_json_file(DESKTOP_JOURNAL)),
+            "app_running": running,
+            "needs_confirm": running,
+            "app_version": desktop_app_version()}
+
+DESKTOP_EXEC = os.path.join(DESKTOP_APP, "Contents", "MacOS", "Claude")
+
+def _proc_names():
+    return subprocess.run(["ps", "-Ao", "comm="], capture_output=True, text=True).stdout.splitlines()
+
+def desktop_app_running():
+    """True while the desktop app is open.
+
+    Matched on the full executable path: pgrep does not report this process at all — it sees the
+    "Claude Helper" children and misses the parent — so a pgrep check would call a running app
+    closed and let a click silently kill live sessions.
+    """
+    return any(line.strip() == DESKTOP_EXEC for line in _proc_names())
+
+def desktop_app_version():
+    try:
+        import plistlib
+        with open(os.path.join(DESKTOP_APP, "Contents", "Info.plist"), "rb") as f:
+            return plistlib.load(f).get("CFBundleShortVersionString")
+    except Exception:
+        return None
+
 # ---- rendering --------------------------------------------------------------
 
 def rel(dt):
@@ -1116,12 +1206,52 @@ def attach_display(rows):
                 t["window_s"] = win_s
             d["trend"] = t
         r["display"] = d
+    _match_desktop(rows)
     return rows
 
+def _match_desktop(rows):
+    """Pair each desktop stash with the Claude account it names, so one card can carry both.
+
+    A stash label is free text the user typed, so the pairing is by name: the account's email,
+    its email localpart, or its display label, case-insensitively — tried in that order because
+    emails are unique and display names collide (several of one person's logins share a name).
+    A tie within a tier attaches nothing: guessing would let one click switch the desktop app to
+    a different person's account than the CLI. An unmatched stash stays in the top-level list,
+    which the bar renders separately — renaming the stash to the account's email pairs it.
+    """
+    ds = rows_desktop_state.get("ds")
+    if not ds:
+        return
+    claude = [r for r in rows if r.get("provider", "claude") == "claude"]
+    claimed = set()
+    for st in ds["stashes"]:
+        key = st["label"].strip().lower()
+        for keyer in (lambda r: (r.get("email") or "").lower(),
+                      lambda r: (r.get("email") or "").split("@")[0].lower(),
+                      lambda r: (r.get("label") or "").strip().lower()):
+            hits = [r for r in claude if keyer(r) == key and r["uuid"] not in claimed]
+            if len(hits) == 1:
+                st["matched_uuid"] = hits[0]["uuid"]
+                claimed.add(hits[0]["uuid"])
+                hits[0]["display"]["desktop"] = {k: st[k] for k in
+                                                 ("label", "active", "can_switch", "stale")}
+                break
+            if hits:
+                break
+
+# attach_display runs deep inside rendering while desktop_state is fetched at the top of the
+# payload build; this hands one snapshot from the one place to the other without threading a
+# parameter through every renderer.
+rows_desktop_state = {}
+
 def render_json(rows):
+    rows_desktop_state["ds"] = ds = desktop_state()
     rows = attach_display(sort_rows(rows))
+    # `desktop` is its own key rather than more `accounts`: those rows carry usage windows and
+    # drive the title gauges, and a desktop stash has neither — it is a switch target only.
     print(json.dumps({"accounts": rows,
                       "gauges": [list(s) for s in title_specs(rows)],
+                      "desktop": ds,
                       "updated_ts": data_ts(),
                       "generated_at": datetime.now(timezone.utc).isoformat()}, indent=2))
 
@@ -1506,6 +1636,27 @@ def _app_installed(bundle):
 
 # ---- doctor -----------------------------------------------------------------
 
+def desktop_tool():
+    return os.path.join(os.path.dirname(os.path.realpath(__file__)), "tools", "desktop-switch.py")
+
+def cmd_desktop_switch(label):
+    """Swap the desktop app to a captured account, for the menu bar to call.
+
+    Failure text goes to stderr and the exit status carries the verdict, which is what the bar
+    reads — the last line is used, since that is where the tool puts the reason rather than the
+    progress it printed on the way there.
+    """
+    tool = desktop_tool()
+    if not label:
+        _fail("usage: claude-usage desktop-switch <label>")
+    if not os.path.exists(tool):
+        _fail(f"{tool} is missing — restore it from the repo")
+    r = subprocess.run([sys.executable, tool, "switch", label], capture_output=True, text=True)
+    if r.returncode != 0:
+        msg = (r.stderr or r.stdout or "desktop switch failed").strip().splitlines()
+        _fail(msg[-1] if msg else "desktop switch failed")
+    print(r.stdout.strip())
+
 def cmd_doctor():
     """Check everything that has to line up for the bar to work, and name the fix for whatever doesn't."""
     counts = {"warn": 0, "bad": 0}
@@ -1591,6 +1742,32 @@ def cmd_doctor():
             else:
                 say("warn", f"{r['email']}: shown from a past snapshot, and switching to it won't work",
                     "sign into it with `codex login` once to capture its credential.")
+
+    section("Desktop app")
+    if not os.path.isdir(DESKTOP_APP):
+        say("warn", "the Claude desktop app isn't installed",
+            "optional — this section only matters if you use it.")
+    else:
+        ds = desktop_state()
+        if not ds:
+            say("warn", "no desktop accounts captured yet, so the app can't be switched here",
+                "capture each account once: ./tools/desktop-switch.py add")
+        else:
+            if ds["needs_repair"]:
+                say("bad", "a desktop switch was interrupted",
+                    "run: ./tools/desktop-switch.py repair")
+            if ds["active"]:
+                say("ok", f"desktop app last set to {ds['active']}")
+            else:
+                say("warn", "the desktop app's account isn't one this tool captured",
+                    "capture it: ./tools/desktop-switch.py add")
+            for st in ds["stashes"]:
+                if st["stale"]:
+                    say("warn", f"{st['label']}: captured {st['age_days']:.0f} days ago and may no longer work",
+                        "if switching to it lands on a login screen, re-add it with `add`.")
+                elif st["app_version"] and st["app_version"] != ds["app_version"]:
+                    say("warn", f"{st['label']}: captured under app v{st['app_version']}, now v{ds['app_version']}",
+                        "an app update can change these files; re-add it if switching fails.")
 
     section("Menu bar")
     bundle = _app_bundle_path()
@@ -1931,7 +2108,7 @@ def cmd_insights(as_json):
              f"{m['cache_write']:,}", f"{m['cache_read']:,}", "$%.0f" % m["cost"])
     line("total", "", "", "", "", "", "$%.0f" % data["total_cost"])
 
-def build_app():
+def build_app(dev=False):
     """Compile native/ClaudeUsageBar.swift into "Claude Usage.app" and (re)launch it — /Applications
     when writable, else ~/Applications.
 
@@ -1939,6 +2116,12 @@ def build_app():
     Gatekeeper doesn't quarantine binaries built on the machine itself. The bundle embeds this
     script's absolute path (CUBackend), which is how the app finds its backend; rebuilding from a
     different checkout repoints it."""
+    # A dev build is a separate bundle and a separate executable name, so it installs beside the
+    # everyday app and both can run: testing a branch must not cost the user their working bar.
+    # Its icon is identical, so the two are told apart by which one you quit.
+    bundle = "Claude Usage (dev).app" if dev else APP_BUNDLE
+    executable = APP_EXECUTABLE + ("Dev" if dev else "")
+    bundle_id = "com.allenmervia.claude-usage" + (".dev" if dev else "")
     src_dir = os.path.dirname(os.path.realpath(__file__))
     src = os.path.join(src_dir, "native", "ClaudeUsageBar.swift")
     if not os.path.exists(src):
@@ -1951,10 +2134,10 @@ def build_app():
         return False
     # /Applications when writable (login items and app registries treat it as home), else ~/Applications
     apps_dir = "/Applications" if os.access("/Applications", os.W_OK) else os.path.expanduser("~/Applications")
-    app = os.path.join(apps_dir, APP_BUNDLE)
+    app = os.path.join(apps_dir, bundle)
     macos_dir = os.path.join(app, "Contents", "MacOS")
     os.makedirs(macos_dir, exist_ok=True)
-    binary = os.path.join(macos_dir, APP_EXECUTABLE)
+    binary = os.path.join(macos_dir, executable)
     print("compiling the menu-bar app (takes a moment the first time)…")
     r = subprocess.run([swiftc, "-O", "-swift-version", "5", "-parse-as-library", src, "-o", binary],
                       capture_output=True, text=True)
@@ -1965,10 +2148,10 @@ def build_app():
     import plistlib
     with open(os.path.join(app, "Contents", "Info.plist"), "wb") as f:
         plistlib.dump({
-            "CFBundleIdentifier": "com.allenmervia.claude-usage",
-            "CFBundleName": "Claude Usage",
-            "CFBundleDisplayName": "Claude Usage",
-            "CFBundleExecutable": APP_EXECUTABLE,
+            "CFBundleIdentifier": bundle_id,
+            "CFBundleName": "Claude Usage" + (" (dev)" if dev else ""),
+            "CFBundleDisplayName": "Claude Usage" + (" (dev)" if dev else ""),
+            "CFBundleExecutable": executable,
             "CFBundlePackageType": "APPL",
             "CFBundleShortVersionString": "1.0",
             "CFBundleVersion": "1",
@@ -1978,21 +2161,21 @@ def build_app():
             "CUBackend": os.path.realpath(__file__),
         }, f)
     subprocess.run(["codesign", "--force", "--sign", "-", app], capture_output=True)
-    subprocess.run(["pkill", "-x", APP_EXECUTABLE], capture_output=True)   # replace a running copy
+    subprocess.run(["pkill", "-x", executable], capture_output=True)   # replace a running copy
     time.sleep(0.3)
     subprocess.run(["open", app])
     print(f"launched {app}")
     return True
 
-def cmd_app():
-    sys.exit(0 if build_app() else 1)
+def cmd_app(dev=False):
+    sys.exit(0 if build_app(dev) else 1)
 
 def main():
     arg = sys.argv[1] if len(sys.argv) > 1 else ""
     if arg == "setup":
         cmd_setup(); return
     if arg == "app":
-        cmd_app(); return
+        cmd_app(dev="--dev" in sys.argv[2:]); return
     if arg in ("install", "interval", "--xbar"):
         print(f"`{arg}` went with the xbar plugin — the menu bar is `claude-usage app` now"
               + ("; `--json` is the machine format" if arg == "--xbar" else ""), file=sys.stderr)
@@ -2003,6 +2186,8 @@ def main():
         cmd_doctor(); return
     if arg == "switch":
         cmd_switch(sys.argv[2] if len(sys.argv) > 2 else ""); return
+    if arg == "desktop-switch":
+        cmd_desktop_switch(sys.argv[2] if len(sys.argv) > 2 else ""); return
     if arg == "capture":
         idx = load_index(); u = ingest_live(idx)
         if u:
