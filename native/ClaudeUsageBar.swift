@@ -17,16 +17,8 @@ import ServiceManagement
 
 struct Payload: Decodable {
     var accounts: [Account]
-    var spend_next: SpendNext?
     var gauges: [[Double?]]?
     var updated_ts: Double?
-}
-
-struct SpendNext: Decodable {
-    var uuid: String
-    var label: String?
-    var active: Bool?
-    var text: String?
 }
 
 struct Account: Decodable, Identifiable {
@@ -267,8 +259,8 @@ final class Model: ObservableObject {
         do {
             let data = try await Backend.run(["--json"])
             let p = try JSONDecoder().decode(Payload.self, from: data)
-            // Animate the swap: after a switch the ▶ moves and the spend-next chip can disappear,
-            // and an unanimated reflow reads as the window jumping.
+            // Animate the swap: after a switch the ▶ moves rows around, and an unanimated reflow
+            // reads as the window jumping.
             withAnimation(.easeOut(duration: 0.18)) { payload = p }
             // No readable gauge still needs a visible status item: a dim empty ring, not a blank.
             let specs = (p.gauges?.isEmpty == false) ? p.gauges! : [[nil, nil]]
@@ -933,23 +925,6 @@ struct FooterView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            if let sn = model.payload?.spend_next, sn.active != true {
-                Button {
-                    Task { await model.switchTo(sn.uuid) }
-                } label: {
-                    HStack(spacing: 6) {
-                        Text("⇄").font(.system(size: 11))
-                        Text("Spend next: \(sn.label ?? "?") — \(sn.text ?? "")")
-                            .font(.system(size: 11))
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(RoundedRectangle(cornerRadius: 6).fill(Color.accentColor.opacity(0.10)))
-                }
-                .buttonStyle(.plain)
-            }
             if let err = model.lastError {
                 Text("⚠ \(err)").font(.system(size: 10.5)).foregroundStyle(sevColor(70)).lineLimit(2)
             }

@@ -194,16 +194,10 @@ a glance, with no numbers to parse.
 
 The dropdown lists every account, grouped under a `CLAUDE` / `CODEX` header. Each
 window is a rendered meter bar in the same colors as the rings, with the number and
-reset beside it. Two lines appear as the bar collects data:
-
-- **trend** — a sparkline of the weekly window over the past 3½ days, with the
-  current pace (`+29%/day`, measured over the trailing day). A weekly reset inside
-  the window draws as the dip it is. It appears once a few hours of history exist.
-- **⇄ Spend next** in the footer — the strategy from
-  [Which account to use, and when](#which-account-to-use-and-when), computed: the
-  account whose weekly reset comes soonest among those with headroom in both
-  windows. Shown only when it names an account other than the one you're on;
-  clicking it switches.
+reset beside it. A **trend** line appears once a few hours of history exist — a
+sparkline of the weekly window over the past 3½ days, with the current pace
+(`+29%/day`, measured over the trailing day). A weekly reset inside the window
+draws as the dip it is.
 
 ### Native app
 

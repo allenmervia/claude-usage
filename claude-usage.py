@@ -1147,7 +1147,7 @@ def attach_display(rows):
 
 def render_json(rows):
     rows = attach_display(sort_rows(rows))
-    print(json.dumps({"accounts": rows, "spend_next": spend_next_display(rows),
+    print(json.dumps({"accounts": rows,
                       "gauges": [list(s) for s in title_specs(rows)],
                       "updated_ts": data_ts(),
                       "generated_at": datetime.now(timezone.utc).isoformat()}, indent=2))
@@ -1363,38 +1363,6 @@ def xb(s):
     """
     return re.sub(r"[|\r\n]", "/", str(s))
 
-def spend_next(rows):
-    """The strategy from the README, computed: among Claude accounts with headroom in both windows,
-    the one whose weekly reset comes soonest — its unspent week is the one about to expire.
-    (reset_dt, row), or None."""
-    best = None
-    for r in rows:
-        if r.get("error") or r.get("stale"):
-            continue      # a recommendation that switches credentials must not ride on last-known values
-        fh = (r.get("five_hour") or {}).get("pct")
-        wk = (r.get("seven_day") or {}).get("pct")
-        if wk is None or wk >= 90 or (fh is not None and fh >= 90):
-            continue
-        reset = parse_dt((r.get("seven_day") or {}).get("resets_at"))
-        if reset and (best is None or reset < best[0]):
-            best = (reset, r)
-    return best
-
-def spend_next_display(rows):
-    """The recommendation as its display dict {uuid, label, active, text}, or None — one builder for
-    every renderer, so the menu and the app can't word it differently."""
-    claude = [r for r in rows if r.get("provider", "claude") == "claude"]
-    if sum(1 for r in claude if has_usage(r)) < 2:
-        return None                    # with one usable account there is nothing to choose between
-    pick = spend_next(claude)
-    if not pick:
-        return None
-    reset, pr = pick
-    left = 100 - int((pr.get("seven_day") or {}).get("pct") or 0)
-    tilde = "~" if (pr.get("seven_day") or {}).get("projected") else ""
-    return {"uuid": pr["uuid"], "label": pr.get("label"), "active": bool(pr.get("active")),
-            "text": f"{left}% left, weekly resets {tilde}{local_short(reset)}"}
-
 def render_xbar(rows):
     if not rows:
         print("Claude · —")
@@ -1490,13 +1458,6 @@ def render_xbar(rows):
             print("---")   # divider under the header, matching the one after every account below it
         for r in grp:
             xbar_account_row(r)
-    # The spend-next strategy, computed instead of recalled — shown only when it names a different
-    # account than the one you're on (agreement isn't news), and clicking it performs the switch.
-    sn = spend_next_display(rows)
-    if sn and not sn["active"]:
-        print(f"⇄ Spend next: {xb(sn['label'])} — {xb(sn['text'])} "
-              f'| font=Menlo size=12 bash="{os.path.realpath(__file__)}" param1=switch '
-              f"param2={sn['uuid']} terminal=false refresh=true")
     if any(r.get("stale") for r in claude_rows):
         print("⚠ last known values — rate-limited; updates on the next refresh | color=#d9a13b font=Menlo size=12")
     if len([r for r in claude_rows if not r.get("is_team")]) <= 1:
