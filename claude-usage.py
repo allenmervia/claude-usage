@@ -38,13 +38,10 @@ once accounts rotate.
 Usage:
   claude-usage setup      guided first-time setup (register account, optional menu bar + PATH)
   claude-usage            table of all known accounts (default)
-  claude-usage install    add the menu-bar view (installs xbar if needed, links + launches it)
-  claude-usage app        build + launch the native menu-bar app (needs Xcode Command Line Tools)
+  claude-usage app        build + launch the menu-bar app (needs the Xcode Command Line Tools)
   claude-usage insights   trailing-week tokens + API-equivalent cost by model, from local transcripts
   claude-usage doctor     check the setup and report what needs fixing
-  claude-usage interval N set the xbar plugin's refresh cadence (the native app has its own, in its gear menu)
   claude-usage --json     machine-readable JSON
-  claude-usage --xbar     xbar/SwiftBar menu-bar format
   claude-usage capture    explicitly ingest the active account (same as a run)
   claude-usage list       list registered accounts
   claude-usage switch X   point the CLI at account X (email / label / uuid; Claude or Codex)
@@ -76,12 +73,6 @@ CODEX_SESSIONS = os.path.join(CODEX_HOME, "sessions")
 CODEX_INDEX    = os.path.join(STATE_DIR, "codex-accounts.json")   # opportunistic registry, keyed by account_id
 CODEX_SCAN     = 60        # newest session files to search for a usable reading before giving up (see below)
 COOLDOWN = 30  # s — rapid re-refreshes within this window reuse the last result, sparing the API
-# The menu-bar host reads the refresh cadence from the "5m" in the plugin filename; we own the
-# symlink in its folder, so changing the interval is a rename of that link. PLUGIN_FILE is the
-# wrapper's fixed name in the repo — only the link's name carries the cadence.
-PLUGIN_FILE = "claude-usage.5m.sh"
-DEFAULT_INTERVAL = "5m"
-INTERVALS = ["1m", "5m", "10m", "30m"]
 
 # ---- keychain helpers -------------------------------------------------------
 
@@ -1046,8 +1037,7 @@ def pace_note(pace):
     return "steady" if day < 0.5 else f"+{day:.0f}%/day"
 
 def title_specs(rows):
-    """(ring pct, pie pct) per active provider — the menu-bar gauge pair. One definition feeds both
-    renderers: the xbar title draws it as a PNG, the native app as an NSImage."""
+    """(ring pct, pie pct) per active provider — the menu-bar gauge pair the app draws."""
     claude_rows = [r for r in rows if r.get("provider", "claude") == "claude"]
     head = next((r for r in claude_rows if r.get("active") and has_usage(r)), None)
     specs = []
@@ -1079,8 +1069,7 @@ def _row(label, pct, meta, resets_at=None):
 
 def _display_rows(r):
     """The account's dropdown lines as data: {label, pct, meta, resets_at, meta_prefix?}. pct None is
-    a text-only line. Both dropdowns render exactly this list, so their content can't drift. Text
-    arrives raw — escaping for a renderer's syntax (xbar's `|`) is that renderer's job."""
+    a text-only line. Every renderer draws exactly this list, so their content can't drift."""
     rows = []
     if r.get("provider") == "codex":
         for w in codex_display_windows(r):
@@ -1106,6 +1095,16 @@ def _display_rows(r):
         rows.append(_row("extra", None, f"{usd(sp.get('used') or 0)} / {usd(sp['limit'])} used"))
     return rows
 
+def _resample(pts, n=24):
+    """At most n of the (ts, value) samples, last-per-bucket — enough shape for a 74-pt sparkline,
+    few enough segments to paint quickly."""
+    if len(pts) <= n: return pts
+    t0, t1 = pts[0][0], pts[-1][0]
+    buckets = [[] for _ in range(n)]
+    for t, v in pts:
+        buckets[min(n - 1, int((t - t0) / ((t1 - t0) or 1) * n))].append((t, v))
+    return [b[-1] for b in buckets if b]
+
 def trend_view(hist, r):
     """(series, pace, note) for the trend row, or Nones until an hour of samples exists — minutes of
     history draw a speck, not a shape."""
@@ -1118,8 +1117,8 @@ def trend_view(hist, r):
 def attach_display(rows):
     """Give every row a `display` view-model: plan text, switchability, formatted lines, and the
     trend (series + numeric pace + the window's reset epoch and length, for charts). All phrasing
-    and strategy stays here, in one place — a consumer that renders `display` verbatim shows what
-    the xbar dropdown shows."""
+    and strategy stays here, in one place — a consumer that renders `display` verbatim is always
+    current."""
     hist = load_history(8 * 86400)     # the full week a chart can frame, plus a day of slack
     for r in rows:
         d = {"plan": plan_of(r), "can_switch": can_switch(r)}
@@ -1151,332 +1150,6 @@ def render_json(rows):
                       "gauges": [list(s) for s in title_specs(rows)],
                       "updated_ts": data_ts(),
                       "generated_at": datetime.now(timezone.utc).isoformat()}, indent=2))
-
-# ---- menu-bar icon (dynamic ring gauges) ------------------------------------
-# xbar/SwiftBar render a base64 PNG placed after `| image=` on the title line. We draw one gauge per
-# active provider — Claude, then Codex. Each gauge carries the account's two windows separately: the
-# ring is the weekly window, filled clockwise from 12 o'clock, and a pie in its centre is the 5-hour
-# window, filled the same way — both tinted green/amber/red, so slow budget and burst budget each
-# read at a glance before the numbers are. Pure stdlib: a hand-rolled PNG writer plus a supersampled rasteriser, no Pillow
-# dependency. Any failure returns None and the title falls back to the emoji dot.
-
-RING_RGB = {"g": (63, 185, 80), "y": (217, 161, 59), "r": (229, 83, 75), "dim": (130, 138, 148)}
-
-def _ring_rgb(pct):
-    if pct is None: return RING_RGB["dim"]
-    if pct >= 90:   return RING_RGB["r"]
-    if pct >= 65:   return RING_RGB["y"]
-    return RING_RGB["g"]
-
-def _png(w, h, rgba, ppm=0):
-    import struct, zlib
-    def chunk(t, d):
-        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
-    raw, row = bytearray(), w * 4
-    for y in range(h):
-        raw.append(0)                                   # per-scanline filter: none
-        raw += rgba[y * row:(y + 1) * row]
-    out = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
-    if ppm:                                             # pHYs: physical resolution, so a retina display
-        out += chunk(b"pHYs", struct.pack(">IIB", ppm, ppm, 1))   # draws the extra pixels at half the points
-    return out + chunk(b"IDAT", zlib.compress(bytes(raw), 9)) + chunk(b"IEND", b"")
-
-def menu_icon_b64(specs, scale=4):
-    """specs: one (ring pct, pie pct) pair per gauge — ring is the weekly window, centre pie the
-    5-hour (each 0-100, or None: a dim ring / no pie). Returns a base64 PNG, or None on any failure. `scale`
-    is the pixel density: higher = crisper on a retina menu bar (xbar draws the bitmap near 1:1, so it
-    needs the extra pixels), at the cost of a larger bitmap."""
-    if not specs: return None
-    try:
-        import math, base64
-        SS = 3                                          # supersample, then box-downsample for smooth edges
-        D, GAP, TH, RPIE, PAD = 10, 3, 1.7, 2.2, 1      # ring diameter / gap / thickness / centre-pie radius / padding, in points
-        n = len(specs)
-        W = (PAD * 2 + n * D + (n - 1) * GAP) * scale
-        H = (PAD * 2 + D) * scale
-        rw, rh = W * SS, H * SS
-        px = bytearray(rw * rh * 4)
-        def clamp01(p): return max(0.0, min(1.0, (p or 0) / 100.0))
-        for i, (pct, pie_pct) in enumerate(specs):
-            r0, g0, b0 = _ring_rgb(pct)
-            frac = clamp01(pct)
-            cx = (PAD + D / 2 + i * (D + GAP)) * scale * SS
-            cy = (PAD + D / 2) * scale * SS
-            rO = (D / 2) * scale * SS
-            rI = (D / 2 - TH) * scale * SS
-            rP = RPIE * scale * SS
-            p0, p1, p2 = _ring_rgb(pie_pct)
-            # rounded caps: a filled disc of radius TH/2 at each end of the arc (top, and the frac angle).
-            rM, capR = (rO + rI) / 2, (rO - rI) / 2
-            th = frac * 2 * math.pi
-            sX, sY = cx, cy - rM
-            eX, eY = cx + rM * math.sin(th), cy - rM * math.cos(th)
-            pie_frac = clamp01(pie_pct)
-            for y in range(max(0, int(cy - rO - 1)), min(rh, int(cy + rO + 2))):
-                for x in range(max(0, int(cx - rO - 1)), min(rw, int(cx + rO + 2))):
-                    dx, dy = x - cx, y - cy
-                    d = math.hypot(dx, dy)
-                    in_pie = pie_pct is not None and d <= rP
-                    if not in_pie and (d > rO or d < rI): continue
-                    a = (math.atan2(dx, -dy) % (2 * math.pi)) / (2 * math.pi)   # 0 at top, clockwise
-                    o = (y * rw + x) * 4
-                    if in_pie:
-                        # centre pie: the 5-hour window — a wedge filled clockwise from 12 o'clock by
-                        # its pct, the rest a faint track, mirroring the ring's fill language.
-                        px[o], px[o + 1], px[o + 2], px[o + 3] = p0, p1, p2, (255 if a <= pie_frac else 55)
-                        continue
-                    fill = a <= frac
-                    if not fill and 0 < frac < 1:        # round the two ends
-                        fill = math.hypot(x - sX, y - sY) <= capR or math.hypot(x - eX, y - eY) <= capR
-                    px[o], px[o + 1], px[o + 2], px[o + 3] = r0, g0, b0, (255 if fill else 55)
-        out = bytearray(W * H * 4)                      # alpha-weighted downsample (clean anti-aliased edges)
-        for y in range(H):
-            for x in range(W):
-                r = g = b = a = 0
-                for sy in range(SS):
-                    base = ((y * SS + sy) * rw + x * SS) * 4
-                    for sx in range(SS):
-                        o = base + sx * 4; aa = px[o + 3]
-                        r += px[o] * aa; g += px[o + 1] * aa; b += px[o + 2] * aa; a += aa
-                oo = (y * W + x) * 4
-                if a:
-                    out[oo], out[oo + 1], out[oo + 2] = r // a, g // a, b // a
-                out[oo + 3] = a // (SS * SS)
-        return _png_b64(W, H, out, scale)
-    except Exception:
-        return None
-
-def _png_b64(W, H, px, scale):
-    """Encode raw RGBA as a base64 PNG declared at 36·scale DPI — the display size stays
-    scale-invariant while the extra pixels land as retina sharpness. One home for the density
-    convention, so every menu bitmap renders at the same physical size."""
-    import base64
-    return base64.b64encode(_png(W, H, px, round(36 * scale / 0.0254))).decode()
-
-# Menu-line images: xbar renders `image=` on any line, not just the title, placing the bitmap left
-# of the line's text. That is the lane the dropdown bars and trend sparklines ride in — the graphic
-# carries severity and shape, the text keeps the numbers and resets, and menu appearance (light or
-# dark) stays the text's problem, which it already solves. Same conventions as the title gauge:
-# transparent ground, fill at full alpha over a track of the same hue at alpha 55, pHYs for retina.
-# Any failure returns None and the caller falls back to the ANSI text bar.
-
-_BAR_CACHE = {}       # per-run memo — 0% and 100% bars recur across accounts in one render
-
-def _bar_b64(pct, w=64, h=4, scale=4, pad=10):
-    """Rounded meter bar for one window: severity-colored fill on a neutral gray track, analytic edge
-    coverage (distance to the rounded rect), so no supersampling pass is needed. `pad` is transparent
-    left margin baked into the bitmap — xbar always draws an image at the line's left edge, so the
-    indent that nests a bar under its account name has to travel inside the image."""
-    key = (None if pct is None else round(pct, 1), w, h, scale, pad)
-    if key in _BAR_CACHE:
-        return _BAR_CACHE[key]
-    try:
-        import math
-        r0, g0, b0 = _ring_rgb(pct)
-        d0, d1, d2 = RING_RGB["dim"]
-        frac = max(0.0, min(1.0, (pct or 0) / 100.0))
-        PL = pad * scale
-        W, H = PL + w * scale, h * scale
-        rad = H / 2
-        fillw = 0 if frac <= 0 else max(H * 1.0, frac * w * scale)   # any nonzero pct shows one cap
-        px = bytearray(W * H * 4)
-        def cov(x, y, x0, x1):    # pixel-centre coverage of the rounded rect [x0,x1]×[0,H]
-            nx = min(max(x + .5, x0 + rad), x1 - rad)
-            ny = min(max(y + .5, rad), H - rad)
-            d = math.hypot(x + .5 - nx, y + .5 - ny) - rad
-            return max(0.0, min(1.0, .5 - d))
-        for y in range(H):
-            for x in range(W):
-                at = cov(x, y, PL, W) * 60 / 255                 # track: quiet, appearance-neutral
-                af = cov(x, y, PL, PL + fillw) if fillw else 0.0
-                a = af + at * (1 - af)                           # fill composited over track
-                if a <= 0: continue
-                o = (y * W + x) * 4
-                px[o]     = int((r0 * af + d0 * at * (1 - af)) / a)
-                px[o + 1] = int((g0 * af + d1 * at * (1 - af)) / a)
-                px[o + 2] = int((b0 * af + d2 * at * (1 - af)) / a)
-                px[o + 3] = int(a * 255)
-        _BAR_CACHE[key] = _png_b64(W, H, px, scale)
-        return _BAR_CACHE[key]
-    except Exception:
-        return None
-
-def _pad_b64(scale=4):
-    """A transparent strip as wide as the bars' baked-in left inset, so text-only detail lines share
-    the bar images' left edge (the NB text indent is narrower)."""
-    try:
-        return _png_b64(10 * scale, scale, bytearray(10 * scale * scale * 4), scale)
-    except Exception:
-        return None
-
-def _resample(pts, n=24):
-    """At most n of the (ts, value) samples, last-per-bucket — enough shape for a 74-pt sparkline,
-    few enough segments to paint quickly."""
-    if len(pts) <= n: return pts
-    t0, t1 = pts[0][0], pts[-1][0]
-    buckets = [[] for _ in range(n)]
-    for t, v in pts:
-        buckets[min(n - 1, int((t - t0) / ((t1 - t0) or 1) * n))].append((t, v))
-    return [b[-1] for b in buckets if b]
-
-def _spark_b64(pts, w=64, h=12, scale=4, pad=10):
-    """Sparkline of (ts, pct) samples — a 1.5-pt polyline on the 0–100 scale with a dot on the newest
-    sample, colored by that sample's severity. A weekly reset inside the window draws as the dip it
-    is. None when there's no line to draw (fewer than two samples). `pad` as in _bar_b64."""
-    try:
-        import math, base64
-        pts = _resample(pts)
-        if len(pts) < 2 or pts[-1][0] <= pts[0][0]: return None
-        r0, g0, b0 = _ring_rgb(pts[-1][1])
-        PL = pad * scale
-        W, H = PL + w * scale, h * scale
-        inset = 2.2 * scale
-        t0, t1 = pts[0][0], pts[-1][0]
-        XY = [(PL + inset + (t - t0) / (t1 - t0) * (W - PL - 2 * inset),
-               inset + (1 - max(0, min(100, v)) / 100) * (H - 2 * inset)) for t, v in pts]
-        px = bytearray(W * H * 4)
-        def paint(cx, cy, ex, ey, r):          # capsule from (cx,cy) to (ex,ey), radius r, max-alpha
-            dx, dy = ex - cx, ey - cy
-            L2 = dx * dx + dy * dy or 1e-9
-            for y in range(max(0, int(min(cy, ey) - r - 1)), min(H, int(max(cy, ey) + r + 2))):
-                for x in range(max(0, int(min(cx, ex) - r - 1)), min(W, int(max(cx, ex) + r + 2))):
-                    t = max(0.0, min(1.0, ((x + .5 - cx) * dx + (y + .5 - cy) * dy) / L2))
-                    a = max(0.0, min(1.0, .5 - (math.hypot(x + .5 - cx - t * dx, y + .5 - cy - t * dy) - r)))
-                    if a <= 0: continue
-                    o = (y * W + x) * 4
-                    na = int(a * 255)
-                    if na > px[o + 3]:
-                        px[o], px[o + 1], px[o + 2], px[o + 3] = r0, g0, b0, na
-        for (a_, b_) in zip(XY, XY[1:]):
-            paint(a_[0], a_[1], b_[0], b_[1], 0.75 * scale)
-        paint(XY[-1][0], XY[-1][1], XY[-1][0], XY[-1][1], 1.6 * scale)
-        return _png_b64(W, H, px, scale)
-    except Exception:
-        return None
-
-def xb(s):
-    """Make server-supplied text safe to place in an xbar menu line.
-
-    `|` separates a line's text from its parameters, and these lines carry `bash=`/`param1=` on a
-    clickable item — so a `|` arriving in a display name or model name could extend the parameter
-    list rather than the text. Newlines would split one row into several.
-    """
-    return re.sub(r"[|\r\n]", "/", str(s))
-
-def render_xbar(rows):
-    if not rows:
-        print("Claude · —")
-        print("---")
-        print("No accounts found — run: claude → /login | color=#d9a13b font=Menlo size=12")
-        print("Refresh now | refresh=true")
-        return
-    claude_rows = sort_rows([r for r in rows if r.get("provider", "claude") == "claude"])
-    # xbar trims leading whitespace from a menu title, and its trim set is the Unicode Zs category —
-    # which includes the regular space AND the non-breaking space, so neither indents. U+2800 (the blank
-    # Braille cell) renders as empty space but is category So, not Zs, so it survives the trim. All
-    # dropdown indentation is built from it, which is what finally makes the tabbed hierarchy show.
-    NB = "\u2800"
-    # menu-bar title: just the ring gauges — one per active provider (Claude, then Codex). Each ring is
-    # that account's weekly window; the pie in its centre is the 5-hour window. No numbers; fill +
-    # severity carry the state, position carries which provider. If the PNG can't be built, fall back
-    # to one severity dot per provider, colored by its worst window (still no numbers).
-    def dot(p): return "🟢" if p < 65 else ("🟡" if p < 90 else "🔴")
-    specs = title_specs(rows)      # the gauge tracks the account you're actually on, per provider
-    img = menu_icon_b64(specs)
-    if img:
-        print(f"|image={img}")
-    elif specs:
-        # worst window of each gauge's pair, same order as the rings
-        print("".join(dot(max(v for v in s if v is not None)) for s in specs))
-    else:
-        print("🔴" if any(has_usage(r) for r in claude_rows) else "Claude · ⏳")
-    print("---")
-    hist = load_history(TREND_S + 3600)      # one trend window (+ slack), shared across the rows
-    pad = _pad_b64()
-    def barline(label, pct, meta="", img=None):
-        # Severity belongs to the gauge, not the clock: the bar carries the red/amber/green, while
-        # the label and the reset text stay the menu's default color. The bar itself is a rendered
-        # image on the line — xbar puts it left of the text — so the text needs no ANSI at all. If
-        # the image can't be built, an ANSI text bar takes over (which needs two colors on one
-        # line — `color=` paints the whole item — hence the spans).
-        tail = f"  · {meta}" if meta else ""
-        if img:
-            print(f"{label:<6} {int(pct):>3}%{tail} | image={img} font=Menlo size=11")
-            return
-        print(f"{NB}{label:<6} {color(pct)}{bar(pct)} {int(pct):>3}%{C['x']}{tail} "
-              f"| font=Menlo size=12 ansi=true")
-    def detail(row):
-        # One dropdown line from the shared view-model: a bar for pct rows, gray text for the rest.
-        # The transparent pad keeps text-only lines on the bar images' left edge.
-        if row["pct"] is None:
-            lead = "" if pad else NB
-            padp = f"image={pad} " if pad else ""
-            print(f"{lead}{xb(row['label']):<7} {xb(row['meta'])} | {padp}color=#8b949e font=Menlo size=11")
-            return
-        barline(xb(row["label"]), row["pct"], xb(row["meta"]), img=_bar_b64(row["pct"]))
-    def trendline(r):
-        # The weekly window's recent shape and pace — the one thing a point-in-time % can't say.
-        # Skipped without comment until the history has something to draw.
-        series, pace, note = trend_view(hist, r)
-        spark = _spark_b64(series) if series else None
-        if spark:
-            print(f"{'trend':<6} {note} | image={spark} color=#8b949e font=Menlo size=11")
-    def xbar_account_row(r):
-        # Name rows wear the system font at medium weight, like native menu items; the ▶ marks the
-        # account you're on. Display names collide (several of one person's logins share a name),
-        # so a row also carries its email — the real identity — when it has one.
-        lead = ACTIVE_MARK if r.get("active") else NB
-        switchable = can_switch(r)
-        hint = "  ⇄" if switchable else ""      # the only thing marking a row as clickable
-        # macOS draws an actionless menu item at reduced alpha, which would gray out exactly the
-        # account you're on — so the active row gets refresh as its action, keeping it full-strength
-        # (and a click on it harmlessly refreshes the menu).
-        params = "font=HelveticaNeue-Medium size=13"
-        if switchable:
-            params += (f' bash="{os.path.realpath(__file__)}" param1=switch param2={r["uuid"]}'
-                       f" terminal=false refresh=true")
-        elif r.get("active"):
-            params += " refresh=true"
-        em = r.get("email") or ""
-        em = em if "@" in em and em != r.get("label") else ""   # label falls back to the email — don't repeat it
-        mail = f"{xb(em)}   " if em else ""
-        print(f"{lead}{xb(r['label'])}   {mail}{xb(plan_of(r))}{hint} | {params}")
-        if switchable:   # holding ⌥ swaps the row for what the click actually does
-            print(f"{lead}⇄ Switch to {xb(r['label'])}{'  ' + xb(em) if em else ''} | alternate=true {params}")
-        if r.get("error"):
-            print(f"{NB}{xb(r['error'])} | color=#e5534b font=Menlo size=12"); print("---"); return
-        for row in _display_rows(r):
-            detail(row)
-        if r.get("provider", "claude") == "claude":
-            trendline(r)
-        print("---")
-    groups = by_provider(rows)
-    multi = len(groups) > 1
-    for key, name, grp in groups:
-        if multi:
-            print(f"{name.upper()} | color=#8b949e size=10")
-            print("---")   # divider under the header, matching the one after every account below it
-        for r in grp:
-            xbar_account_row(r)
-    if any(r.get("stale") for r in claude_rows):
-        print("⚠ last known values — rate-limited; updates on the next refresh | color=#d9a13b font=Menlo size=12")
-    if len([r for r in claude_rows if not r.get("is_team")]) <= 1:
-        print("＋ Log into another account with the claude CLI (claude → /login) to track it | color=#8b949e font=Menlo size=12")
-    prob = last_problem()      # only failures reach the menu; success is visible in the bar itself
-    if prob:
-        print(f"⚠ {xb(prob.get('msg',''))} | color=#d9a13b font=Menlo size=11")
-    ts = data_ts()
-    upd = datetime.fromtimestamp(ts).strftime("%-I:%M:%S %p") if ts else "—"
-    _, iv = find_plugin_link()
-    cadence = f"every {iv}" if iv else "on a timer"
-    print(f"Updated {upd} · auto-refreshes {cadence} | color=#8b949e font=Menlo size=11")
-    print("↻ Refresh now | refresh=true")
-    if iv:
-        print(f"⏱ Refresh every · {iv} | font=Menlo size=11 refresh=true")
-        for opt in INTERVALS:
-            mark = "✓" if opt == iv else "  "
-            print(f'--{mark} {opt} | bash="{os.path.realpath(__file__)}" param1=interval param2={opt}'
-                  f" terminal=false refresh=true font=Menlo size=11")
 
 # ---- account switching ------------------------------------------------------
 
@@ -1880,182 +1553,11 @@ def cmd_switch(target):
     clear_cache()                                     # so the post-switch refresh shows the new active account
     _report_switch(f"switched to {e['email']}", note)
 
-# ---- menu-bar install -------------------------------------------------------
+# ---- native app presence (for doctor) ---------------------------------------
 
 def _app_installed(bundle):
     return any(os.path.isdir(os.path.join(base, bundle))
                for base in ("/Applications", os.path.expanduser("~/Applications")))
-
-def _read_default(domain, key):
-    r = subprocess.run(["defaults", "read", domain, key], capture_output=True, text=True)
-    v = r.stdout.strip()
-    return os.path.expanduser(v) if r.returncode == 0 and v else None
-
-def ensure_xbar():
-    """Make sure a menu-bar host exists, offering to `brew install --cask xbar` if not. Returns bool."""
-    if _app_installed("xbar.app") or _app_installed("SwiftBar.app"):
-        return True
-    if not shutil.which("brew"):
-        print("  No menu-bar host found, and Homebrew isn't installed.")
-        print("  Install xbar from https://xbarapp.com, then re-run `claude-usage install`.")
-        return False
-    if sys.stdin.isatty() and not _ask("  xbar isn't installed. Install it now with Homebrew?", True):
-        print("  Skipped. Install later with:  brew install --cask xbar")
-        return False
-    print("  Installing xbar (brew install --cask xbar)…")
-    if subprocess.run(["brew", "install", "--cask", "xbar"]).returncode != 0:
-        print("  brew install failed — install xbar manually from https://xbarapp.com.")
-        return False
-    return True
-
-_HOST_CACHE = []      # memo: the lookup forks `defaults`, and a render asks for it repeatedly
-
-def host_and_plugin_dir():
-    """(host name, its plugin folder) for the installed menu-bar host. Either may be None.
-
-    Memoized per process: neither the installed host nor its plugin folder changes during a
-    run, and the `defaults` fork is otherwise repeated on every render.
-    """
-    if _HOST_CACHE:
-        return _HOST_CACHE[0]
-    if _app_installed("xbar.app"):
-        res = ("xbar", (_read_default("com.xbarapp.app", "pluginsDirectory")
-                        or os.path.expanduser("~/Library/Application Support/xbar/plugins")))
-    elif _app_installed("SwiftBar.app"):
-        res = ("SwiftBar", _read_default("com.ameba.SwiftBar", "PluginDirectory"))
-    else:
-        res = (None, None)
-    _HOST_CACHE.append(res)
-    return res
-
-def plugin_source():
-    here = os.path.dirname(os.path.realpath(__file__))     # realpath: works via a PATH symlink too
-    return os.path.join(here, PLUGIN_FILE)
-
-def wrapper_path():
-    """The PATH the plugin wrapper exports, read from the wrapper itself. The menu-bar host runs
-    the plugin with a bare environment, so that line — not this process's PATH — decides which
-    python3 the bar gets. Reading it keeps the check honest if the wrapper is ever edited."""
-    try:
-        with open(plugin_source()) as f:
-            m = re.search(r'^export PATH="([^"]*)"', f.read(), re.M)
-        return m.group(1).split(":") if m else None
-    except Exception:
-        return None
-
-def plugin_python():
-    """The python3 the wrapper will actually find, or None."""
-    for d in wrapper_path() or []:
-        p = os.path.join(d, "python3")
-        if os.path.exists(p):
-            return p
-    return None
-
-def find_plugin_links():
-    """Every (link, interval) in the host's folder pointing at our plugin. The interval is the
-    '.5m.' in the *link's* name, which is what the host reads. More than one means the host is
-    running the plugin twice — two icons in the bar."""
-    _, d = host_and_plugin_dir()
-    if not d or not os.path.isdir(d):
-        return []
-    src = os.path.realpath(plugin_source())
-    out = []
-    for p in sorted(glob.glob(os.path.join(d, "claude-usage.*.sh"))):
-        if os.path.realpath(p) == src:
-            m = re.match(r"claude-usage\.([^.]+)\.sh$", os.path.basename(p))
-            out.append((p, m.group(1) if m else None))
-    return out
-
-def find_plugin_link():
-    """(link path, interval) of our plugin, or (None, None)."""
-    links = find_plugin_links()
-    return links[0] if links else (None, None)
-
-def install_plugin():
-    """Symlink the plugin into the host's folder (host must already exist). Returns 'xbar'/'SwiftBar' or None."""
-    plugin = plugin_source()
-    if not os.path.exists(plugin):
-        print(f"  plugin not found next to the script: {plugin}"); return None
-    os.chmod(plugin, 0o755)
-
-    app, target = host_and_plugin_dir()
-    if not app:
-        print("  No menu-bar host found."); return None
-    if not target:
-        print(f"  {app} is installed but no plugin folder is set.")
-        print(f"  Open {app} → Preferences, choose a plugin folder, then re-run.")
-        return None
-
-    os.makedirs(target, exist_ok=True)
-    existing, _ = find_plugin_link()      # keep whatever interval the user already chose
-    link = existing or os.path.join(target, f"claude-usage.{DEFAULT_INTERVAL}.sh")
-    if os.path.islink(link) or os.path.exists(link):
-        if os.path.realpath(link) == os.path.realpath(plugin):
-            print(f"  ✓ already linked → {link}")
-        else:
-            os.remove(link); os.symlink(plugin, link); print(f"  ✓ relinked → {link}")
-    else:
-        os.symlink(plugin, link); print(f"  ✓ linked plugin → {link}")
-    return app
-
-def setup_menu_bar():
-    """Install a host if needed, link the plugin, launch the host. Returns True if the bar is set up."""
-    if not ensure_xbar():
-        return False
-    app = install_plugin()
-    if not app:
-        return False
-    subprocess.run(["open", "-a", app], capture_output=True)
-    print(f"  ✓ launched {app} — the bar should appear shortly (allow plugins if {app} prompts).")
-    return True
-
-def cmd_install():
-    sys.exit(0 if setup_menu_bar() else 1)
-
-def restart_host(app):
-    """Bounce the menu-bar host so it re-scans the plugin folder.
-
-    Detached and in its own session: this usually runs as a child of the host itself (a menu
-    click), so it has to outlive the quit it just issued.
-
-    The relaunch waits for the process to actually be gone rather than sleeping a fixed
-    interval — `open -a` against a still-quitting app can be swallowed as "already running",
-    which would leave no bar and, since the plugin link is already renamed, no menu to fix it
-    from. The final `open` is unconditional so a hung quit still gets a running host.
-    """
-    script = (f'osascript -e \'quit app "{app}"\' >/dev/null 2>&1; '
-              f'for i in $(seq 30); do pgrep -x {app} >/dev/null 2>&1 || break; sleep 0.2; done; '
-              f'open -a "{app}"')
-    subprocess.Popen(["/bin/sh", "-c", script], start_new_session=True,
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-def cmd_interval(val):
-    if val not in INTERVALS:
-        _fail(f"interval must be one of: {', '.join(INTERVALS)}", "interval")
-    app, _ = host_and_plugin_dir()
-    links = find_plugin_links()
-    if not links:
-        _fail("the menu-bar plugin isn't linked — run `claude-usage install` first", "interval")
-    if len(links) > 1:
-        # renaming one of several would leave the rest running at their own cadences
-        _fail("the plugin is linked more than once (" +
-              ", ".join(os.path.basename(p) for p, _ in links) +
-              ") — delete all but one, then set the interval", "interval")
-    link, cur = links[0]
-    if cur == val:
-        clear_problem("interval")
-        print(f"already refreshing every {val}"); return
-    dest = os.path.join(os.path.dirname(link), f"claude-usage.{val}.sh")
-    if os.path.lexists(dest):          # lexists: a dangling link still occupies the name
-        if os.path.realpath(dest) != os.path.realpath(plugin_source()):
-            _fail(f"{dest} already exists and isn't ours — move it aside and retry", "interval")
-        os.remove(dest)                # a duplicate link of our own; the rename replaces it
-    os.rename(link, dest)
-    # The host keeps the plugin's path in memory and doesn't notice a rename — it would keep
-    # exec'ing the old name and show a ⚠ icon. Restart it so it picks the new cadence up.
-    clear_problem("interval")
-    print(f"refreshing every {val} (restarting {app})")
-    restart_host(app)      # a link was found, so a host exists
 
 # ---- doctor -----------------------------------------------------------------
 
@@ -2118,7 +1620,7 @@ def cmd_doctor():
     if ts and time.time() - ts > 3600:
         age = int((time.time() - ts) // 60)
         say("warn", f"usage numbers last fetched {age // 60}h {age % 60}m ago",
-            "the menu-bar host may not be running.")
+            "the menu-bar app may not be running.")
 
     section("Codex")
     if not os.path.exists(CODEX_AUTH):
@@ -2146,31 +1648,12 @@ def cmd_doctor():
                     "sign into it with `codex login` once to capture its credential.")
 
     section("Menu bar")
-    app, pdir = host_and_plugin_dir()
-    if not app:
-        say("warn", "no menu-bar host installed", "run `claude-usage install` to add xbar.")
-    elif not pdir:
-        say("warn", f"{app} is installed but has no plugin folder set",
-            f"open {app} → Preferences and choose one, then run `claude-usage install`.")
+    if not _app_installed("Claude Usage.app"):
+        say("warn", "the menu-bar app isn't built", "run `claude-usage app` to build and launch it.")
+    elif subprocess.run(["pgrep", "-x", "ClaudeUsage"], capture_output=True).returncode != 0:
+        say("warn", "Claude Usage.app is built but not running", "open it, or run `claude-usage app`.")
     else:
-        links = find_plugin_links()
-        if not links:
-            say("warn", f"{app} is installed but the plugin isn't linked", "run `claude-usage install`.")
-        elif len(links) > 1:
-            say("warn", f"{len(links)} links to the plugin — {app} is running it once per link",
-                "delete all but one: " + ", ".join(os.path.basename(p) for p, _ in links))
-        else:
-            say("ok", f"{app}: plugin linked, refreshing every {links[0][1]}", links[0][0])
-        if subprocess.run(["pgrep", "-x", app], capture_output=True).returncode != 0:
-            say("warn", f"{app} isn't running — the bar won't update", f"run: open -a {app}")
-    py = plugin_python()
-    if py:
-        say("ok", f"the plugin's python3 resolves to {py}")
-    elif wrapper_path() is None:
-        say("bad", f"can't read the plugin's PATH from {PLUGIN_FILE}",
-            "the wrapper is missing or unreadable; re-clone or restore it.")
-    else:
-        say("bad", "no python3 on the plugin's PATH — the bar will render empty")
+        say("ok", "Claude Usage.app is running")
 
     section("Shell")
     cu = os.path.expanduser("~/.local/bin/claude-usage")
@@ -2211,7 +1694,7 @@ def cmd_setup():
     print("This will:")
     print("  • read the Claude account you're signed into (read-only) and register it")
     print("  • store each account's refresh token in your macOS Keychain — never in files or the repo")
-    print("  • optionally add a menu-bar view (xbar / SwiftBar)")
+    print("  • optionally build the menu-bar app (compiled locally; needs the Xcode Command Line Tools)")
     print("It never changes or signs out your Claude Code session.")
     print("If you use the Codex CLI, its usage shows automatically alongside — nothing to set up.\n")
     if not _ask("Proceed?", True):
@@ -2230,10 +1713,15 @@ def cmd_setup():
         if local_bin not in os.environ.get("PATH", "").split(os.pathsep):
             print('  add to your shell rc:  export PATH="$HOME/.local/bin:$PATH"')
 
-    # optional: menu bar (the primary experience — offers to install xbar if missing)
-    if _ask("Add the menu-bar view? (installs xbar if needed)", True):
-        print("Menu bar:")
-        setup_menu_bar()
+    # optional: the menu bar (the primary experience)
+    if not shutil.which("swiftc"):
+        print("Menu bar: needs the Xcode Command Line Tools (xcode-select --install);")
+        print("run `claude-usage app` once they're installed.")
+    elif _ask("Build and launch the menu-bar app?", True):
+        try:
+            cmd_app()
+        except SystemExit:
+            print("  the build didn't finish — fix the error above and run `claude-usage app`.")
 
     print("\nRegistering the account you're signed into…")
     rows = collect()
@@ -2525,25 +2013,17 @@ def cmd_app():
     time.sleep(0.3)
     subprocess.run(["open", app])
     print(f"launched {app}")
-    link, _ = find_plugin_link()
-    if link:
-        print(f"the xbar plugin is still linked at {link} — the two bars run side by side; "
-              "remove that symlink to retire it")
 
 def main():
     arg = sys.argv[1] if len(sys.argv) > 1 else ""
     if arg == "setup":
         cmd_setup(); return
-    if arg == "install":
-        cmd_install(); return
     if arg == "app":
         cmd_app(); return
     if arg == "insights":
         cmd_insights("--json" in sys.argv[2:]); return
     if arg == "doctor":
         cmd_doctor(); return
-    if arg == "interval":
-        cmd_interval(sys.argv[2] if len(sys.argv) > 2 else ""); return
     if arg == "switch":
         cmd_switch(sys.argv[2] if len(sys.argv) > 2 else ""); return
     if arg == "capture":
@@ -2585,7 +2065,6 @@ def main():
         return
     rows = collect()
     if arg == "--json": render_json(rows)
-    elif arg == "--xbar": render_xbar(rows)
     else: render_table(rows)
 
 if __name__ == "__main__":
