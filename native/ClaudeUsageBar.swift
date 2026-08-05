@@ -982,7 +982,11 @@ struct AccountCard: View {
     /// this: the desktop app when it has been set up, the CLI otherwise. Two lit cards would ask
     /// the reader to work out which one counts, and drift is not what this indicator is for.
     private var isCurrent: Bool {
-        model.desktopOnboarded ? (stash?.active == true) : (account.active == true)
+        // Codex has no desktop surface, so its own active flag is the whole answer. Letting the
+        // desktop rule reach these rows would leave the Codex section with nothing lit as soon as
+        // any desktop account was captured.
+        if account.isCodex { return account.active == true }
+        return model.desktopOnboarded ? (stash?.active == true) : (account.active == true)
     }
     private var cliSwitchable: Bool { account.display?.can_switch == true }
     private var desktopSwitchable: Bool {
