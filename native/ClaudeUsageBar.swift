@@ -925,19 +925,19 @@ struct AccountCard: View {
         HStack(alignment: .firstTextBaseline, spacing: 6) {
             // One reserved leading slot for all rows keeps every name on the same left edge, and
             // gives the hover affordance a meaningful home: ⇄ appears exactly where the ▶ will sit
-            // once this account is the active one. The plan pill never moves.
-            Group {
-                if model.switching == account.uuid {
-                    ProgressView().controlSize(.mini)
-                } else if account.active == true {
-                    Text("▶").font(.system(size: 9)).foregroundStyle(.primary)
-                } else if hovered && account.display?.can_switch == true {
-                    Text("⇄").font(.system(size: 11, weight: .semibold)).foregroundStyle(Color.accentColor)
-                } else {
-                    Color.clear
+            // once this account is the active one. The slot is always one Text in one font — a
+            // baseline-less placeholder would flip the row's alignment mode on hover and shift
+            // every glyph beside it. The switch spinner overlays instead of substituting.
+            Text(account.active == true ? "▶"
+                 : (hovered && account.display?.can_switch == true ? "⇄" : ""))
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(account.active == true ? AnyShapeStyle(.primary)
+                                 : AnyShapeStyle(Color.accentColor))
+                .opacity(model.switching == account.uuid ? 0 : 1)
+                .frame(width: 13, alignment: .leading)
+                .overlay(alignment: .leading) {
+                    if model.switching == account.uuid { ProgressView().controlSize(.mini) }
                 }
-            }
-            .frame(width: 13, alignment: .leading)
             Text(account.label ?? account.uuid)
                 .font(.system(size: 13, weight: .semibold))
             if let em = account.email, em.contains("@"), em != account.label {
@@ -1013,7 +1013,6 @@ struct FooterView: View {
                 Text("⚠ last known values — rate-limited; updates on the next refresh")
                     .font(.system(size: 10.5)).foregroundStyle(sevColor(70))
             }
-            Divider()
             HStack(spacing: 10) {
                 TimelineView(.periodic(from: .now, by: 10)) { ctx in
                     Text(updatedText(now: ctx.date))
