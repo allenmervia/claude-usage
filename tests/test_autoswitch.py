@@ -236,6 +236,8 @@ class TestMaybeAutoSwitch(unittest.TestCase):
         self.notices = []
         self._patch("_notify", lambda title, body: self.notices.append((title, body)))
         self._patch("desktop_state", lambda: None)
+        # notifications must never carry an em dash: check every one this test produces
+        self.addCleanup(lambda: [self.assertNotIn("—", t + b) for t, b in self.notices])
 
     def _enable(self):
         cu.save_autoswitch({"enabled": True})
@@ -262,6 +264,14 @@ class TestMaybeAutoSwitch(unittest.TestCase):
         self.assertEqual(len(self.notices), 1)
         self.assertIn("best@x.test", self.notices[0][1])
         self.assertFalse(os.path.exists(cu.AUTOSWITCH_LOCK))   # lock released
+
+    def test_partial_switch_is_recorded_and_notified(self):
+        self._enable()
+        cu._switch_claude = lambda e: (True, f"switched to {e['email']}", cu.MISMATCH_NOTE)
+        rows = [row("a", fh=100, active=True), row("best", fh=5, uuid="best")]
+        cu.maybe_auto_switch(rows)
+        self.assertTrue(cu.load_autoswitch()["last_auto"]["partial"])
+        self.assertIn("old account's name", self.notices[0][1])
 
     def test_failed_candidate_falls_through_to_next(self):
         self._enable()
@@ -312,7 +322,7 @@ class TestMaybeAutoSwitch(unittest.TestCase):
                 row("b", fh=100, fh_reset=NOW + 7200, uuid="best")]
         cu.maybe_auto_switch(rows)
         self.assertEqual(len(self.notices), 1)
-        self.assertIn("earliest reset", self.notices[0][1])
+        self.assertIn("Earliest reset", self.notices[0][1])
         cu.maybe_auto_switch(rows)          # immediately again — still one notification
         self.assertEqual(len(self.notices), 1)
 
@@ -322,7 +332,7 @@ class TestMaybeAutoSwitch(unittest.TestCase):
                 row("b", fh=100, fh_reset=None, uuid="best")]
         cu.maybe_auto_switch(rows)
         self.assertEqual(len(self.notices), 1)
-        self.assertIn("reset times unknown", self.notices[0][1])
+        self.assertIn("Reset times unknown", self.notices[0][1])
 
     def test_off_toggle_during_refresh_survives_the_record_write(self):
         self._enable()

@@ -2083,11 +2083,11 @@ def maybe_auto_switch(rows):
     scoped = bool(st.get("scoped"))
     kind, payload = auto_decision(rows, last_switch_info(), now, _has_full_creds, scoped)
     if kind == "stranded":
-        when = (f"earliest reset {local_short(datetime.fromtimestamp(payload, timezone.utc))}"
-                if payload else "reset times unknown")   # unknown must still notify — silence
+        when = (f"Earliest reset {local_short(datetime.fromtimestamp(payload, timezone.utc))}."
+                if payload else "Reset times unknown.")  # unknown must still notify — silence
                                                          # here reads as "everything is fine"
         _notify_hourly("last_stranded_notify", "claude-usage",
-                       f"Every account is at its limit — {when}.")
+                       f"Every account is at its limit. {when}")
         return rows
     if kind != "switch":
         return rows
@@ -2114,11 +2114,12 @@ def maybe_auto_switch(rows):
                                              "partial": bool(note)},
                                "last_stranded_notify": None, "last_failed_notify": None})
             record_last_switch("claude", auto=True)
-            body = f"{active.get('email')} hit its {reason} — CLI now on {e['email']}."
+            # notification copy stays dash-free: no em dashes in anything osascript posts
+            body = f"{active.get('email')} hit its {reason}. CLI now on {e['email']}."
             if desktop_state():
                 body += " Desktop app unchanged; switch it from the menu bar."
             if note:
-                body += note
+                body += " Note: ~/.claude.json still shows the old account's name."
             _notify("claude-usage auto-switch", body)
             for r in rows:                             # this tick renders the switch it just made —
                 if is_claude(r):                       # usage numbers can't have changed, only who
@@ -2129,7 +2130,7 @@ def maybe_auto_switch(rows):
         # every candidate refused to switch — that's as wrong as stranded and must not be silent
         _notify_hourly("last_failed_notify", "claude-usage",
                        f"{active.get('email')} is at its limit but no account could be switched "
-                       f"to — check `claude-usage doctor`.")
+                       f"to. Check `claude-usage doctor`.")
         return rows
     finally:
         _release_switch_lock(lock)
