@@ -245,9 +245,14 @@ operation in a journal before touching anything, so an interrupted run can be ro
 forward or back (`repair`) rather than leaving the profile half one account and half
 another. `undo` restores the exact bytes the last switch replaced.
 
-One thing still unknown: whether a stash keeps working after days rather than minutes
-depends on how long those session cookies stay valid. If an old one stops working, the
-app shows a login screen and `add` re-captures it.
+A stash survives idle days (`doctor` flags one older than two weeks as untested
+territory), but not an app update: once the desktop app updates itself, installing a
+pre-update capture lands on a login screen. The bar and `doctor` warn when a stash
+predates the installed version, and switching away from an account whose capture
+predates the update refreshes its stash from the live profile automatically (the old
+copy is kept aside). So recovery is one login per account: sign in at the login screen
+the switch lands on, and the stash heals on the next switch away — or refresh it
+immediately with the app quit via `desktop-switch.py capture <label>`.
 
 ## Menu bar
 

@@ -50,6 +50,7 @@ struct Stash: Decodable, Identifiable {
     var age_days: Double?
     var app_version: String?
     var stale: Bool?
+    var version_mismatch: Bool?
     var active: Bool?
     var can_switch: Bool?
     var matched_uuid: String?
@@ -84,6 +85,7 @@ struct DisplayDesktop: Decodable {
     var active: Bool?
     var can_switch: Bool?
     var stale: Bool?
+    var version_mismatch: Bool?
 }
 
 struct DisplayRow: Decodable {
@@ -1035,6 +1037,22 @@ struct SectionHeader: View {
     }
 }
 
+// The pre-update-capture warning, one home for both card types so the copies can't drift:
+// the badge sits in a card header, the notice in a confirm sheet.
+private func mismatchBadge() -> some View {
+    Text("app updated since capture")
+        .font(.system(size: 10))
+        .foregroundStyle(sevColor(70))
+        .lineLimit(1)
+}
+
+private func mismatchNotice() -> some View {
+    Text("This saved sign-in predates an app update and may land on a login screen. If it does, just log in; the saved copy refreshes on the next switch away.")
+        .font(.system(size: 11))
+        .foregroundStyle(sevColor(70))
+        .fixedSize(horizontal: false, vertical: true)
+}
+
 struct AccountCard: View {
     @EnvironmentObject var model: Model
     let account: Account
@@ -1072,7 +1090,12 @@ struct AccountCard: View {
                 confirmCard
             } else if cliSwitchable || desktopSwitchable {
                 Button {
-                    if desktopSwitchable && model.desktop?.needs_confirm == true {
+                    // A pre-update stash confirms even with the app closed: the swap costs
+                    // nothing then, but the login screen it may land on still deserves a
+                    // heads-up, and this sheet is the only surface left to give it (the
+                    // backend's stderr warning is dropped on a successful exit).
+                    if desktopSwitchable && (model.desktop?.needs_confirm == true
+                                             || stash?.version_mismatch == true) {
                         model.confirmTarget = account.uuid
                     } else if model.confirmTarget != nil {
                         // A question is open on another card, and this click lands outside it:
@@ -1102,10 +1125,15 @@ struct AccountCard: View {
     private var confirmCard: some View {
         VStack(alignment: .leading, spacing: 7) {
             card
-            Text("Claude Code Desktop will quit and reopen. Make sure your sessions are at a good stopping place.")
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+            if model.desktop?.needs_confirm == true {
+                Text("Claude Code Desktop will quit and reopen. Make sure your sessions are at a good stopping place.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if stash?.version_mismatch == true {
+                mismatchNotice()
+            }
             HStack(spacing: 8) {
                 Spacer()
                 Button("Cancel") { model.confirmTarget = nil }
@@ -1190,6 +1218,9 @@ struct AccountCard: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
+            if stash?.version_mismatch == true {
+                mismatchBadge()
+            }
             Spacer(minLength: 4)
             if let plan = account.display?.plan, !plan.isEmpty {
                 Text(plan)
@@ -1221,7 +1252,11 @@ struct StashCard: View {
                 confirmCard
             } else if stash.can_switch == true {
                 Button {
-                    if desktop.needs_confirm == true { model.confirmTarget = "desktop:" + stash.label }
+                    // A pre-update stash confirms even with the app closed — same rationale
+                    // as AccountCard: this sheet is the only warning surface left.
+                    if desktop.needs_confirm == true || stash.version_mismatch == true {
+                        model.confirmTarget = "desktop:" + stash.label
+                    }
                     else if model.confirmTarget != nil { model.confirmTarget = nil }  // dismiss, don't act
                     else { Task { await model.switchDesktop(stash.label) } }
                 } label: { card }
@@ -1243,15 +1278,20 @@ struct StashCard: View {
     private var confirmCard: some View {
         VStack(alignment: .leading, spacing: 7) {
             card
-            Text("Claude Code Desktop will quit and reopen. Make sure your sessions are at a good stopping place.")
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+            if desktop.needs_confirm == true {
+                Text("Claude Code Desktop will quit and reopen. Make sure your sessions are at a good stopping place.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if stash.version_mismatch == true {
+                mismatchNotice()
+            }
             HStack(spacing: 8) {
                 Spacer()
                 Button("Cancel") { model.confirmTarget = nil }
                     .controlSize(.small)
-                Button("Quit and switch") {
+                Button(desktop.needs_confirm == true ? "Quit and switch" : "Switch anyway") {
                     model.confirmTarget = nil
                     Task { await model.switchDesktop(stash.label) }
                 }
@@ -1279,7 +1319,10 @@ struct StashCard: View {
                     if isSwitching { ProgressView().controlSize(.mini) }
                 }
             Text(stash.label).font(.system(size: 13, weight: .semibold))
-            if stash.stale == true {
+            // Mismatch outranks age: an app update is known to invalidate a capture, age only might.
+            if stash.version_mismatch == true {
+                mismatchBadge()
+            } else if stash.stale == true {
                 Text("may have expired")
                     .font(.system(size: 10))
                     .foregroundStyle(sevColor(70))

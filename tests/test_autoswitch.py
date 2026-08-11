@@ -346,5 +346,43 @@ class TestMaybeAutoSwitch(unittest.TestCase):
         self.assertFalse(cu.load_autoswitch()["enabled"])   # the toggle is not reverted
 
 
+class TestDesktopVersionMismatch(unittest.TestCase):
+    """_desktop_state flags a stash captured under a different app version."""
+
+    def _patch(self, name, stub):
+        self.addCleanup(setattr, cu, name, getattr(cu, name))
+        setattr(cu, name, stub)
+
+    def setUp(self):
+        import json
+        import tempfile
+        self.tmp = tempfile.mkdtemp()
+        stashes = os.path.join(self.tmp, "stashes")
+        for label, ver in (("old", "1.0.0"), ("current", "2.0.0"), ("unversioned", None)):
+            d = os.path.join(stashes, label)
+            os.makedirs(d)
+            with open(os.path.join(d, "manifest.json"), "w") as f:
+                json.dump({"label": label, "app_version": ver,
+                           "files": {"Cookies": "x"}}, f)
+        self._patch("DESKTOP_APP", self.tmp)
+        self._patch("DESKTOP_STASHES", stashes)
+        self._patch("DESKTOP_ACTIVE", os.path.join(self.tmp, "active.json"))
+        self._patch("DESKTOP_JOURNAL", os.path.join(self.tmp, "journal.json"))
+        self._patch("desktop_app_version", lambda: "2.0.0")
+        self._patch("desktop_app_running", lambda: False)
+
+    def test_flags_only_the_pre_update_stash(self):
+        st = {s["label"]: s for s in cu._desktop_state()["stashes"]}
+        self.assertTrue(st["old"]["version_mismatch"])
+        self.assertFalse(st["current"]["version_mismatch"])
+        # a capture with no recorded version gives no basis to warn
+        self.assertFalse(st["unversioned"]["version_mismatch"])
+
+    def test_unknown_installed_version_never_flags(self):
+        self._patch("desktop_app_version", lambda: None)
+        st = {s["label"]: s for s in cu._desktop_state()["stashes"]}
+        self.assertFalse(any(s["version_mismatch"] for s in st.values()))
+
+
 if __name__ == "__main__":
     unittest.main()

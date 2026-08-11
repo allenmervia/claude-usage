@@ -1028,7 +1028,8 @@ def mock_insights():
 def mock_desktop():
     return {"active": "side",
             "stashes": [{"label": l, "files": 34, "age_days": 0.4, "app_version": desktop_app_version(),
-                         "stale": False, "active": l == "side", "can_switch": l != "side"}
+                         "stale": False, "version_mismatch": False,
+                         "active": l == "side", "can_switch": l != "side"}
                         for l, *_ in MOCK_ACCOUNTS],
             "needs_repair": False, "app_running": True, "needs_confirm": True,
             "app_version": desktop_app_version()}
@@ -1076,6 +1077,7 @@ def _desktop_state():
         return None
     active = (_read_json_file(DESKTOP_ACTIVE) or {}).get("label")
     now = time.time()
+    app_ver = desktop_app_version()
     stashes = []
     for label in labels:
         m = _read_json_file(os.path.join(DESKTOP_STASHES, label, "manifest.json")) or {}
@@ -1086,6 +1088,11 @@ def _desktop_state():
             "age_days": round(age, 1),
             "app_version": m.get("app_version"),
             "stale": age > STASH_STALE_DAYS,
+            # An app update can migrate or re-key the account stores, after which a pre-update
+            # capture lands on a login screen when installed. Computed once here so every
+            # surface warns from the same fact.
+            "version_mismatch": bool(m.get("app_version") and app_ver
+                                     and m["app_version"] != app_ver),
             "active": label == active,
             # Switching restarts the app, so a consumer must confirm rather than act on a click.
             "can_switch": label != active,
@@ -1099,7 +1106,7 @@ def _desktop_state():
             "needs_repair": bool(_read_json_file(DESKTOP_JOURNAL)),
             "app_running": running,
             "needs_confirm": running,
-            "app_version": desktop_app_version()}
+            "app_version": app_ver}
 
 DESKTOP_EXEC = os.path.join(DESKTOP_APP, "Contents", "MacOS", "Claude")
 
@@ -1445,7 +1452,8 @@ def _match_desktop(rows):
                 st["matched_uuid"] = hits[0]["uuid"]
                 claimed.add(hits[0]["uuid"])
                 hits[0]["display"]["desktop"] = {k: st[k] for k in
-                                                 ("label", "active", "can_switch", "stale")}
+                                                 ("label", "active", "can_switch", "stale",
+                                                  "version_mismatch")}
                 break
             if hits:
                 break
@@ -2201,9 +2209,19 @@ def cmd_desktop_switch(label):
     if not os.path.exists(tool):
         _fail(f"{tool} is missing — restore it from the repo")
     r = subprocess.run([sys.executable, tool, "switch", label], capture_output=True, text=True)
+    if r.returncode < 0:
+        # killed by a signal: the tool wrote no verdict of its own, and stderr may hold only
+        # its pre-switch warning, whose last line would otherwise be reported as the reason
+        _fail(f"desktop switch was killed by signal {-r.returncode}; "
+              f"check ./tools/desktop-switch.py status")
     if r.returncode != 0:
         msg = (r.stderr or r.stdout or "desktop switch failed").strip().splitlines()
         _fail(msg[-1] if msg else "desktop switch failed")
+    if r.stderr.strip():
+        # warnings from the tool (e.g. the stash predates an app update) ride stderr so a
+        # successful exit can't swallow them for terminal callers; the bar warns from the
+        # version_mismatch flag instead, since it reads stderr only on failure
+        print(r.stderr.strip(), file=sys.stderr)
     print(r.stdout.strip())
 
 def cmd_doctor():
@@ -2314,12 +2332,22 @@ def cmd_doctor():
                 say("warn", "the desktop app's account isn't one this tool captured",
                     "capture it: ./tools/desktop-switch.py add")
             for st in ds["stashes"]:
-                if st["stale"]:
+                # A version mismatch outranks age: an update is known to invalidate captures,
+                # while age only might.
+                if st["version_mismatch"] and st["active"]:
+                    # The account in use can't be switched to, and its live session is the one
+                    # thing that can refresh the dead capture without a login.
+                    say("warn", f"{st['label']}: the app updated since this account was captured",
+                        "re-capture while its session is live: quit the app, then "
+                        f"./tools/desktop-switch.py capture {st['label']} "
+                        "(switching away also refreshes it automatically)")
+                elif st["version_mismatch"]:
+                    say("warn", f"{st['label']}: captured under app v{st['app_version']}, now v{ds['app_version']}",
+                        "switching to it will likely land on a login screen; log in there and its "
+                        "saved copy refreshes on the next switch away.")
+                elif st["stale"]:
                     say("warn", f"{st['label']}: captured {st['age_days']:.0f} days ago and may no longer work",
                         "if switching to it lands on a login screen, re-add it with `add`.")
-                elif st["app_version"] and st["app_version"] != ds["app_version"]:
-                    say("warn", f"{st['label']}: captured under app v{st['app_version']}, now v{ds['app_version']}",
-                        "an app update can change these files; re-add it if switching fails.")
 
     section("Menu bar")
     bundle = _app_bundle_path()

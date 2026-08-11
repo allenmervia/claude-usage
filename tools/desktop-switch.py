@@ -45,6 +45,9 @@ PROFILE = os.path.expanduser(os.environ.get("CU_DESKTOP_PROFILE")
 STATE    = os.path.expanduser(os.environ.get("CU_DESKTOP_STATE") or "~/.claude-usage")
 STASHES  = os.path.join(STATE, "desktop-stashes")
 ROLLBACK = os.path.join(STATE, "desktop-rollbacks")
+# Displaced copies of stashes that were refreshed in place (see _refresh_dead_stash). Not under
+# ROLLBACK: `undo` restores the newest rollback wholesale, and these are not profile rollbacks.
+ASIDES   = os.path.join(STATE, "desktop-stash-asides")
 JOURNAL  = os.path.join(STATE, "desktop-journal.json")
 ACTIVE   = os.path.join(STATE, "desktop-active.json")
 LOCK     = os.path.join(STATE, "desktop-switch.lock")
@@ -393,9 +396,15 @@ def cmd_switch(label, dry_run=False):
         sys.exit("This is running inside the desktop app, and switching quits that app — which\n"
                  "would kill this process mid-swap. Run it from Terminal.")
 
-    if meta.get("app_version") and meta["app_version"] != app_version():
-        print(f"warning: {label!r} was captured under app v{meta['app_version']}, now v{app_version()}.\n"
-              f"         If the app has migrated its stores since, this may land on a login screen.")
+    cur_ver = app_version()
+    if meta.get("app_version") and cur_ver and meta["app_version"] != cur_ver:
+        # stderr, not stdout: wrappers keep stdout for results, and this warning is the one
+        # line that predicts a switch landing on a login screen. Both versions must be
+        # readable: with either unknown there is no basis to warn, and the doctor/bar
+        # surfaces (which share this predicate) stay silent on unknown too.
+        print(f"warning: {label!r} was captured under app v{meta['app_version']}, now v{cur_ver}.\n"
+              f"         If the app has migrated its stores since, this may land on a login screen.",
+              file=sys.stderr)
 
     with Lock():
         print("· quitting Claude.app…")
@@ -415,6 +424,8 @@ def cmd_switch(label, dry_run=False):
                 "label": cur_label, "captured_at": time.time(), "app_version": app_version(),
                 "files": manifest(PROFILE)})
             print(f"  refreshed the stash for {cur_label!r} before replacing it")
+        else:
+            _refresh_dead_stash(label)
 
         op_id = time.strftime("%Y%m%d-%H%M%S")
         rb = os.path.join(ROLLBACK, op_id)
@@ -437,6 +448,42 @@ def cmd_switch(label, dry_run=False):
     launch_app()
     print(f"\nswitched the desktop app to {label!r}.")
     print("If it opens on a login screen, run:  desktop-switch.py undo\n")
+
+def _refresh_dead_stash(target):
+    """Replace the displaced account's stash with the live profile when its capture predates
+    the installed app version.
+
+    A pre-update capture cannot work as captured (installing it lands on a login screen),
+    while the profile being displaced holds whatever session has actually been working under
+    the new version. The byte-exact guard above is deliberately not required here: it protects
+    known-good captures from drifted profiles, and this capture is known-dead — the worst a
+    drifted profile can do is mislabel the stash (the ACTIVE record is a record, not a
+    reading, so a hand sign-in as another account would be stashed under this label; `rename`
+    fixes that). The displaced bytes go aside rather than being deleted, so even that case
+    loses nothing. If the profile is itself a signed-out login screen (the user never logged
+    in after a failed switch), its bytes are stashed and the version warning clears — the
+    stash is no worse than before, and the aside copy keeps the history.
+    """
+    claimed = (read_json(ACTIVE) or {}).get("label")
+    if not claimed or claimed == target or claimed not in list_stashes():
+        return
+    m = stash_meta(claimed) or {}
+    cur_ver = app_version()
+    if not (m.get("app_version") and cur_ver and m["app_version"] != cur_ver):
+        return
+    files = manifest(PROFILE)
+    if not files:
+        return
+    aside = os.path.join(ASIDES, time.strftime("%Y%m%d-%H%M%S") + "-" + claimed)
+    os.makedirs(ASIDES, mode=0o700, exist_ok=True)
+    os.rename(stash_dir(claimed), aside)
+    os.makedirs(stash_dir(claimed), mode=0o700, exist_ok=True)
+    copy_identity(PROFILE, os.path.join(stash_dir(claimed), "files"))
+    write_json(os.path.join(stash_dir(claimed), "manifest.json"), {
+        "label": claimed, "captured_at": time.time(), "app_version": cur_ver,
+        "files": files})
+    print(f"  refreshed the stash for {claimed!r} from the live profile; its capture predated "
+          f"app v{cur_ver} (old copy kept aside)")
 
 def _apply(op_id, staging, rb, label):
     """Move the staged identity items into place, recording each move before making it."""
