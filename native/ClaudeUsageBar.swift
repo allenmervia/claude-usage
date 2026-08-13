@@ -287,10 +287,16 @@ final class Model: ObservableObject {
     }
 
     private var ticker: Task<Void, Never>?
+    private var watcher: Task<Void, Never>?
 
     init() {
         let stored = UserDefaults.standard.integer(forKey: "intervalMinutes")
         intervalMinutes = stored == 0 ? 5 : stored
+    }
+
+    deinit {
+        ticker?.cancel()
+        watcher?.cancel()
     }
 
     // Live polling is opt-in so the snapshot tool can render a fixture payload without this
@@ -298,8 +304,49 @@ final class Model: ObservableObject {
     static func live() -> Model {
         let m = Model()
         m.startTimer()
+        m.startWatcher()
         Task { await m.refresh() }
         return m
+    }
+
+    // A switch made outside this app — the CLI, the desktop-switch tool, another session's
+    // auto-switch — would otherwise leave the gauges wearing the displaced account's numbers
+    // until the next timer tick. Every switch stamps one of these two backend state files, so
+    // polling their mtimes bounds that lag at seconds. (A re-login through `claude /login`
+    // writes only the credential store and stamps neither; that path still waits for the timer.)
+    private nonisolated static let switchStamps = ["last-switch.json", "desktop-active.json"].map {
+        NSString(string: "~/.claude-usage/" + $0).expandingTildeInPath
+    }
+
+    private nonisolated static func stampDates() -> [Date?] {
+        switchStamps.map {
+            (try? URL(fileURLWithPath: $0)
+                .resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+        }
+    }
+
+    func startWatcher() {
+        watcher?.cancel()
+        // Detached at utility priority: the stat calls must stay off the main thread, and the
+        // cadence must not wake it — only a detected change hops to the actor.
+        watcher = Task.detached(priority: .utility) { [weak self] in
+            var seen = Model.stampDates()
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 10_000_000_000)
+                let now = Model.stampDates()
+                guard now != seen else { continue }
+                guard let self else { return }
+                // A switch driven from this app stamps these files mid-flight; reading the
+                // half-swapped state now could finish after the switch's own forced refresh
+                // and overwrite it. Leave `seen` alone so the stamp is revisited once done.
+                if await self.switching != nil { continue }
+                seen = now
+                // force: an unforced call would be swallowed by the in-flight guard while a
+                // timer refresh — issued before the switch, carrying the displaced account's
+                // rows — is still running, and the stamp is already consumed.
+                await self.refresh(force: true)
+            }
+        }
     }
 
     func startTimer() {
@@ -1038,7 +1085,9 @@ struct SectionHeader: View {
 }
 
 // The pre-update-capture warning, one home for both card types so the copies can't drift:
-// the badge sits in a card header, the notice in a confirm sheet.
+// the badge sits in a card header, the notice in a confirm sheet. The badge skips the row
+// whose account the desktop app is on: that stash can't be switched to, and the next switch
+// away recaptures it from the live session — there is nothing for the user to do or avoid.
 private func mismatchBadge() -> some View {
     Text("app updated since capture")
         .font(.system(size: 10))
@@ -1218,7 +1267,7 @@ struct AccountCard: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
-            if stash?.version_mismatch == true {
+            if stash?.version_mismatch == true, stash?.active != true {
                 mismatchBadge()
             }
             Spacer(minLength: 4)
@@ -1321,7 +1370,7 @@ struct StashCard: View {
             Text(stash.label).font(.system(size: 13, weight: .semibold))
             // Mismatch outranks age: an app update is known to invalidate a capture, age only might.
             if stash.version_mismatch == true {
-                mismatchBadge()
+                if stash.active != true { mismatchBadge() }
             } else if stash.stale == true {
                 Text("may have expired")
                     .font(.system(size: 10))
