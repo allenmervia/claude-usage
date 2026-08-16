@@ -153,7 +153,7 @@ def refresh_token(refresh, host_hint=None):
                        "refresh_token": refresh,
                        "client_id": CLIENT_ID}).encode()
     hosts = ([host_hint] if host_hint else []) + [h for h in TOKEN_HOSTS if h != host_hint]
-    last = None
+    last = denied = None
     for h in hosts:
         try:
             req = urllib.request.Request(h, data=body, method="POST", headers={
@@ -164,13 +164,22 @@ def refresh_token(refresh, host_hint=None):
             with urllib.request.urlopen(req, timeout=25) as r:
                 return json.loads(r.read()), h
         except urllib.error.HTTPError as e:
-            last = f"HTTP {e.code} at {h}"
+            # the response body names the OAuth failure (RFC 6749 §5.2); carry it in the error
+            # string so callers can tell a dead grant from a transient outage
+            try:
+                oauth_err = json.loads(e.read()).get("error")
+            except Exception:
+                oauth_err = None
+            last = f"HTTP {e.code}{f' ({oauth_err})' if oauth_err else ''} at {h}"
+            if oauth_err == "invalid_grant":
+                # terminal for this token everywhere — a later host's 404 must not bury it
+                denied = last
             # 4xx that isn't 404 means the host is right but the grant failed
             if e.code not in (404, 405, 400):
                 raise RuntimeError(last)
         except Exception as e:
             last = f"{type(e).__name__} at {h}"
-    raise RuntimeError(last or "refresh failed")
+    raise RuntimeError(denied or last or "refresh failed")
 
 # ---- credential resolution --------------------------------------------------
 
@@ -203,6 +212,10 @@ def store_secret(uuid, refresh, access=None, expires_at=None, host=None, meta=No
     rec.update({"refreshToken": refresh or rec.get("refreshToken"), "accessToken": access,
                 "expiresAt": expires_at, "tokenHost": host})
     if meta: rec.update({k: v for k, v in meta.items() if v is not None})
+    if rec.get("refreshToken") != prev.get("refreshToken"):
+        # the needs-login latch describes one dead grant; a different refresh token is a new
+        # grant (a real sign-in or a rotation), so the latch must not outlive it
+        rec.pop("needsLogin", None)
     if rec == prev:
         # nothing changed, so skip the write: every write puts the secret in argv where the process
         # table exposes it, and an unchanged re-ingest happens on every refresh tick
@@ -215,12 +228,19 @@ def load_secret(uuid):
     try: return json.loads(raw)
     except Exception: return None      # corrupt value: treat as uncaptured, don't take the tool down
 
+NEEDS_LOGIN = "signed out by the server — sign into it once and re-run"
+
 def token_for_parked(uuid, force=False):
     """Valid access token for a parked account, refreshing + rotating if needed.
     force=True skips the cached access token (used to recover from a 401 on a token that
     looked unexpired but was invalidated server-side)."""
     sec = load_secret(uuid)
     if not sec: return None, "not captured — sign into it once and re-run"
+    if sec.get("needsLogin"):
+        # the stored grant is known dead (see below); only a fresh sign-in can revive the
+        # account, so don't spend a network call finding that out again — force included,
+        # since a retry with the same dead token can never come back different
+        return None, NEEDS_LOGIN
     now_ms = time.time() * 1000
     if not force and sec.get("accessToken") and (sec.get("expiresAt") or 0) > now_ms + 60_000:
         return sec["accessToken"], None
@@ -229,6 +249,14 @@ def token_for_parked(uuid, force=False):
     try:
         data, host = refresh_token(sec["refreshToken"], sec.get("tokenHost"))
     except Exception as e:
+        if "invalid_grant" in str(e):
+            # the server revoked this grant, so retrying it every tick can never succeed:
+            # latch the account into needs-login until a real sign-in stores a new refresh
+            # token (store_secret drops the latch when the token changes). Transient
+            # failures (network, 5xx, 429) stay below and keep retrying.
+            store_secret(uuid, sec["refreshToken"], None, None, sec.get("tokenHost"),
+                         meta={"needsLogin": True})
+            return None, NEEDS_LOGIN
         return None, f"refresh failed ({e}) — sign into it once and re-run"
     access  = data["access_token"]
     newref  = data.get("refresh_token", sec["refreshToken"])
@@ -569,6 +597,10 @@ def _collect_live(ingest=True):
                         scoped.append({"model": m, "pct": lim.get("percent"),
                                        "resets_at": lim.get("resets_at")})
                 row["scoped"] = scoped
+        if row.get("error") == NEEDS_LOGIN:
+            # a state, not a failure: consumers (doctor, the bar) render "sign in again"
+            # instead of a retrying-refresh error
+            row["needs_login"] = True
         rows.append(row)
     if anchors_moved and ingest:   # ingest=False is diagnostic: report the state, don't advance it
         save_index(idx)
@@ -2273,7 +2305,10 @@ def cmd_doctor():
         say("warn", "no accounts registered yet",
             "sign into each account once with `claude` → /login.")
     for r in sort_rows(claude_rows):
-        if r.get("error"):
+        if r.get("needs_login"):
+            say("bad", f"{r['email']}: signed out by the server — its refresh token was revoked",
+                "sign into it once with `claude` → /login; refresh attempts are paused until then.")
+        elif r.get("error"):
             say("bad", f"{r['email']}: {r['error']}")
         elif r.get("active"):
             say("ok", f"{r['email']}: usage reads OK (active)")
