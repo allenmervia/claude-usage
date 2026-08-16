@@ -130,6 +130,7 @@ claude-usage capture    register the active account now (same as any run)
 claude-usage list       list registered accounts, Claude and Codex
 claude-usage switch X   switch the CLI to that account (see below)
 claude-usage switch --undo   put the previous account back
+claude-usage relogin X  sign an account back in after the server signed it out (see below)
 claude-usage autoswitch on   switch automatically when the active account hits a limit (see below)
 claude-usage forget X   drop an account by email, label or id (and delete its stored credential)
 ```
@@ -171,6 +172,34 @@ Two things to know:
 - **This command switches the CLI account.** The desktop app has its own session and
   its own command; see [Switching the desktop app](#switching-the-desktop-app). In the
   menu bar the two move together, so one click is usually all you need.
+
+## Signing an account back in
+
+A parked account's stored refresh token can be revoked server-side. Once that happens
+nothing local can revive it: only a real OAuth sign-in mints a replacement. The account
+shows as **signed out by the server**, refresh attempts stop rather than retry a dead
+token every tick, and its usage stays blank until it signs in again.
+
+```bash
+claude-usage relogin allen-1@example.com
+```
+
+That opens a Terminal window running the CLI's sign-in with the address filled in, and
+does everything around it: it waits for the credential to land, captures it (which is
+what clears the signed-out state), and puts the CLI back on whichever account it was on
+before. In the menu bar the same recovery is the **Sign in** button on the account's card.
+
+Two details it handles that a hand-run sign-in doesn't:
+
+- The desktop app injects its own host auth into every process it launches, and a
+  `claude` that authenticates that way never writes the Keychain item this tool reads —
+  the sign-in reports success and the account stays signed out. The window this opens
+  has that environment stripped.
+- Signing in *replaces* the CLI's account. Being left on a different account than you
+  started on is the second half of the surprise, so the CLI is handed back automatically.
+
+If you sign in as a different account than the one being recovered, that account is
+still captured — but the command says so and reports the target as still signed out.
 
 ## Auto-switch on limit hit
 
@@ -482,7 +511,7 @@ credential, including the pre-switch backup, lives in the Keychain.**
 - **macOS only.** It shells out to the macOS `security` tool for Keychain access.
 - **Undocumented endpoints.** It uses the same private OAuth endpoints Claude Code
   uses for its own `/usage` view. Anthropic may change them; if a parked account
-  stops refreshing, sign into it once and re-run.
+  stops refreshing, [sign it back in](#signing-an-account-back-in).
 - **Refresh-token rotation.** If a provider rotates refresh tokens on every use, a
   parked account's stored token can go stale between the last time it was active and
   now. Frequent menu-bar polling keeps the stored copy fresh; if a parked read

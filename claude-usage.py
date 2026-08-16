@@ -46,9 +46,10 @@ Usage:
   claude-usage list       list registered accounts
   claude-usage switch X   point the CLI at account X (email / label / uuid; Claude or Codex)
   claude-usage switch --undo   restore the account that was active before the last switch
+  claude-usage relogin X  sign account X back in after the server signed it out
   claude-usage forget X   drop account by email or uuid
 """
-import sys, os, re, json, glob, time, getpass, subprocess, shutil, urllib.request, urllib.error
+import sys, os, re, json, glob, time, getpass, shlex, subprocess, shutil, urllib.request, urllib.error
 from datetime import datetime, timezone, timedelta
 
 CLIENT_ID   = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
@@ -241,7 +242,10 @@ def load_secret(uuid):
     try: return json.loads(raw)
     except Exception: return None      # corrupt value: treat as uncaptured, don't take the tool down
 
-NEEDS_LOGIN = "signed out by the server — sign into it once and re-run"
+# The state only. Each surface names the remedy in the terms it can offer — a button in the
+# menu bar, a command in the table and in doctor — and a remedy baked in here would be wrong
+# wherever it isn't the one within reach.
+NEEDS_LOGIN = "signed out by the server"
 
 def token_for_parked(uuid, force=False):
     """Valid access token for a parked account, refreshing + rotating if needed.
@@ -276,7 +280,10 @@ def token_for_parked(uuid, force=False):
                             meta={"needsLogin": True}):
             # unlatched, so the next tick re-checks; the distinct string keeps the row
             # from claiming the paused state doctor describes for a persisted latch
-            return None, NEEDS_LOGIN + " (couldn't save that to the Keychain — unlock it)"
+            # the remedy has to ride along here: this string deliberately never matches
+            # NEEDS_LOGIN, so no surface adds the sign-in step to it
+            return None, (NEEDS_LOGIN + " — unlock the Keychain, then sign it back in "
+                          "with `claude-usage relogin`")
         return None, NEEDS_LOGIN
     except Exception as e:
         return None, f"refresh failed ({e}) — sign into it once and re-run"
@@ -1371,6 +1378,15 @@ def render_table(rows):
             for r in grp: _table_claude_row(r, w)
     if any(r.get("stale") for r in rows if is_claude(r)):
         print(f"{C['y']}⚠ Showing last known values — the usage API rate-limited this refresh.{C['x']}\n")
+    latched = [r for r in rows if is_claude(r) and r.get("needs_login")]
+    if latched:
+        # the row states the condition; here is the only place in this surface that can carry
+        # what ends it, and without it a signed-out row reads as something to wait out
+        who = latched[0]["email"] if len(latched) == 1 else "<account>"
+        subject = (f"{latched[0]['email']} is" if len(latched) == 1
+                   else f"{len(latched)} accounts are")
+        print(f"{C['y']}⚠ {subject} signed out and no longer refreshing. "
+              f"Sign back in with `claude-usage relogin {who}`.{C['x']}\n")
     line = None if mock_enabled() else last_auto_line()   # a real switch under invented data
     if line:                                              # would read as part of the fiction
         print(f"{C['dim']}{line}{C['x']}\n")
@@ -1931,6 +1947,153 @@ def _switch_claude(e):
 
     return True, f"switched to {e['email']}", note
 
+# ---- signing an account back in ----------------------------------------------
+# An account the server signed out can only come back through a real OAuth sign-in, and that
+# has to happen in the claude CLI. Everything around that one interactive step is mechanical:
+# spot the credential it writes, capture it, and put the CLI back on the account it was on.
+# Doing all of it here is what keeps recovery a single action from any surface.
+
+LOGIN_WAIT_S = 300      # a browser round trip; past this the sign-in was abandoned
+LOGIN_POLL_S = 3
+LOGIN_SCRIPT = os.path.join(STATE_DIR, "relogin.command")
+# The sign-in's exit status, written by the script itself. A wait that only ever ended on a
+# new credential or a five-minute timeout would hold the app's controls for the whole window
+# after a sign-in the user had already given up on.
+LOGIN_STATUS = os.path.join(STATE_DIR, "relogin.status")
+
+# The desktop app injects its own host auth into every process it launches, and a `claude`
+# that authenticates that way never writes the Keychain item this tool reads — the sign-in
+# would report success and leave the account just as signed out. Launch it without them.
+HOST_AUTH_ENV = ("CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH", "ANTHROPIC_BASE_URL")
+
+def _launch_login(email):
+    """Open a Terminal window running the CLI's sign-in for `email`. Returns (ok, message).
+
+    A window of the user's own is the only place this can go: the flow is interactive, it
+    prints a URL, and it may ask for a browser. Passing --email means the account being
+    recovered is the one already filled in on the login page.
+    """
+    unset = " ".join(f"-u {v}" for v in HOST_AUTH_ENV)
+    # Every interpolation is quoted: an address reaches here from the accounts API, and this
+    # file is executed as a shell script.
+    script = f"""#!/bin/sh
+# Written by claude-usage for a one-off sign-in. Safe to delete.
+echo {shlex.quote(f"Signing {email} back in for claude-usage.")}
+echo
+env {unset} claude auth login --email {shlex.quote(email)}
+status=$?
+echo "$status" > {shlex.quote(LOGIN_STATUS)}
+echo
+if [ "$status" -eq 0 ]; then
+  echo "Signed in. The menu bar takes it from here; you can close this window."
+else
+  echo "Sign-in did not finish. Close this window and start it again from the menu bar."
+fi
+"""
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        # an earlier run's status would read as this one finishing the moment it starts
+        if os.path.exists(LOGIN_STATUS):
+            os.remove(LOGIN_STATUS)
+        with open(LOGIN_SCRIPT, "w") as f:
+            f.write(script)
+        os.chmod(LOGIN_SCRIPT, 0o700)
+    except Exception as ex:
+        return False, f"couldn't write the sign-in script ({ex})"
+    try:
+        subprocess.run(["open", "-a", "Terminal", LOGIN_SCRIPT],
+                       check=True, capture_output=True, timeout=20)
+    except Exception as ex:
+        return False, f"couldn't open a Terminal window to sign in ({ex})"
+    return True, ""
+
+def _login_gave_up():
+    """Whether the sign-in has already finished without succeeding. A zero status is not an
+    answer: the credential is written before the CLI exits, but identifying it can need a
+    retry or two, so a clean exit keeps the wait running."""
+    try:
+        with open(LOGIN_STATUS) as f:
+            return int(f.read().strip()) != 0
+    except Exception:
+        return False        # not written yet, or unreadable: still in progress as far as we know
+
+def await_new_live(before, deadline=None):
+    """Wait for the CLI to write a credential that isn't `before`, and say whose it is.
+
+    Identity comes from /profile rather than a stored-token match: a fresh sign-in mints a
+    token this tool has never seen, which is the whole point of waiting for it. None means
+    nothing landed — either the sign-in failed or it never finished.
+    """
+    if deadline is None:
+        deadline = time.time() + LOGIN_WAIT_S
+    while time.time() < deadline:
+        time.sleep(LOGIN_POLL_S)
+        live = read_live()
+        if not live or not live.get("accessToken") or live.get("refreshToken") == before:
+            if _login_gave_up():
+                return None
+            continue
+        try:
+            uuid = api_get(PROFILE_URL, live["accessToken"]).get("account", {}).get("uuid")
+        except Exception:
+            continue        # a half-written blob, or a token the API hasn't caught up with
+        if uuid:
+            return uuid
+    return None
+
+def _hand_cli_back(prev, now_uuid, now_email):
+    """Return the CLI to the account it was on before the sign-in displaced it. Returns a
+    sentence to append to the outcome: a recovery that leaves the CLI somewhere other than
+    where it started is a second surprise, and one discovered later."""
+    if not prev:
+        # nothing identified what this displaced, so there is nowhere to hand it back to
+        return f" The CLI is now on {now_email}."
+    if prev["uuid"] == now_uuid:
+        return ""
+    ok, msg, note = _switch_claude(prev)
+    if not ok:
+        return f" The CLI is now on the account you signed in; couldn't move it back ({msg})."
+    record_last_switch("claude")            # a deliberate move: the auto-switch holdoff covers it
+    clear_cache()                           # the credential moved last, so the clear comes last
+    return f" CLI is back on {prev['email']}." + (note if note else "")
+
+def cmd_relogin(target):
+    provider, e, note = resolve_target(target)
+    if not e:
+        _fail(note)
+    if provider == "codex":
+        _fail("relogin is for Claude accounts; sign Codex in with `codex login`")
+    if note:
+        print(note, file=sys.stderr)
+    prev_uuid = active_uuid_only()
+    prev = next((x for x in load_index() if x["uuid"] == prev_uuid), None)
+    before = (read_live() or {}).get("refreshToken")
+
+    ok, msg = _launch_login(e["email"])
+    if not ok:
+        _fail(msg)
+    print(f"signing {e['email']} in — finish it in the Terminal window that just opened",
+          flush=True)
+
+    uuid = await_new_live(before)
+    if not uuid:
+        why = ("the sign-in didn't complete" if _login_gave_up()
+               else f"no sign-in landed within {LOGIN_WAIT_S // 60} minutes")
+        _fail(f"{why}, so {e['email']} is still signed out")
+    ingest_live(load_index())               # store the new token; that is what drops the latch
+    clear_cache()
+    if uuid != e["uuid"]:
+        who = next((x["email"] for x in load_index() if x["uuid"] == uuid), uuid)
+        _fail(f"that signed in {who}, not {e['email']}, so {e['email']} is still signed out."
+              + _hand_cli_back(prev, uuid, who))
+    if (load_secret(e["uuid"]) or {}).get("needsLogin"):
+        # ingest_live declined the capture (a team context over a personal entry) or the
+        # Keychain write failed — either way the account is still parked on a dead grant
+        _fail(f"{e['email']} signed in, but its credentials couldn't be captured, "
+              f"so it still reads as signed out. Run `claude-usage doctor` for the state."
+              + _hand_cli_back(prev, uuid, e["email"]))
+    print(f"{e['email']} is signed in again." + _hand_cli_back(prev, uuid, e["email"]))
+
 # ---- auto-switch on limit hit ------------------------------------------------
 # Opt-in: when the ACTIVE account's 5-hour or weekly window is spent, move the CLI credential to
 # the best parked account so new work continues. The check rides the normal refresh (every surface
@@ -2163,7 +2326,8 @@ def maybe_auto_switch(rows):
             # to name the actual remedy or it points the user at the wrong wait
             n = len(latched)
             who = "1 parked account needs" if n == 1 else f"{n} parked accounts need"
-            body = f"No account has room. {who} a fresh sign-in with the claude CLI. {when}"
+            body = (f"No account has room. {who} a fresh sign-in. "
+                    f"Use Sign in on its card in the menu bar. {when}")
         else:
             body = f"Every account is at its limit. {when}"
         _notify_hourly("last_stranded_notify", "claude-usage", body)
@@ -2347,8 +2511,9 @@ def cmd_doctor():
         if r.get("needs_login"):
             # the row's error is the one canonical wording; doctor only adds the remedy
             say("bad", f"{r['email']}: {r['error']}",
-                "its refresh token was revoked server-side; sign into it once with "
-                "`claude` → /login — refresh attempts are paused until then.")
+                "its refresh token was revoked server-side and nothing retries until it signs "
+                f"in again — `claude-usage relogin {r['email']}`, or Sign in on its card in "
+                "the menu bar, does the whole recovery.")
         elif r.get("error"):
             say("bad", f"{r['email']}: {r['error']}")
         elif r.get("active"):
@@ -2848,6 +3013,8 @@ def main():
         cmd_doctor(); return
     if arg == "switch":
         cmd_switch(sys.argv[2] if len(sys.argv) > 2 else ""); return
+    if arg == "relogin":
+        cmd_relogin(sys.argv[2] if len(sys.argv) > 2 else ""); return
     if arg == "mock":
         cmd_mock(sys.argv[2] if len(sys.argv) > 2 else ""); return
     if arg == "autoswitch":

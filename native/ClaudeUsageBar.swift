@@ -64,10 +64,15 @@ struct Account: Decodable, Identifiable {
     var email: String?
     var active: Bool?
     var error: String?
+    // The server revoked this account's grant. Apart in its own field because it is a state
+    // with one remedy, not a read that failed: nothing retries and nothing here can clear it,
+    // so the card owes the user the sign-in rather than another error to wait out.
+    var needs_login: Bool?
     var stale: Bool?
     var display: Display?
     var id: String { uuid }
     var isCodex: Bool { provider == "codex" }
+    var needsLogin: Bool { needs_login == true }
 }
 
 struct Display: Decodable {
@@ -433,6 +438,26 @@ final class Model: ObservableObject {
         actionError = errs.isEmpty ? nil : errs.joined(separator: " · ")
         await refresh(force: true)
     }
+
+    /// Bring back an account the server signed out. The one interactive step happens in a
+    /// Terminal window the backend opens; this call stays in flight for as long as the user
+    /// takes over there, and returns once the account is captured and the CLI is back on
+    /// whichever account it started on. It occupies `switching` throughout, so nothing else
+    /// moves a credential while a sign-in is mid-flight.
+    func signIn(_ account: Account) async {
+        guard switching == nil else { return }
+        switching = Model.loginKey(account.uuid)
+        defer { switching = nil }
+        actionError = nil
+        do {
+            _ = try await Backend.run(["relogin", account.uuid])
+        } catch {
+            actionError = error.localizedDescription
+        }
+        await refresh(force: true)
+    }
+
+    static func loginKey(_ uuid: String) -> String { "login:" + uuid }
 
     func switchDesktop(_ label: String) async {
         guard switching == nil else { return }
@@ -1127,6 +1152,9 @@ struct AccountCard: View {
     private var desktopSwitchable: Bool {
         stash?.can_switch == true && model.desktop?.needs_repair != true
     }
+    private var signingIn: Bool { model.switching == Model.loginKey(account.uuid) }
+    /// This card has something in flight — a switch or a sign-in — and owns the spinner slot.
+    private var busy: Bool { model.switching == account.uuid || signingIn }
 
     // A switchable card is one control, the way a table row or menu row is: click anywhere on it
     // and this account becomes the one you are on — CLI and desktop app together, because being
@@ -1137,6 +1165,12 @@ struct AccountCard: View {
         Group {
             if confirming {
                 confirmCard
+            } else if account.needsLogin {
+                // Not a control. A signed-out account has one remedy and it isn't a switch, so
+                // the card states it and puts the buttons in reach instead of behaving like a
+                // row you can click into — a whole-card click here could only reach the desktop
+                // stash, which does nothing about being signed out and reports success anyway.
+                card
             } else if cliSwitchable || desktopSwitchable {
                 Button {
                     // A pre-update stash confirms even with the app closed: the swap costs
@@ -1216,7 +1250,9 @@ struct AccountCard: View {
     private var card: some View {
         VStack(alignment: .leading, spacing: 5) {
             header
-            if let err = account.error {
+            if account.needsLogin {
+                signedOutBody
+            } else if let err = account.error {
                 Text(err).font(.system(size: 11)).foregroundStyle(sevColor(95))
             } else {
                 TimelineView(.periodic(from: .now, by: 60)) { ctx in
@@ -1243,6 +1279,49 @@ struct AccountCard: View {
         .onHover { hovered = $0 }
     }
 
+    /// What a signed-out account shows in place of its gauges: what happened, what fixes it,
+    /// and the button that does the fixing. The desktop swap stays reachable but named, so it
+    /// can't be mistaken for the remedy the way an unlabelled whole-card click was.
+    private var signedOutBody: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(account.error ?? "signed out by the server")
+                .font(.system(size: 11))
+                .foregroundStyle(sevColor(95))
+                .fixedSize(horizontal: false, vertical: true)
+            if signingIn {
+                Text("Finish the sign-in in the Terminal window. This card updates when it lands, and the CLI goes back to the account it was on.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if !confirming {
+                // While a confirmation is open the sheet below carries the buttons; a second
+                // pair here would ask the same question twice.
+                HStack(spacing: 8) {
+                    // No .defaultAction: several accounts are usually signed out at once, and
+                    // shortcuts don't nest — Return would fire whichever card SwiftUI resolved
+                    // it to, signing in an account nobody picked.
+                    Button("Sign in") { Task { await model.signIn(account) } }
+                        .controlSize(.small)
+                        .buttonStyle(.borderedProminent)
+                    if let st = stash, desktopSwitchable {
+                        Button("Move desktop here") {
+                            // The same warnings a whole-card swap gets: this click can still
+                            // quit an app with live sessions in it.
+                            if model.desktop?.needs_confirm == true || st.version_mismatch == true {
+                                model.confirmTarget = account.uuid
+                            } else {
+                                Task { await model.switchDesktop(st.label) }
+                            }
+                        }
+                        .controlSize(.small)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .disabled(model.switching != nil)
+            }
+        }
+    }
+
     private var header: some View {
         HStack(alignment: .firstTextBaseline, spacing: 6) {
             // One reserved leading slot for all rows keeps every name on the same left edge and
@@ -1250,13 +1329,13 @@ struct AccountCard: View {
             // carried by the lit card, not by anything here. The slot is always one Text in one
             // font — a baseline-less placeholder would flip the row's alignment mode on hover and
             // shift every glyph beside it.
-            Text(hovered && (cliSwitchable || desktopSwitchable) ? "⇄" : "")
+            Text(hovered && !account.needsLogin && (cliSwitchable || desktopSwitchable) ? "⇄" : "")
                 .font(.system(size: 10, weight: .semibold))
                 .foregroundStyle(Color.accentColor)
-                .opacity(model.switching == account.uuid ? 0 : 1)
+                .opacity(busy ? 0 : 1)
                 .frame(width: 13, alignment: .leading)
                 .overlay(alignment: .leading) {
-                    if model.switching == account.uuid { ProgressView().controlSize(.mini) }
+                    if busy { ProgressView().controlSize(.mini) }
                 }
             Text(account.label ?? account.uuid)
                 .font(.system(size: 13, weight: .semibold))
