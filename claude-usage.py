@@ -2854,6 +2854,26 @@ def main():
         cmd_autoswitch(sys.argv[2:]); return
     if arg == "desktop-switch":
         cmd_desktop_switch(sys.argv[2] if len(sys.argv) > 2 else ""); return
+    if arg == "creds-debug":
+        # Non-secret metadata about each stored credential, for debugging refresh failures.
+        # One formatter for every row so the live and stored credentials stay grep-comparable,
+        # and _secret_gap for completeness so this can never disagree with what switch accepts.
+        def show(label, sec, live_ref):
+            ts = sec.get("expiresAt")
+            gap = _secret_gap(sec)
+            print(f"{label:<22} refreshToken={'yes' if sec.get('refreshToken') else 'no'}"
+                  f" needsLogin={bool(sec.get('needsLogin'))}"
+                  f" same-as-live={bool(sec.get('refreshToken') and sec.get('refreshToken') == live_ref)}"
+                  f" tokenHost={sec.get('tokenHost')}"
+                  f" accessExpiresAt={datetime.fromtimestamp(ts / 1000, timezone.utc).isoformat() if ts else None}"
+                  + (f"  [{gap}]" if gap else ""))
+        live = read_live() or {}
+        live_ref = live.get("refreshToken")
+        if live:
+            show("live", live, live_ref)
+        for e in load_index():
+            show(e["email"], load_secret(e["uuid"]) or {}, live_ref)
+        return
     if arg == "capture":
         idx = load_index(); u = ingest_live(idx)
         if u:
