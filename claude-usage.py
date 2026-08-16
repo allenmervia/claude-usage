@@ -147,13 +147,20 @@ def api_get(url, token):
     with urllib.request.urlopen(req, timeout=25) as r:
         return json.loads(r.read())
 
+class GrantRevoked(RuntimeError):
+    """The token endpoint rejected the refresh token itself (OAuth invalid_grant): revoked or
+    expired server-side. Terminal — only a new sign-in can mint a replacement, so callers
+    must not retry the same token."""
+
 def refresh_token(refresh, host_hint=None):
-    """Exchange a refresh token for a new access token. Returns (data, host)."""
+    """Exchange a refresh token for a new access token. Returns (data, host).
+    Raises GrantRevoked when the server says the token is dead; any other exception is
+    transient (wrong host, outage, network) and worth retrying later."""
     body = json.dumps({"grant_type": "refresh_token",
                        "refresh_token": refresh,
                        "client_id": CLIENT_ID}).encode()
     hosts = ([host_hint] if host_hint else []) + [h for h in TOKEN_HOSTS if h != host_hint]
-    last = denied = None
+    last = None
     for h in hosts:
         try:
             req = urllib.request.Request(h, data=body, method="POST", headers={
@@ -164,22 +171,28 @@ def refresh_token(refresh, host_hint=None):
             with urllib.request.urlopen(req, timeout=25) as r:
                 return json.loads(r.read()), h
         except urllib.error.HTTPError as e:
-            # the response body names the OAuth failure (RFC 6749 §5.2); carry it in the error
-            # string so callers can tell a dead grant from a transient outage
-            try:
-                oauth_err = json.loads(e.read()).get("error")
-            except Exception:
-                oauth_err = None
+            # Only a 400 carries an OAuth error code (RFC 6749 §5.2). Bodies on other
+            # statuses can come from proxies and gateways and must not be read as a
+            # verdict on the grant.
+            oauth_err = None
+            if e.code == 400:
+                try:
+                    oauth_err = json.loads(e.read()).get("error")
+                    if isinstance(oauth_err, dict):        # nested {"error": {"type": ...}}
+                        oauth_err = oauth_err.get("type")
+                except Exception:
+                    pass
             last = f"HTTP {e.code}{f' ({oauth_err})' if oauth_err else ''} at {h}"
             if oauth_err == "invalid_grant":
-                # terminal for this token everywhere — a later host's 404 must not bury it
-                denied = last
+                # the grant itself is dead: every host fronts the same OAuth service, so no
+                # later host can answer differently — and none may bury this verdict
+                raise GrantRevoked(last)
             # 4xx that isn't 404 means the host is right but the grant failed
             if e.code not in (404, 405, 400):
                 raise RuntimeError(last)
         except Exception as e:
             last = f"{type(e).__name__} at {h}"
-    raise RuntimeError(denied or last or "refresh failed")
+    raise RuntimeError(last or "refresh failed")
 
 # ---- credential resolution --------------------------------------------------
 
@@ -248,15 +261,24 @@ def token_for_parked(uuid, force=False):
         return None, "no refresh token — sign into it once and re-run"
     try:
         data, host = refresh_token(sec["refreshToken"], sec.get("tokenHost"))
+    except GrantRevoked:
+        # The server revoked this grant, so retrying it every tick can never succeed: latch
+        # the account into needs-login until a real sign-in stores a new refresh token
+        # (store_secret drops the latch when the token changes). Transient failures take
+        # the branch below and keep retrying.
+        cur = load_secret(uuid)
+        if not cur or cur.get("refreshToken") != sec["refreshToken"]:
+            # a concurrent refresh rotated the token while this one was in flight: the
+            # account lives on under its new token, and a write here would clobber it
+            # with the dead one
+            return None, "refresh lost a race with a concurrent rotation — re-run"
+        if not store_secret(uuid, sec["refreshToken"], None, None, sec.get("tokenHost"),
+                            meta={"needsLogin": True}):
+            # unlatched, so the next tick re-checks; the distinct string keeps the row
+            # from claiming the paused state doctor describes for a persisted latch
+            return None, NEEDS_LOGIN + " (couldn't save that to the Keychain — unlock it)"
+        return None, NEEDS_LOGIN
     except Exception as e:
-        if "invalid_grant" in str(e):
-            # the server revoked this grant, so retrying it every tick can never succeed:
-            # latch the account into needs-login until a real sign-in stores a new refresh
-            # token (store_secret drops the latch when the token changes). Transient
-            # failures (network, 5xx, 429) stay below and keep retrying.
-            store_secret(uuid, sec["refreshToken"], None, None, sec.get("tokenHost"),
-                         meta={"needsLogin": True})
-            return None, NEEDS_LOGIN
         return None, f"refresh failed ({e}) — sign into it once and re-run"
     access  = data["access_token"]
     newref  = data.get("refresh_token", sec["refreshToken"])
@@ -537,7 +559,12 @@ def collect(ingest=True, act=None):
     # (never an error) must not mask a Claude 429 storm and clobber the last-known Claude values.
     claude = [r for r in rows if r.get("provider", "claude") == "claude"]
     codex  = [r for r in rows if r.get("provider") == "codex"]
-    if not claude or any(not r.get("error") for r in claude):  # got fresh Claude data (or none to fetch)
+    # A latched needs-login row is a definitive answer, not a failed read: when the only
+    # "errors" are latches, the fallback below would hide the sign-in state behind cached
+    # pre-revocation numbers forever, since the cache only refreshes on a fresh save.
+    fresh_ok    = any(not r.get("error") for r in claude)
+    all_latched = all(r.get("needs_login") for r in claude if r.get("error"))
+    if not claude or fresh_ok or all_latched:                 # got fresh Claude data (or none to fetch)
         save_cache(rows, now)
         append_history(rows, now)
         if act:
@@ -563,7 +590,11 @@ def _collect_live(ingest=True):
     for e in idx:
         uuid = e["uuid"]
         if uuid == active_uuid and live:
-            token, err = live["accessToken"], None
+            # .get: a live blob can carry only a refreshToken (mid-write file, partial
+            # blob) and still be identified via match_live_uuid — that must degrade to an
+            # error row, not a KeyError that kills the whole render
+            token = live.get("accessToken")
+            err = None if token else "live credential has no access token — run `claude` once"
         else:
             token, err = token_for_parked(uuid)
         row = {"provider": "claude", "uuid": uuid, "email": e["email"], "label": e["label"],
@@ -598,8 +629,8 @@ def _collect_live(ingest=True):
                                        "resets_at": lim.get("resets_at")})
                 row["scoped"] = scoped
         if row.get("error") == NEEDS_LOGIN:
-            # a state, not a failure: consumers (doctor, the bar) render "sign in again"
-            # instead of a retrying-refresh error
+            # a state, not a failure: doctor and --json consumers key on this to render a
+            # sign-in prompt instead of a retrying refresh error
             row["needs_login"] = True
         rows.append(row)
     if anchors_moved and ingest:   # ingest=False is diagnostic: report the state, don't advance it
@@ -2126,8 +2157,16 @@ def maybe_auto_switch(rows):
         when = (f"Earliest reset {local_short(datetime.fromtimestamp(payload, timezone.utc))}."
                 if payload else "Reset times unknown.")  # unknown must still notify — silence
                                                          # here reads as "everything is fine"
-        _notify_hourly("last_stranded_notify", "claude-usage",
-                       f"Every account is at its limit. {when}")
+        latched = [r for r in rows if is_claude(r) and r.get("needs_login")]
+        if latched:
+            # waiting for a reset can't relieve a signed-out account; the notification has
+            # to name the actual remedy or it points the user at the wrong wait
+            n = len(latched)
+            who = "1 parked account needs" if n == 1 else f"{n} parked accounts need"
+            body = f"No account has room. {who} a fresh sign-in with the claude CLI. {when}"
+        else:
+            body = f"Every account is at its limit. {when}"
+        _notify_hourly("last_stranded_notify", "claude-usage", body)
         return rows
     if kind != "switch":
         return rows
@@ -2306,8 +2345,10 @@ def cmd_doctor():
             "sign into each account once with `claude` → /login.")
     for r in sort_rows(claude_rows):
         if r.get("needs_login"):
-            say("bad", f"{r['email']}: signed out by the server — its refresh token was revoked",
-                "sign into it once with `claude` → /login; refresh attempts are paused until then.")
+            # the row's error is the one canonical wording; doctor only adds the remedy
+            say("bad", f"{r['email']}: {r['error']}",
+                "its refresh token was revoked server-side; sign into it once with "
+                "`claude` → /login — refresh attempts are paused until then.")
         elif r.get("error"):
             say("bad", f"{r['email']}: {r['error']}")
         elif r.get("active"):

@@ -4,63 +4,66 @@ revoked (invalid_grant) stops being retried until a real sign-in stores a new to
 
 Run:  python3 -m unittest discover -s tests
 """
-import importlib.util
 import io
 import json
-import os
+import types
 import unittest
 import urllib.error
+import urllib.request
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_spec = importlib.util.spec_from_file_location(
-    "claude_usage_needs_login", os.path.join(_HERE, "..", "claude-usage.py"))
-cu = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(cu)
+from support import Patched, cu, raiser
 
 
 def http_error(code, body=b""):
     return urllib.error.HTTPError("https://h.test", code, "err", {}, io.BytesIO(body))
 
 
-class _Patched(unittest.TestCase):
-    def _patch(self, name, stub):
-        orig = getattr(cu, name)
-        setattr(cu, name, stub)
-        self.addCleanup(setattr, cu, name, orig)
+REVOKED = cu.GrantRevoked("HTTP 400 (invalid_grant) at https://h.test")
 
 
-class TestRefreshTokenErrorParsing(_Patched):
-    def test_invalid_grant_survives_a_later_hosts_404(self):
-        # the grant's home host names the failure; the fallback hosts 404 — the terminal
-        # invalid_grant must be what the caller sees, not the last host's 404
-        calls = []
-        def urlopen(req, timeout=None):
-            calls.append(req.full_url)
-            raise http_error(400, b'{"error":"invalid_grant"}') if len(calls) == 1 \
-                else http_error(404)
-        self._patch("urllib", type("U", (), {
-            "request": type("R", (), {"Request": urllib.request.Request,
-                                      "urlopen": staticmethod(urlopen)}),
-            "error": urllib.error})())
-        with self.assertRaises(RuntimeError) as cm:
+class TestRefreshTokenErrors(Patched):
+    def _patch_urlopen(self, urlopen):
+        self.calls = []
+        def counting(req, timeout=None):
+            self.calls.append(req.full_url)
+            return urlopen(req)
+        self._patch("urllib", types.SimpleNamespace(
+            request=types.SimpleNamespace(Request=urllib.request.Request,
+                                          urlopen=counting),
+            error=urllib.error))
+
+    def test_invalid_grant_raises_grant_revoked_without_trying_more_hosts(self):
+        # the verdict is on the grant, not the host: further POSTs of a dead token are
+        # both wasted and unable to change the answer
+        self._patch_urlopen(raiser(http_error(400, b'{"error":"invalid_grant"}')))
+        with self.assertRaises(cu.GrantRevoked) as cm:
             cu.refresh_token("dead-token", cu.TOKEN_HOSTS[0])
         self.assertIn("invalid_grant", str(cm.exception))
-        self.assertEqual(len(calls), len(cu.TOKEN_HOSTS))
+        self.assertEqual(len(self.calls), 1)
 
-    def test_unparseable_body_still_reports_the_status(self):
-        def urlopen(req, timeout=None):
-            raise http_error(400, b"not json")
-        self._patch("urllib", type("U", (), {
-            "request": type("R", (), {"Request": urllib.request.Request,
-                                      "urlopen": staticmethod(urlopen)}),
-            "error": urllib.error})())
+    def test_nested_error_body_shape_is_recognized(self):
+        self._patch_urlopen(raiser(http_error(400, b'{"error":{"type":"invalid_grant"}}')))
+        with self.assertRaises(cu.GrantRevoked):
+            cu.refresh_token("dead-token", cu.TOKEN_HOSTS[0])
+
+    def test_5xx_body_is_not_a_grant_verdict(self):
+        # a proxy or gateway body must not park the account; only a 400 speaks for OAuth
+        self._patch_urlopen(raiser(http_error(500, b'{"error":"invalid_grant"}')))
         with self.assertRaises(RuntimeError) as cm:
-            cu.refresh_token("t")
-        self.assertIn("HTTP 400", str(cm.exception))
+            cu.refresh_token("t", cu.TOKEN_HOSTS[0])
+        self.assertNotIsInstance(cm.exception, cu.GrantRevoked)
         self.assertNotIn("invalid_grant", str(cm.exception))
 
+    def test_unparseable_400_body_still_reports_the_status(self):
+        self._patch_urlopen(raiser(http_error(400, b"not json")))
+        with self.assertRaises(RuntimeError) as cm:
+            cu.refresh_token("t")
+        self.assertNotIsInstance(cm.exception, cu.GrantRevoked)
+        self.assertIn("HTTP 400", str(cm.exception))
+        self.assertEqual(len(self.calls), len(cu.TOKEN_HOSTS))  # plain 400 still tries them all
 
-class TestTokenForParkedLatch(_Patched):
+
+class TestTokenForParkedLatch(Patched):
     SEC = {"refreshToken": "dead", "tokenHost": "https://h.test", "scopes": ["s"]}
 
     def test_latched_account_is_not_refreshed(self):
@@ -77,22 +80,42 @@ class TestTokenForParkedLatch(_Patched):
         token, err = cu.token_for_parked("u1", force=True)
         self.assertEqual((token, err), (None, cu.NEEDS_LOGIN))
 
-    def test_invalid_grant_sets_the_latch(self):
+    def test_grant_revoked_sets_the_latch(self):
         stored = []
         self._patch("load_secret", lambda u: dict(self.SEC))
-        self._patch("refresh_token", lambda *a, **k: (_ for _ in ()).throw(
-            RuntimeError("HTTP 400 (invalid_grant) at https://h.test")))
+        self._patch("refresh_token", raiser(REVOKED))
         self._patch("store_secret", lambda uuid, refresh, access=None, expires_at=None,
                     host=None, meta=None: stored.append((uuid, refresh, meta)) or True)
         token, err = cu.token_for_parked("u1")
         self.assertEqual((token, err), (None, cu.NEEDS_LOGIN))
         self.assertEqual(stored, [("u1", "dead", {"needsLogin": True})])
 
+    def test_latch_skipped_when_a_concurrent_refresh_rotated_the_token(self):
+        # another process rotated to a live token between our load and the failed refresh;
+        # latching (or writing at all) would clobber the account's only good credential
+        secs = [dict(self.SEC), {**self.SEC, "refreshToken": "fresh"}]
+        self._patch("load_secret", lambda u: dict(secs.pop(0)))
+        self._patch("refresh_token", raiser(REVOKED))
+        self._patch("store_secret", lambda *a, **k: self.fail("wrote over a rotated token"))
+        token, err = cu.token_for_parked("u1")
+        self.assertIsNone(token)
+        self.assertNotEqual(err, cu.NEEDS_LOGIN)
+        self.assertIn("rotation", err)
+
+    def test_failed_latch_write_is_not_reported_as_paused(self):
+        self._patch("load_secret", lambda u: dict(self.SEC))
+        self._patch("refresh_token", raiser(REVOKED))
+        self._patch("store_secret", lambda *a, **k: False)
+        token, err = cu.token_for_parked("u1")
+        self.assertIsNone(token)
+        self.assertNotEqual(err, cu.NEEDS_LOGIN)    # the exact-match row flag must stay off
+        self.assertTrue(err.startswith(cu.NEEDS_LOGIN))
+        self.assertIn("Keychain", err)
+
     def test_transient_failure_keeps_retrying(self):
         stored = []
         self._patch("load_secret", lambda u: dict(self.SEC))
-        self._patch("refresh_token", lambda *a, **k: (_ for _ in ()).throw(
-            RuntimeError("HTTP 500 at https://h.test")))
+        self._patch("refresh_token", raiser(RuntimeError("HTTP 500 at https://h.test")))
         self._patch("store_secret", lambda *a, **k: stored.append(a) or True)
         token, err = cu.token_for_parked("u1")
         self.assertIsNone(token)
@@ -100,7 +123,7 @@ class TestTokenForParkedLatch(_Patched):
         self.assertEqual(stored, [])                # no latch: the next tick tries again
 
 
-class TestStoreSecretClearsLatch(_Patched):
+class TestStoreSecretClearsLatch(Patched):
     def _written(self, prev, *args, **kw):
         out = {}
         self._patch("load_secret", lambda u: dict(prev))
@@ -122,7 +145,7 @@ class TestStoreSecretClearsLatch(_Patched):
         self.assertTrue(rec["needsLogin"])
 
 
-class TestRowFlag(_Patched):
+class TestRowFlag(Patched):
     def setUp(self):
         self._patch("load_index", lambda: [
             {"uuid": "latched", "email": "latched@x.test", "label": "latched"},
@@ -141,6 +164,35 @@ class TestRowFlag(_Patched):
         self.assertEqual(rows["latched"]["error"], cu.NEEDS_LOGIN)
         self.assertNotIn("needs_login", rows["flaky"])
         self.assertIn("refresh failed", rows["flaky"]["error"])
+
+
+class TestCollectFreshness(Patched):
+    """Latched rows are definitive answers: they must not push the render onto stale
+    cached values, which would hide the sign-in state for as long as the latch holds."""
+
+    def setUp(self):
+        self._patch("mock_enabled", lambda: False)
+        self._patch("append_history", lambda rows, ts: None)
+        self._patch("maybe_auto_switch", lambda rows: rows)
+        self.saved = []
+        self._patch("save_cache", lambda rows, ts: self.saved.append(rows))
+        self._patch("load_cache", lambda: {"ts": 0, "rows": [
+            {"provider": "claude", "uuid": "u1", "error": None}]})
+
+    def test_all_latched_rows_render_fresh_not_stale(self):
+        latched = [{"provider": "claude", "uuid": "u1",
+                    "error": cu.NEEDS_LOGIN, "needs_login": True}]
+        self._patch("_collect_live", lambda ingest=True: list(latched))
+        rows = cu.collect()
+        self.assertEqual(rows, latched)
+        self.assertTrue(self.saved)
+
+    def test_all_transient_errors_still_fall_back_to_cache(self):
+        erry = [{"provider": "claude", "uuid": "u1", "error": "refresh failed (x)"}]
+        self._patch("_collect_live", lambda ingest=True: erry)
+        rows = cu.collect()
+        self.assertTrue(rows and all(r.get("stale") for r in rows))
+        self.assertFalse(self.saved)
 
 
 if __name__ == "__main__":

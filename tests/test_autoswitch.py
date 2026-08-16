@@ -3,17 +3,11 @@
 
 Run:  python3 -m unittest discover -s tests
 """
-import importlib.util
 import os
-import sys
 import unittest
 from datetime import datetime, timezone
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_spec = importlib.util.spec_from_file_location(
-    "claude_usage", os.path.join(_HERE, "..", "claude-usage.py"))
-cu = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(cu)
+from support import Patched, cu
 
 NOW = 1_800_000_000.0
 
@@ -207,12 +201,8 @@ class TestUsableAt(unittest.TestCase):
         self.assertIsNone(cu._usable_at(r))
 
 
-class TestMaybeAutoSwitch(unittest.TestCase):
+class TestMaybeAutoSwitch(Patched):
     """The impure shell around the decision core, with every IO seam stubbed."""
-
-    def _patch(self, name, stub):
-        self.addCleanup(setattr, cu, name, getattr(cu, name))
-        setattr(cu, name, stub)
 
     def setUp(self):
         import tempfile
@@ -334,6 +324,16 @@ class TestMaybeAutoSwitch(unittest.TestCase):
         self.assertEqual(len(self.notices), 1)
         self.assertIn("Reset times unknown", self.notices[0][1])
 
+    def test_stranded_names_the_signed_out_accounts(self):
+        # a signed-out refuge is cured by a login, not a reset; the copy must say so
+        self._enable()
+        dead = row("b", error=cu.NEEDS_LOGIN, uuid="best")
+        dead["needs_login"] = True
+        rows = [row("a", fh=100, active=True), dead]
+        cu.maybe_auto_switch(rows)
+        self.assertEqual(len(self.notices), 1)
+        self.assertIn("1 parked account needs a fresh sign-in", self.notices[0][1])
+
     def test_off_toggle_during_refresh_survives_the_record_write(self):
         self._enable()
         def switch_and_disable(e):
@@ -346,12 +346,8 @@ class TestMaybeAutoSwitch(unittest.TestCase):
         self.assertFalse(cu.load_autoswitch()["enabled"])   # the toggle is not reverted
 
 
-class TestDesktopVersionMismatch(unittest.TestCase):
+class TestDesktopVersionMismatch(Patched):
     """_desktop_state flags a stash captured under a different app version."""
-
-    def _patch(self, name, stub):
-        self.addCleanup(setattr, cu, name, getattr(cu, name))
-        setattr(cu, name, stub)
 
     def setUp(self):
         import json
