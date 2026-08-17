@@ -35,6 +35,7 @@ today. So: switch by swapping, never log out.
   desktop-switch.py list                stashes, with age and app version
   desktop-switch.py switch <label>      swap to that account (quits and reopens the app)
   desktop-switch.py switch <label> -n   dry run: show exactly what would move, change nothing
+  desktop-switch.py switch <label> --no-launch   swap without reopening the app afterwards
   desktop-switch.py undo                put back what the last switch overwrote
   desktop-switch.py repair              finish or roll back an interrupted operation
   desktop-switch.py rename <old> <new>  fix a mislabeled stash (no re-capture needed)
@@ -245,7 +246,8 @@ def _log_records(data):
         rtype = data[pos + 6]
         if rtype not in (1, 2, 3, 4) or 7 + length > room:
             pos += room                      # trailer or corruption: resync
-            continue
+            buf = b""                        # a pending fragment must not survive the resync —
+            continue                         # gluing it to a later LAST would forge a record
         payload = data[pos + 7:pos + 7 + length]
         pos += 7 + length
         if rtype == 1:                       # FULL
@@ -257,19 +259,105 @@ def _log_records(data):
         else:                                # LAST
             yield buf + payload; buf = b""
 
+# profile_identity's third answer: the log affirmatively shows the session was signed out.
+# Truthy on purpose — every consumer must decide what a dead session means for it rather
+# than fall through a None check into "unknown".
+SIGNED_OUT = "signed-out"
+
+def _is_uuid(u):
+    return bool(u) and u != SIGNED_OUT
+
+def _varint(data, pos):
+    shift = val = 0
+    while pos < len(data) and shift < 35:
+        b = data[pos]; pos += 1
+        val |= (b & 0x7F) << shift
+        if not b & 0x80:
+            return val, pos
+        shift += 7
+    raise ValueError("bad varint")
+
+def _batch_ops(payload):
+    """The (op, key, value) entries of a leveldb WriteBatch record, in write order.
+
+    [sequence:8][count:4] then per entry: tag 0x01 = put (varint klen, key, varint vlen,
+    value), tag 0x00 = deletion (varint klen, key). Strict — anything malformed raises
+    ValueError and the caller falls back to a raw value scan of the record."""
+    if len(payload) < 12:
+        raise ValueError("short batch")
+    count = int.from_bytes(payload[8:12], "little")
+    pos, out = 12, []
+    for _ in range(count):
+        if pos >= len(payload):
+            raise ValueError("truncated batch")
+        tag = payload[pos]; pos += 1
+        klen, pos = _varint(payload, pos)
+        key = payload[pos:pos + klen]; pos += klen
+        if len(key) != klen:
+            raise ValueError("truncated key")
+        if tag == 1:
+            vlen, pos = _varint(payload, pos)
+            val = payload[pos:pos + vlen]; pos += vlen
+            if len(val) != vlen:
+                raise ValueError("truncated value")
+            out.append(("put", bytes(key), bytes(val)))
+        elif tag == 0:
+            out.append(("del", bytes(key), b""))
+        else:
+            raise ValueError("unknown tag")
+    if pos != len(payload):
+        raise ValueError("trailing bytes")
+    return out
+
+def _log_identity(d, logs):
+    """uuid | SIGNED_OUT | None from the write-ahead logs, deletion-aware.
+
+    Records parse as write batches, so a sign-out is visible as what it is: a deletion of
+    (or an accountless overwrite to) a key that previously carried the account — without
+    this, a revoked session keeps reading as its last account and dead bytes masquerade
+    as a sign-in. A record that isn't a parseable batch degrades to the raw value scan,
+    which can only ever say "uuid" — never a false sign-out."""
+    identity_keys, last = set(), None
+    for _, name in sorted(logs):
+        try:
+            with open(os.path.join(d, name), "rb") as f:
+                data = f.read()
+        except OSError:
+            continue
+        for rec in _log_records(data):
+            try:
+                ops = _batch_ops(rec)
+            except ValueError:
+                found = []
+                _scan_for_uuid(rec, found)
+                if found:
+                    last = found[-1]
+                continue
+            for op, key, val in ops:
+                found = []
+                _scan_for_uuid(val, found)
+                if found:
+                    identity_keys.add(key)
+                    last = found[-1]
+                elif key in identity_keys:
+                    last = SIGNED_OUT        # tombstoned, or rewritten without an account
+    return last
+
 def profile_identity(root):
-    """The signed-in account's uuid in a profile tree (or a stash's files/ tree), or None.
+    """The signed-in account's uuid in a profile tree (or a stash's files/ tree),
+    SIGNED_OUT when the log shows the session was ended, or None (unknown).
 
     Meaningful only at rest — a running app holds newer state in memory. Evidence quality
     decides the answer, not file numbers alone: every write lands in the write-ahead .log
-    before anything else and the log format parses completely, so a match from the logs IS
-    the freshest sign-in and wins outright. (File numbers cannot be compared across kinds:
+    before anything else and the log format parses completely, so the logs' verdict —
+    sign-in or sign-out — wins outright. (File numbers cannot be compared across kinds:
     the live log is numbered before tables flushed later.) Compacted .ldb tables are
-    consulted only when the logs are silent; their data blocks are usually compressed, so
-    a table answer can be an earlier account's residue rather than the current sign-in —
-    a possible stale answer accepted over a useless None. The pre-install identity check
-    in cmd_switch and the aside copies are the backstops for that case. Only NNNN.log and
-    NNNN.ldb can carry localStorage values; MANIFEST/CURRENT/LOG are leveldb bookkeeping.
+    consulted only when the logs are silent; their data blocks are usually compressed and
+    deletions are invisible to a raw scan, so a table answer can be an earlier account's
+    residue rather than the current sign-in — a possible stale answer accepted over a
+    useless None. The pre-install identity check in cmd_switch and the aside copies are
+    the backstops for that case. Only NNNN.log and NNNN.ldb can carry localStorage
+    values; MANIFEST/CURRENT/LOG are leveldb bookkeeping.
     """
     d = os.path.join(root, "Local Storage", "leveldb")
     if not os.path.isdir(d):
@@ -279,21 +367,17 @@ def profile_identity(root):
         m = re.fullmatch(r"(\d+)\.(log|ldb)", name)
         if m:
             (logs if m.group(2) == "log" else tables).append((int(m.group(1)), name))
-    def last_match(files, parse_log):
-        found = []
-        for _, name in sorted(files):
-            try:
-                with open(os.path.join(d, name), "rb") as f:
-                    data = f.read()
-            except OSError:
-                continue
-            if parse_log:
-                for rec in _log_records(data):
-                    _scan_for_uuid(rec, found)
-            else:
-                _scan_for_uuid(data, found)
-        return found[-1] if found else None
-    return last_match(logs, True) or last_match(tables, False)
+    ans = _log_identity(d, logs)
+    if ans:
+        return ans
+    found = []
+    for _, name in sorted(tables):
+        try:
+            with open(os.path.join(d, name), "rb") as f:
+                _scan_for_uuid(f.read(), found)
+        except OSError:
+            continue
+    return found[-1] if found else None
 
 # ---- small json helpers -----------------------------------------------------
 
@@ -357,12 +441,13 @@ def _stash_uuid(label):
     uuid-less stash pays a rescan of its few MB per call.
     """
     m = stash_meta(label) or {}
-    return m.get("account_uuid") or profile_identity(os.path.join(stash_dir(label), "files"))
+    u = m.get("account_uuid") or profile_identity(os.path.join(stash_dir(label), "files"))
+    return u if _is_uuid(u) else None    # a signed-out capture is attributable to no account
 
 def _uuid_owners(uid):
     """The stashes holding this account, best candidate first: a christened label over an
     unclaimed one, then name order."""
-    if not uid:
+    if not _is_uuid(uid):
         return []
     return sorted((l for l in list_stashes() if _stash_uuid(l) == uid),
                   key=lambda l: (bool((stash_meta(l) or {}).get("unclaimed")), l))
@@ -412,6 +497,11 @@ def _write_stash(label, uid=None, keep_aside=False, unclaimed=False):
 def cmd_capture(label):
     if not label:
         sys.exit("usage: desktop-switch.py capture <label>")
+    if label.startswith("unclaimed-"):
+        # the quarantine namespace: only `rename` moves a stash out of it, so a capture into
+        # it would mint a christened stash under a name that promises the opposite
+        sys.exit("labels starting with 'unclaimed-' are reserved for preserved sign-ins —\n"
+                 "pick a real name, or `rename` the unclaimed stash you mean")
     if app_running():
         sys.exit("Claude.app is running — quit it first.\n"
                  "Its session stores are flushed to disk on quit, so a capture now would stash\n"
@@ -419,6 +509,9 @@ def cmd_capture(label):
     if next(walk_identity(PROFILE), None) is None:
         sys.exit(f"nothing to capture — no identity files found under {PROFILE}")
     uid = profile_identity(PROFILE)
+    if uid == SIGNED_OUT:
+        sys.exit("the profile's storage shows a sign-out — there is no live session here to\n"
+                 "capture. Sign into the account in the app, quit it, then capture.")
     others = [l for l in _uuid_owners(uid) if l != label]
     if others:
         # Downstream, owner lookups assume one stash per account; a second label would make
@@ -458,18 +551,27 @@ def cmd_recapture(label=""):
     if next(walk_identity(PROFILE), None) is None:
         sys.exit(f"nothing to recapture — no identity files found under {PROFILE}")
     uid = profile_identity(PROFILE)
+    if uid == SIGNED_OUT:
+        sys.exit("the profile's storage shows a sign-out — recapturing it would replace a\n"
+                 "stash's session with a dead one. Sign into the account in the app, quit\n"
+                 "it, then recapture.")
     owner = next(iter(_uuid_owners(uid)), None)   # the stash provably holding these bytes
     claimed = (read_json(ACTIVE) or {}).get("label")
-    label = label or owner or claimed
-    if not label:
+    if not owner and not claimed:
+        # No evidence at all of whose bytes these are. An explicit label is a name, not
+        # evidence — accepting it here would overwrite a good stash on say-so alone.
         sys.exit("neither the profile's files nor this tool's records say which account is\n"
                  "signed in here (signout-local, undo, and hand sign-ins clear the record),\n"
                  "so recapture cannot attribute it to a stash safely. If you know which\n"
                  "account it is, quit the app and run:\n"
                  "  desktop-switch.py capture <label>   (the label's old stash is kept aside)")
+    label = label or owner or claimed
     if label not in list_stashes():
         sys.exit(f"unknown stash: {label}\nknown: {', '.join(list_stashes()) or '(none)'}\n"
                  "recapture refreshes an existing stash — use `capture` for a new label")
+    if (stash_meta(label) or {}).get("unclaimed"):
+        sys.exit(f"{label!r} is a preserved sign-in still waiting for a name — name it first:\n"
+                 f"  desktop-switch.py rename {label} <label>")
     if owner and owner != label:
         sys.exit(f"the profile here is signed into the account stashed as {owner!r}, not\n"
                  f"{label!r} — refusing to overwrite {label!r}'s stash with it. Run\n"
@@ -478,9 +580,10 @@ def cmd_recapture(label=""):
         sys.exit(f"the profile here was last installed as {claimed!r}, not {label!r} — refusing\n"
                  f"to overwrite {label!r}'s stash with it. Run `recapture {claimed}`, then\n"
                  f"`rename` if that label is wrong.")
-    if uid and not owner and (_stash_uuid(label) or uid) != uid:
-        # the reading and the stash's own identity disagree — adopting here would overwrite a
-        # known account's capture with a different account's files
+    if uid and not owner and _stash_uuid(label):
+        # no stash holds these bytes' account, and the target stash has its own identity —
+        # which therefore disagrees; overwriting would replace a known account's capture
+        # with a different account's files
         sys.exit(f"the profile here holds a different account than {label!r}'s stash does —\n"
                  f"refusing to overwrite it. If this sign-in should become a new stash, run:\n"
                  f"  desktop-switch.py capture <label>")
@@ -578,9 +681,9 @@ def _staging(op_id):
     # Inside the profile so a move into place is a same-filesystem rename, which is atomic.
     return os.path.join(PROFILE, f".cu-staging-{op_id}")
 
-def cmd_switch(label, dry_run=False):
+def cmd_switch(label, dry_run=False, no_launch=False):
     if not label:
-        sys.exit("usage: desktop-switch.py switch <label> [-n]")
+        sys.exit("usage: desktop-switch.py switch <label> [-n|--no-launch]")
     if label not in list_stashes():
         sys.exit(f"unknown stash: {label}\nknown: {', '.join(list_stashes()) or '(none)'}")
     if _journal():
@@ -634,17 +737,29 @@ def cmd_switch(label, dry_run=False):
     # manifest is lying, and installing it would sign the app into a different account
     # than every surface reports.
     files_uid = profile_identity(src)
+    if files_uid == SIGNED_OUT:
+        sys.exit(f"the stash {label!r} holds a signed-out session — installing it can only\n"
+                 f"land on the sign-in banner. Sign into the account in the app, quit it,\n"
+                 f"and `recapture {label}` — or `forget {label}`.")
     if files_uid and meta.get("account_uuid") and files_uid != meta["account_uuid"]:
-        sys.exit(f"the stash {label!r} records one account but its files hold another —\n"
-                 f"its manifest can't be trusted. Fix the label (`rename`) or re-capture\n"
-                 f"the account before switching to it.")
-
+        # rename can't fix this — it changes neither operand. Name the real ways out.
+        sys.exit(f"the stash {label!r} records one account but its files hold another\n"
+                 f"(…{files_uid[-12:]}) — its manifest can't be trusted. Either sign into that\n"
+                 f"account in the app and `recapture {label}` to rebuild it consistently, or\n"
+                 f"`forget {label}` and capture it fresh.")
 
     with Lock():
-        print("· quitting Claude.app…")
-        if not quit_app():
-            sys.exit("Claude.app did not quit within 45s — nothing was changed.\n"
-                     "Something is holding it open (a modal dialog?). Quit it by hand and retry.")
+        if no_launch:
+            # The unattended caller decided while the app was closed; if it opened since, the
+            # decision is void — an unattended swap must never quit a session out from under
+            # the user, so this mode refuses rather than quits.
+            if app_running():
+                sys.exit("Claude.app is open — an unattended swap must not quit it.")
+        else:
+            print("· quitting Claude.app…")
+            if not quit_app():
+                sys.exit("Claude.app did not quit within 45s — nothing was changed.\n"
+                         "Something is holding it open (a modal dialog?). Quit it by hand and retry.")
 
         _preserve_displaced(label)
 
@@ -653,7 +768,7 @@ def cmd_switch(label, dry_run=False):
         os.makedirs(rb, mode=0o700, exist_ok=True)
         n, _ = copy_identity(PROFILE, rb)
         print(f"· saved {n} files to roll back to")
-        for old in sorted(os.listdir(ROLLBACK))[:-12]:   # undo only ever uses the newest
+        for old in sorted(os.listdir(ROLLBACK))[:-KEEP_COPIES]:
             shutil.rmtree(os.path.join(ROLLBACK, old), ignore_errors=True)
 
         write_json(JOURNAL, {"op": op_id, "phase": "staged", "target": label,
@@ -667,11 +782,17 @@ def cmd_switch(label, dry_run=False):
 
         _apply(op_id, staging, rb, label)
 
-    print("· reopening Claude.app…")
-    launch_app()
-    print(f"\nswitched the desktop app to {label!r}.")
+    if not no_launch:
+        print("· reopening Claude.app…")
+        launch_app()
+    # no_launch never reopens: the app was closed, and opening it un-asked would put a window
+    # on the user's screen for a switch they only find out about from the notification
+    tail = "; it will be on it when next opened" if no_launch else ""
+    print(f"\nswitched the desktop app to {label!r}{tail}.")
     print("If it opens on a sign-in screen: signing in is safe (device trust holds) — then run")
     print("`desktop-switch.py recapture` to stash the fresh session. Or undo:  desktop-switch.py undo\n")
+
+KEEP_COPIES = 12   # rollbacks and asides each keep this many; undo/recovery only ever needs the newest
 
 def _aside_stash(label):
     """Move a stash's current content aside before it is overwritten, and bound the pile.
@@ -682,9 +803,14 @@ def _aside_stash(label):
     if not os.path.isdir(stash_dir(label)):
         return
     os.makedirs(ASIDES, mode=0o700, exist_ok=True)
-    os.rename(stash_dir(label), os.path.join(ASIDES, time.strftime("%Y%m%d-%H%M%S") + "-" + label))
+    dest = os.path.join(ASIDES, time.strftime("%Y%m%d-%H%M%S") + "-" + label)
+    n = 0
+    while os.path.exists(dest):                   # same label twice in one second: uniquify
+        n += 1
+        dest = os.path.join(ASIDES, time.strftime("%Y%m%d-%H%M%S") + "-" + label + f"~{n}")
+    os.rename(stash_dir(label), dest)
     entries = sorted(os.listdir(ASIDES))          # names start with the timestamp: oldest first
-    keep = set(entries[-12:])
+    keep = set(entries[-KEEP_COPIES:])
     keep.update({e[16:]: e for e in entries}.values())   # label starts after "YYYYMMDD-HHMMSS-"
     for e in entries:
         if e not in keep:
@@ -699,21 +825,33 @@ def _preserve_displaced(target):
     stash is never touched: switching to an account you are already on means "install the
     capture", and rewriting it first would just install the live bytes back while
     destroying the capture (the rollback preserves the live bytes instead). A sign-in that
-    matches no stash refreshes the recorded label when that stash has no identity of its
-    own to contradict the reading, and is otherwise kept as an unclaimed stash for the user
-    to name — never written over a labeled stash. When identity can't be read at all,
-    records fill in: a byte-exact match only freshens that stash's bookkeeping, and the
-    recorded label is refreshed only when its capture predates the installed app version,
-    i.e. when what is being overwritten could not have worked anyway — recorded with no
-    account_uuid, because bytes nobody identified must not be stamped as verified.
+    matches no stash refreshes the recorded label only when that stash has no identity of
+    its own to contradict the reading AND its capture predates the installed app version —
+    a same-version capture may be perfectly good with merely-unreadable identity, and
+    overwriting it on a record's say-so is how a good account stops being switchable-to.
+    Everything else is kept as an unclaimed stash for the user to name — never written
+    over a labeled stash. When identity can't be read at all, records fill in under the
+    same version gate, recorded with no account_uuid, because bytes nobody identified
+    must not be stamped as verified. A byte-exact match is left entirely alone: the app
+    never ran on those bytes, so even its bookkeeping still describes the capture.
     """
     cur = manifest(PROFILE)
     if not cur:
         return                                # signed-out shell: nothing worth keeping
+    uid = profile_identity(PROFILE)
+    if uid == SIGNED_OUT:
+        # a revoked or ended session: refreshing any stash with these bytes would replace
+        # a working capture with a dead one that still names the account
+        print("  the profile's session was signed out; nothing worth keeping")
+        return
     exact = next((l for l in list_stashes()
                   if (stash_meta(l) or {}).get("files") == cur), None)
-    uid = profile_identity(PROFILE)
     claimed = (read_json(ACTIVE) or {}).get("label")
+
+    def capture_predates_app(label):
+        m, cur_ver = stash_meta(label) or {}, app_version()
+        return bool(m.get("app_version") and cur_ver and m["app_version"] != cur_ver)
+
     if uid:
         owners = _uuid_owners(uid)
         owner = exact if exact in owners else (owners[0] if owners else None)
@@ -724,14 +862,17 @@ def _preserve_displaced(target):
             if exact == owner:
                 print(f"  stash for {owner!r}: already current")
             else:
-                _write_stash(owner, uid, keep_aside=True)
+                # a quarantined stash stays quarantined through a refresh — only rename
+                # ends the quarantine
+                _write_stash(owner, uid, keep_aside=True,
+                             unclaimed=bool((stash_meta(owner) or {}).get("unclaimed")))
                 print(f"  stash for {owner!r}: refreshed, identity-verified")
             return
         if claimed and claimed != target and claimed in list_stashes() \
-                and _stash_uuid(claimed) is None:
-            # The record says this label was installed, and its stash carries no identity
-            # to disagree with the reading — adopt it, healing the stash and recording the
-            # uuid it now provably holds.
+                and _stash_uuid(claimed) is None and capture_predates_app(claimed):
+            # The record says this label was installed, its stash has no identity to
+            # disagree, and its capture predates the app version — what would be
+            # overwritten could not have worked anyway.
             _write_stash(claimed, uid, keep_aside=True)
             print(f"  stash for {claimed!r}: refreshed from the live profile; its account "
                   f"is now recorded")
@@ -742,23 +883,15 @@ def _preserve_displaced(target):
               f"    desktop-switch.py rename {q} <label>")
         return
     if exact and exact != target:
-        # Byte-identical to its stash: the files need no rewrite, only fresher bookkeeping.
-        m = stash_meta(exact) or {}
-        m.update({"captured_at": time.time(), "app_version": app_version()})
-        write_json(os.path.join(stash_dir(exact), "manifest.json"), m)
         print(f"  stash for {exact!r}: already current")
         return
     if not claimed or claimed == target or claimed not in list_stashes():
         return
-    m = stash_meta(claimed) or {}
-    cur_ver = app_version()
-    if not (m.get("app_version") and cur_ver and m["app_version"] != cur_ver):
-        return
-    if next(walk_identity(PROFILE), None) is None:
+    if not capture_predates_app(claimed):
         return
     _write_stash(claimed, keep_aside=True)
     print(f"  refreshed the stash for {claimed!r} from the live profile; its capture predated "
-          f"app v{cur_ver} (old copy kept aside)")
+          f"app v{app_version()} (old copy kept aside)")
 
 def _apply(op_id, staging, rb, label):
     """Move the staged identity items into place, recording each move before making it."""
@@ -1044,7 +1177,8 @@ def main():
             sys.exit("recapture takes no flags — it replaces the stash immediately, no dry run.\n"
                      "Preview the stash state with `list` or `status` instead.")
         cmd_recapture(arg)
-    elif cmd == "switch":  cmd_switch(arg, dry_run=bool({"-n", "--dry-run"} & flags))
+    elif cmd == "switch":  cmd_switch(arg, dry_run=bool({"-n", "--dry-run"} & flags),
+                                      no_launch="--no-launch" in flags)
     elif cmd == "undo":    cmd_undo()
     elif cmd == "repair":  cmd_repair()
     elif cmd == "rename":  cmd_rename(arg, rest[1] if len(rest) > 1 else "")

@@ -24,7 +24,11 @@ def load_tool(case, profile, state):
     """Import the tool against throwaway dirs (it reads its env at import time)."""
     for key, val in (("CU_DESKTOP_PROFILE", profile), ("CU_DESKTOP_STATE", state),
                      ("CU_SKIP_APP_CONTROL", "1")):
-        case.addCleanup(os.environ.pop, key, None)
+        prev = os.environ.get(key)      # restore, don't just delete: a developer running the
+        if prev is None:                # suite with these exported must get them back
+            case.addCleanup(os.environ.pop, key, None)
+        else:
+            case.addCleanup(os.environ.__setitem__, key, prev)
         os.environ[key] = val
     spec = importlib.util.spec_from_file_location("dsw", _TOOL)
     mod = importlib.util.module_from_spec(spec)
@@ -35,6 +39,32 @@ def load_tool(case, profile, state):
 def record(payload, rtype=1):
     """One leveldb log record: [crc:4][length:2][type:1][payload]."""
     return b"\x00\x00\x00\x00" + len(payload).to_bytes(2, "little") + bytes([rtype]) + payload
+
+
+def _vi(n):
+    """leveldb varint32."""
+    out = b""
+    while True:
+        b_, n = n & 0x7F, n >> 7
+        out += bytes([b_ | (0x80 if n else 0)])
+        if not n:
+            return out
+
+
+KEY = b"_https://claude.ai\x00\x01account"
+
+
+def batch(*ops, seq=1):
+    """A leveldb WriteBatch payload: [seq:8][count:4] then put/del entries."""
+    out = seq.to_bytes(8, "little") + len(ops).to_bytes(4, "little")
+    for op in ops:
+        if op[0] == "put":
+            _, k, v = op
+            out += b"\x01" + _vi(len(k)) + k + _vi(len(v)) + v
+        else:
+            _, k = op
+            out += b"\x00" + _vi(len(k)) + k
+    return out
 
 
 def account_json(uuid):
@@ -56,7 +86,9 @@ class _ToolCase(unittest.TestCase):
     """Throwaway profile + state dirs and the helpers the test classes share."""
 
     def setUp(self):
+        import shutil
         self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
         self.profile = os.path.join(self.tmp, "profile")
         os.makedirs(self.profile)
         self.state = os.path.join(self.tmp, "state")
@@ -145,6 +177,43 @@ class TestProfileIdentity(_ToolCase):
         write_log(self.profile, [b"\xff" * 100])
         self.assertIsNone(self.ds.profile_identity(self.profile))
 
+    def test_tombstone_after_signin_reads_signed_out(self):
+        write_log(self.profile, [record(batch(("put", KEY, account_json(UUID_A)))),
+                                 record(batch(("del", KEY)))])
+        self.assertEqual(self.ds.profile_identity(self.profile), self.ds.SIGNED_OUT)
+
+    def test_tombstone_in_a_later_log_still_counts(self):
+        write_log(self.profile, [record(batch(("put", KEY, account_json(UUID_A))))],
+                  name="000003.log")
+        write_log(self.profile, [record(batch(("del", KEY)))], name="000005.log")
+        self.assertEqual(self.ds.profile_identity(self.profile), self.ds.SIGNED_OUT)
+
+    def test_resignin_after_tombstone_wins(self):
+        write_log(self.profile, [record(batch(("put", KEY, account_json(UUID_A)))),
+                                 record(batch(("del", KEY))),
+                                 record(batch(("put", KEY, account_json(UUID_B))))])
+        self.assertEqual(self.ds.profile_identity(self.profile), UUID_B)
+
+    def test_accountless_overwrite_reads_signed_out(self):
+        write_log(self.profile, [record(batch(("put", KEY, account_json(UUID_A)))),
+                                 record(batch(("put", KEY, b'{"loggedOut":true}')))])
+        self.assertEqual(self.ds.profile_identity(self.profile), self.ds.SIGNED_OUT)
+
+    def test_unrelated_deletion_does_not_sign_out(self):
+        write_log(self.profile, [record(batch(("put", KEY, account_json(UUID_A)))),
+                                 record(batch(("del", b"some-other-key")))])
+        self.assertEqual(self.ds.profile_identity(self.profile), UUID_A)
+
+    def test_fragments_across_corruption_do_not_assemble(self):
+        # a FIRST fragment followed by corruption then an orphan LAST from another record
+        # must not be glued into a uuid the log never stored as one value
+        js = account_json(UUID_A)
+        head, tail = js[:len(js) // 2], js[len(js) // 2:]
+        first = record(head, rtype=2)
+        pad = BLOCK - len(first)
+        write_log(self.profile, [first, b"\xff" * pad, record(tail, rtype=4)])
+        self.assertIsNone(self.ds.profile_identity(self.profile))
+
 
 class TestPreserveDisplaced(_ToolCase):
     def setUp(self):
@@ -172,13 +241,40 @@ class TestPreserveDisplaced(_ToolCase):
         self.assertEqual(self.stash_cookie("mine"), b"old-mine")
         self.assertFalse(os.path.isdir(os.path.join(self.state, "desktop-stash-asides")))
 
-    def test_adopts_recorded_label_when_it_cannot_disagree(self):
+    def test_adopts_recorded_label_only_when_its_capture_predates_the_app(self):
         self.sign_in(UUID_A)
-        self.make_stash("claimed", None)
+        self.make_stash("claimed", None, app_version="0.0.1")
+        self.ds.app_version = lambda: "9.9.9"
         self.ds.write_json(self.ds.ACTIVE, {"label": "claimed", "at": 1.0, "files": {}})
         self.preserve("other")
         self.assertEqual(self.stash_cookie("claimed"), b"live-cookie-bytes")
         self.assertEqual((self.ds.stash_meta("claimed") or {}).get("account_uuid"), UUID_A)
+
+    def test_same_version_recorded_stash_is_quarantined_not_adopted(self):
+        # a same-version capture may be perfectly good with merely-unreadable identity;
+        # the sign-in is preserved as unclaimed instead of overwriting it
+        self.sign_in(UUID_A)
+        self.make_stash("claimed", None, app_version="9.9.9")
+        self.ds.app_version = lambda: "9.9.9"
+        self.ds.write_json(self.ds.ACTIVE, {"label": "claimed", "at": 1.0, "files": {}})
+        self.preserve("other")
+        self.assertEqual(self.stash_cookie("claimed"), b"old-claimed")
+        unclaimed = [l for l in self.ds.list_stashes() if l.startswith("unclaimed-")]
+        self.assertEqual(len(unclaimed), 1)
+        self.assertEqual(self.stash_cookie(unclaimed[0]), b"live-cookie-bytes")
+
+    def test_refreshing_an_unclaimed_owner_keeps_the_quarantine_flag(self):
+        self.sign_in(UUID_A)
+        self.make_stash("unclaimed-20260813-101112", UUID_A)
+        meta_path = os.path.join(self.state, "desktop-stashes", "unclaimed-20260813-101112",
+                                 "manifest.json")
+        m = self.ds.stash_meta("unclaimed-20260813-101112")
+        m["unclaimed"] = True
+        self.ds.write_json(meta_path, m)
+        self.preserve("other")
+        m2 = self.ds.stash_meta("unclaimed-20260813-101112") or {}
+        self.assertEqual(self.stash_cookie("unclaimed-20260813-101112"), b"live-cookie-bytes")
+        self.assertTrue(m2.get("unclaimed"))      # refresh must not christen it
 
     def test_unknown_identity_quarantines_instead_of_overwriting(self):
         self.sign_in(UUID_B)
@@ -208,7 +304,9 @@ class TestPreserveDisplaced(_ToolCase):
         self.preserve("other")
         self.assertEqual(self.stash_cookie("claimed"), b"old-claimed")
 
-    def test_byte_exact_stash_gets_bookkeeping_only(self):
+    def test_byte_exact_stash_is_left_entirely_alone(self):
+        # byte-identity proves the app never ran on these bytes, so even the bookkeeping
+        # still describes the capture — freshening captured_at would mask real session age
         self.make_stash("here", None, app_version="0.0.1")
         meta_path = os.path.join(self.state, "desktop-stashes", "here", "manifest.json")
         m = self.ds.stash_meta("here")
@@ -217,8 +315,19 @@ class TestPreserveDisplaced(_ToolCase):
         self.ds.app_version = lambda: "9.9.9"
         self.preserve("other")
         m2 = self.ds.stash_meta("here")
-        self.assertEqual(m2["app_version"], "9.9.9")               # bookkeeping freshened
+        self.assertEqual(m2["app_version"], "0.0.1")               # untouched
+        self.assertEqual(m2["captured_at"], 1.0)                   # staleness clock intact
         self.assertEqual(self.stash_cookie("here"), b"old-here")   # files untouched
+
+    def test_revoked_session_does_not_refresh_its_owners_stash(self):
+        # the residue case: the profile still NAMES account A in old records, but the log
+        # shows the session ended — A's working capture must not be replaced with dead bytes
+        write_log(self.profile, [record(batch(("put", KEY, account_json(UUID_A)))),
+                                 record(batch(("del", KEY)))])
+        self.make_stash("mine", UUID_A)
+        self.preserve("elsewhere")
+        self.assertEqual(self.stash_cookie("mine"), b"old-mine")
+        self.assertEqual(self.ds.list_stashes(), ["mine"])   # and nothing quarantined
 
     def test_signed_out_profile_preserves_nothing(self):
         os.remove(os.path.join(self.profile, "Cookies"))
@@ -268,6 +377,71 @@ class TestIdentityGuards(_ToolCase):
             with self.assertRaises(SystemExit) as cm:
                 self.ds.cmd_switch("liar")
         self.assertIn("records one account", str(cm.exception))
+
+    def test_capture_refuses_a_signed_out_profile(self):
+        write_log(self.profile, [record(batch(("put", KEY, account_json(UUID_A)))),
+                                 record(batch(("del", KEY)))])
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                self.ds.cmd_capture("work")
+        self.assertIn("sign-out", str(cm.exception))
+
+    def test_switch_refuses_a_stash_captured_signed_out(self):
+        self.make_stash("dead", UUID_A)
+        write_log(os.path.join(self.state, "desktop-stashes", "dead", "files"),
+                  [record(batch(("put", KEY, account_json(UUID_A)))),
+                   record(batch(("del", KEY)))])
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                self.ds.cmd_switch("dead")
+        self.assertIn("signed-out session", str(cm.exception))
+
+    def test_no_launch_refuses_a_running_app(self):
+        self.make_stash("work", UUID_A)
+        self.ds.app_running = lambda: True
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                self.ds.cmd_switch("work", no_launch=True)
+        self.assertIn("must not quit", str(cm.exception))
+
+    def test_recapture_refuses_without_any_attribution(self):
+        # explicit label is a name, not evidence: with no readable identity and no ACTIVE
+        # record, nothing says whose bytes these are
+        self.touch_cookie()
+        self.make_stash("work", UUID_A)
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                self.ds.cmd_recapture("work")
+        self.assertIn("cannot attribute", str(cm.exception))
+
+    def test_recapture_refuses_an_unclaimed_target(self):
+        self.touch_cookie()
+        self.sign_in(UUID_A)
+        self.make_stash("unclaimed-x", UUID_A)
+        meta_path = os.path.join(self.state, "desktop-stashes", "unclaimed-x", "manifest.json")
+        m = self.ds.stash_meta("unclaimed-x")
+        m["unclaimed"] = True
+        self.ds.write_json(meta_path, m)
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                self.ds.cmd_recapture("unclaimed-x")
+        self.assertIn("name it first", str(cm.exception))
+
+    def test_capture_refuses_the_unclaimed_namespace(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                self.ds.cmd_capture("unclaimed-20260817-000000")
+        self.assertIn("reserved", str(cm.exception))
+
+    def test_same_second_asides_get_unique_names(self):
+        self.touch_cookie()
+        d = os.path.join(self.state, "desktop-stashes", "twice", "files")
+        os.makedirs(d)
+        self.ds._aside_stash("twice")     # consumes the stash dir
+        os.makedirs(d)
+        self.ds._aside_stash("twice")     # same wall-clock second: must not collide
+        asides = os.listdir(os.path.join(self.state, "desktop-stash-asides"))
+        self.assertEqual(len(asides), 2)
 
     def test_rename_clears_the_unclaimed_flag(self):
         self.make_stash("unclaimed-x", UUID_A)

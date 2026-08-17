@@ -30,6 +30,8 @@ struct Payload: Decodable {
 struct AutoSwitch: Decodable {
     var enabled: Bool?
     var line: String?
+    var desktop_enabled: Bool?
+    var desktop_line: String?
 }
 
 // The desktop app's account is a set of files rather than a token, so it carries no usage and
@@ -618,12 +620,18 @@ struct MenuView: View {
                 .padding(.horizontal, 6).padding(.bottom, 2)
         }
         if let aw = model.payload?.auto_switch {
-            if let line = aw.line {
+            // one binding feeds both the rows and the emptiness test, so a future third
+            // line can't update one and miss the other
+            let lines = [aw.line, aw.desktop_line].compactMap { $0 }
+            let cli = aw.enabled ?? false, desktop = aw.desktop_enabled ?? false
+            ForEach(lines, id: \.self) { line in
                 Text(line)
                     .font(.system(size: 10.5)).foregroundStyle(.secondary)
                     .padding(.horizontal, 6).padding(.bottom, 2)
-            } else if aw.enabled == true {
-                Text("auto-switch armed — switches accounts when a limit hits")
+            }
+            if lines.isEmpty, cli || desktop {
+                let scope = cli && desktop ? "CLI and desktop app" : desktop ? "desktop app" : "CLI"
+                Text("auto-switch armed (\(scope)) — switches accounts when a limit hits")
                     .font(.system(size: 10)).foregroundStyle(.tertiary)
                     .padding(.horizontal, 6).padding(.bottom, 2)
             }

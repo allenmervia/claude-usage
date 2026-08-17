@@ -228,13 +228,33 @@ nothing moves and a notification names the earliest reset instead.
 
 Because an auto-switch changes which account gets billed without a click, it is never
 silent: each one posts a macOS notification and leaves a record in the menu bar
-dropdown and the table output. Only the CLI credential moves — the desktop app is
-never touched (see [Switching the desktop app](#switching-the-desktop-app)); the
-notification reminds you to move it from the menu bar if you want both.
+dropdown and the table output. `autoswitch on` moves only the CLI credential — the
+desktop app has its own auto-switch, below.
 
 A new `claude` run is on the new account immediately; a session already
 mid-conversation picks up the new credential on its own within about ten minutes,
 no restart needed.
+
+### Auto-switching the desktop app
+
+`claude-usage autoswitch desktop on` extends auto-switching to the desktop app
+(requires [desktop switching](#switching-the-desktop-app) to be set up). When the
+app's own account — which need not be the CLI's — hits a limit, the app is swapped
+to the best captured account, under two rules that keep it safe unattended:
+
+- **Swap only fresh.** An unattended swap onto a sign-in screen helps nobody, so only
+  stashes that will come up signed in — fresh (see
+  [stash lifetime](#switching-the-desktop-app)) and captured under the current app
+  version — are targets. If none qualifies, nothing moves and a notification says
+  which recovery to run.
+- **Closed app only, and no surprise launches.** With the app open, the swap is
+  queued instead — a notification offers the menu bar's switch for "now" — and it
+  executes on the first refresh that finds the app closed. The swap never quits the
+  app and never launches it; it refuses if the app opened meanwhile, and the app is
+  simply on the new account the next time you open it.
+
+The same picker, guardrails, and records apply as for the CLI, and the two
+auto-switches arm independently.
 
 ## Switching the desktop app
 
@@ -274,25 +294,29 @@ operation in a journal before touching anything, so an interrupted run can be ro
 forward or back (`repair`) rather than leaving the profile half one account and half
 another. `undo` restores the exact bytes the last switch replaced.
 
-A stash survives idle days (`doctor` flags one older than two weeks as untested
-territory), but not an app update: once the desktop app updates itself, installing a
-pre-update capture lands on a login screen. The bar and `doctor` warn when a stash
-predates the installed version. Recovery is one login per account: sign in at the
-login screen the switch lands on, and the stash heals on the next switch away — or
-refresh it immediately with the app quit via `desktop-switch.py capture <label>`.
+A stash survives short parking, not long: the server invalidates sessions left idle
+past about a day, so a stash parked longer usually comes back to the sign-in banner
+(the bar and `doctor` flag it as stale). An app update has the same effect — a
+pre-update capture lands on a login screen, and both surfaces warn when a stash
+predates the installed version. Either way, recovery is one login per account: sign
+in at the login screen the switch lands on, then `desktop-switch.py recapture` to
+put the fresh session in the stash.
 
-Each capture records which account it holds, read from the profile's own storage (the
-same account id the usage API reports; the write-ahead log is the freshest evidence on
-disk and wins). That reading, not the labels, decides what a switch away preserves —
-so signing into the "wrong" account at a login screen refreshes that account's stash
-rather than poisoning the one the switcher expected. The reading also gates the risky
-moves: `capture` refuses a second label for an already-stashed account, `switch`
-refuses a stash whose files disagree with the account its manifest claims, a sign-in
-matching no stash is kept as `unclaimed-<timestamp>` for you to `rename` rather than
-written over a labeled stash, and whatever a refresh overwrites is kept under
-`desktop-stash-asides`. The account id's location in the profile is the app's private
-business; if an update moves it, reads degrade to "unknown", records fill in, and
-`profile-probe.py` re-derives where it went.
+Each capture records which account it holds, read from the profile's own storage —
+the same account id the usage API reports. That reading, not the labels, decides what
+a switch away preserves, so signing into the "wrong" account at a login screen
+refreshes that account's stash rather than poisoning the one the switcher expected.
+The reading also gates the risky moves:
+
+- `capture` refuses a second label for an already-stashed account.
+- `switch` refuses a stash whose files disagree with the account its manifest claims.
+- A sign-in matching no stash is kept as `unclaimed-<timestamp>` for you to `rename`,
+  never written over a labeled stash.
+- Whatever a refresh overwrites is kept under `desktop-stash-asides`.
+
+The account id's location in the profile is the app's private business; if an update
+moves it, reads degrade to "unknown", records fill in, and `profile-probe.py`
+re-derives where it went.
 
 ## Menu bar
 

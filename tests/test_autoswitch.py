@@ -379,6 +379,31 @@ class TestDesktopVersionMismatch(Patched):
         st = {s["label"]: s for s in cu._desktop_state()["stashes"]}
         self.assertFalse(any(s["version_mismatch"] for s in st.values()))
 
+    def test_missing_captured_at_reads_as_stale_not_fresh(self):
+        # no manifest timestamp means unknown age; unknown must not pass the freshness
+        # gate an unattended swap rides on
+        st = {s["label"]: s for s in cu._desktop_state()["stashes"]}
+        self.assertTrue(all(s["stale"] for s in st.values()))
+        self.assertTrue(all(s["age_days"] is None for s in st.values()))
+
+
+class TestDesktopPairsTies(unittest.TestCase):
+    def test_uuid_claim_does_not_resolve_a_name_tie(self):
+        # two accounts share the display label; a mislabeled stash uuid-claims one of them.
+        # The name tie stays a tie — resolving it by elimination would pair the uuid-less
+        # stash with whichever account the mislabeled stash didn't take.
+        rows = [dict(row("allen", uuid="u-x"), label="allen"),
+                dict(row("allen2", uuid="u-y"), label="allen")]
+        ds = {"stashes": [{"label": "mislabeled", "account_uuid": "u-x"},
+                          {"label": "allen", "account_uuid": None}]}
+        pairs = cu.desktop_pairs(rows, ds)
+        self.assertEqual(set(pairs), {"mislabeled"})   # the name tie attached nothing
+
+    def test_unclaimed_stash_never_name_pairs(self):
+        rows = [row("allen", uuid="u-x")]
+        ds = {"stashes": [{"label": "allen", "account_uuid": None, "unclaimed": True}]}
+        self.assertEqual(cu.desktop_pairs(rows, ds), {})
+
 
 class TestMatchDesktopIdentity(unittest.TestCase):
     """Stash-to-account pairing: recorded identity outranks the label."""
