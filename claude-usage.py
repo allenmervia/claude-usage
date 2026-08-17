@@ -1578,10 +1578,14 @@ def render_json(rows):
                       # the record of an identity change belongs in every surface. `line` is the
                       # sentence, preformatted here so the bar and the table can never disagree
                       # on wording or recency; `enabled` marks the mode as armed.
+                      # suppressed under mock like the table's line: a real switch record
+                      # under invented data would read as part of the fiction
                       "auto_switch": ({"enabled": bool(aw.get("enabled")),
                                        "last": aw.get("last_auto"),
                                        "line": last_auto_line(aw)}
-                                      if aw.get("enabled") or aw.get("last_auto") else None),
+                                      if not mock_enabled()
+                                      and (aw.get("enabled") or aw.get("last_auto"))
+                                      else None),
                       # the bar has no other way to know, and unmarked invented numbers are
                       # worse than no numbers — they get screenshotted and believed
                       "mock": True if mock_enabled() else None,
@@ -2150,13 +2154,28 @@ def save_autoswitch(st):
         pass
 
 def update_autoswitch(updates):
-    """Merge runtime keys into autoswitch.json against a FRESH read. The refresh holds its loaded
-    copy across network calls, and the user can flip `enabled`/`scoped` in that window — writing
-    the held copy back whole would silently revert their toggle."""
-    st = load_autoswitch()
-    st.update(updates)
-    save_autoswitch(st)
-    return st
+    """Merge runtime keys into autoswitch.json against a FRESH read, under an advisory lock.
+    The refresh holds its loaded copy across network calls, and the user can flip
+    `enabled`/`scoped` in that window — writing the held copy back whole would silently revert
+    their toggle. The lock closes the same hole between two concurrent writers (menu-bar tick
+    and a CLI run), whose read-modify-write cycles would otherwise drop each other's keys."""
+    import fcntl
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(AUTOSWITCH + ".lock", "w") as lk:
+            try:
+                fcntl.flock(lk, fcntl.LOCK_EX)
+            except Exception:
+                pass
+            st = load_autoswitch()
+            st.update(updates)
+            save_autoswitch(st)
+        return st
+    except Exception:
+        st = load_autoswitch()
+        st.update(updates)
+        save_autoswitch(st)
+        return st
 
 def last_auto_line(st=None):
     """The one sentence describing the last auto-switch, shared by every text surface — or None
