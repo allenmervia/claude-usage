@@ -277,11 +277,22 @@ another. `undo` restores the exact bytes the last switch replaced.
 A stash survives idle days (`doctor` flags one older than two weeks as untested
 territory), but not an app update: once the desktop app updates itself, installing a
 pre-update capture lands on a login screen. The bar and `doctor` warn when a stash
-predates the installed version, and switching away from an account whose capture
-predates the update refreshes its stash from the live profile automatically (the old
-copy is kept aside). So recovery is one login per account: sign in at the login screen
-the switch lands on, and the stash heals on the next switch away — or refresh it
-immediately with the app quit via `desktop-switch.py capture <label>`.
+predates the installed version. Recovery is one login per account: sign in at the
+login screen the switch lands on, and the stash heals on the next switch away — or
+refresh it immediately with the app quit via `desktop-switch.py capture <label>`.
+
+Each capture records which account it holds, read from the profile's own storage (the
+same account id the usage API reports; the write-ahead log is the freshest evidence on
+disk and wins). That reading, not the labels, decides what a switch away preserves —
+so signing into the "wrong" account at a login screen refreshes that account's stash
+rather than poisoning the one the switcher expected. The reading also gates the risky
+moves: `capture` refuses a second label for an already-stashed account, `switch`
+refuses a stash whose files disagree with the account its manifest claims, a sign-in
+matching no stash is kept as `unclaimed-<timestamp>` for you to `rename` rather than
+written over a labeled stash, and whatever a refresh overwrites is kept under
+`desktop-stash-asides`. The account id's location in the profile is the app's private
+business; if an update moves it, reads degrade to "unknown", records fill in, and
+`profile-probe.py` re-derives where it went.
 
 ## Menu bar
 

@@ -380,5 +380,54 @@ class TestDesktopVersionMismatch(Patched):
         self.assertFalse(any(s["version_mismatch"] for s in st.values()))
 
 
+class TestMatchDesktopIdentity(unittest.TestCase):
+    """Stash-to-account pairing: recorded identity outranks the label."""
+
+    STASH_KEYS = {"active": False, "can_switch": True, "stale": False,
+                  "version_mismatch": False}
+
+    def _rows(self):
+        return [{"provider": "claude", "uuid": "u-a", "email": "a@x.test",
+                 "label": "A", "display": {}},
+                {"provider": "claude", "uuid": "u-b", "email": "b@x.test",
+                 "label": "B", "display": {}}]
+
+    def _match(self, stashes, rows):
+        cu.rows_desktop_state["ds"] = {"stashes": stashes}
+        try:
+            cu._match_desktop(rows)
+        finally:
+            cu.rows_desktop_state.pop("ds", None)
+
+    def test_identity_outranks_a_misleading_label(self):
+        st = dict(self.STASH_KEYS, label="b@x.test", account_uuid="u-a")
+        rows = self._rows()
+        self._match([st], rows)
+        self.assertEqual(st["matched_uuid"], "u-a")
+        self.assertEqual(rows[0]["display"]["desktop"]["label"], "b@x.test")
+        self.assertNotIn("desktop", rows[1]["display"])
+
+    def test_known_identity_never_falls_back_to_name(self):
+        st = dict(self.STASH_KEYS, label="b@x.test", account_uuid="u-elsewhere")
+        rows = self._rows()
+        self._match([st], rows)
+        self.assertNotIn("matched_uuid", st)
+        self.assertNotIn("desktop", rows[1]["display"])
+
+    def test_uuidless_stash_still_pairs_by_name(self):
+        st = dict(self.STASH_KEYS, label="b@x.test", account_uuid=None)
+        rows = self._rows()
+        self._match([st], rows)
+        self.assertEqual(st["matched_uuid"], "u-b")
+
+    def test_unclaimed_stash_never_pairs(self):
+        st = dict(self.STASH_KEYS, label="unclaimed-20260813-101112",
+                  account_uuid="u-a", unclaimed=True)
+        rows = self._rows()
+        self._match([st], rows)
+        self.assertNotIn("matched_uuid", st)
+        self.assertNotIn("desktop", rows[0]["display"])
+
+
 if __name__ == "__main__":
     unittest.main()

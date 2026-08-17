@@ -40,14 +40,14 @@ today. So: switch by swapping, never log out.
   desktop-switch.py rename <old> <new>  fix a mislabeled stash (no re-capture needed)
   desktop-switch.py forget <label>
 """
-import os, sys, json, time, shutil, hashlib, subprocess
+import os, re, sys, json, time, shutil, hashlib, subprocess
 
 PROFILE = os.path.expanduser(os.environ.get("CU_DESKTOP_PROFILE")
                              or "~/Library/Application Support/Claude")
 STATE    = os.path.expanduser(os.environ.get("CU_DESKTOP_STATE") or "~/.claude-usage")
 STASHES  = os.path.join(STATE, "desktop-stashes")
 ROLLBACK = os.path.join(STATE, "desktop-rollbacks")
-# Displaced copies of stashes that were refreshed in place (see _refresh_dead_stash). Not under
+# Displaced copies of stashes that were refreshed in place (_write_stash's keep_aside). Not under
 # ROLLBACK: `undo` restores the newest rollback wholesale, and these are not profile rollbacks.
 ASIDES   = os.path.join(STATE, "desktop-stash-asides")
 JOURNAL  = os.path.join(STATE, "desktop-journal.json")
@@ -198,6 +198,103 @@ def copy_identity(src_root, dst_root):
         total += os.path.getsize(full)
     return n, total
 
+# ---- whose profile is this ---------------------------------------------------
+# The app records the signed-in account's uuid in claude.ai's Local Storage, and that uuid is
+# the same one the usage API reports for the account. Reading it turns "which account is
+# installed" from a record this tool keeps into a fact it can check — which is what makes
+# refreshing a drifted profile into the right stash safe. The storage location is the app's
+# private business, so None (not found) must always be a survivable answer; profile-probe.py
+# re-derives the location if an update moves it.
+
+# localStorage values may be stored as UTF-16LE, which puts a NUL after each of what are
+# otherwise ASCII JSON bytes. One pattern with an optional NUL after every literal byte
+# matches both encodings in a single pass over the raw buffer — and, unlike scanning a
+# NUL-stripped copy, it cannot assemble a "match" out of fragments that sat on opposite
+# sides of a run of padding NULs between adjacent leveldb entries.
+def _either_width(s):
+    return b"".join(re.escape(bytes([c])) + b"\x00?" for c in s.encode())
+
+_HEX = b"[0-9a-f]\x00?"
+_UUID_BODY = (_HEX * 8 + _either_width("-") + _HEX * 4 + _either_width("-") + _HEX * 4
+              + _either_width("-") + _HEX * 4 + _either_width("-") + _HEX * 12)
+UUID_RE = re.compile(_either_width('"accountUuid"') + b"[\\s\x00]*" + _either_width(":")
+                     + b"[\\s\x00]*" + _either_width('"') + b"(" + _UUID_BODY + b")"
+                     + _either_width('"'))
+
+def _scan_for_uuid(data, found):
+    for m in UUID_RE.finditer(data):
+        found.append(m.group(1).replace(b"\x00", b"").decode())
+
+def _log_records(data):
+    """Reassembled record payloads from a leveldb write-ahead log.
+
+    The log is 32KB blocks of [crc:4][length:2][type:1][payload] records, and one logical
+    record may be split FIRST/MIDDLE/.../LAST across blocks — a value that straddles a block
+    boundary is invisible to a flat scan of the file, which is why this parser exists.
+    Corruption resyncs at the next block boundary: better to miss one record than to error
+    out of reading identity at all.
+    """
+    BLOCK = 32768
+    buf, pos = b"", 0
+    while pos + 7 <= len(data):
+        room = BLOCK - (pos % BLOCK)
+        if room < 7:
+            pos += room                      # zero-padded block trailer
+            continue
+        length = int.from_bytes(data[pos + 4:pos + 6], "little")
+        rtype = data[pos + 6]
+        if rtype not in (1, 2, 3, 4) or 7 + length > room:
+            pos += room                      # trailer or corruption: resync
+            continue
+        payload = data[pos + 7:pos + 7 + length]
+        pos += 7 + length
+        if rtype == 1:                       # FULL
+            yield payload; buf = b""
+        elif rtype == 2:                     # FIRST
+            buf = payload
+        elif rtype == 3:                     # MIDDLE
+            buf += payload
+        else:                                # LAST
+            yield buf + payload; buf = b""
+
+def profile_identity(root):
+    """The signed-in account's uuid in a profile tree (or a stash's files/ tree), or None.
+
+    Meaningful only at rest — a running app holds newer state in memory. Evidence quality
+    decides the answer, not file numbers alone: every write lands in the write-ahead .log
+    before anything else and the log format parses completely, so a match from the logs IS
+    the freshest sign-in and wins outright. (File numbers cannot be compared across kinds:
+    the live log is numbered before tables flushed later.) Compacted .ldb tables are
+    consulted only when the logs are silent; their data blocks are usually compressed, so
+    a table answer can be an earlier account's residue rather than the current sign-in —
+    a possible stale answer accepted over a useless None. The pre-install identity check
+    in cmd_switch and the aside copies are the backstops for that case. Only NNNN.log and
+    NNNN.ldb can carry localStorage values; MANIFEST/CURRENT/LOG are leveldb bookkeeping.
+    """
+    d = os.path.join(root, "Local Storage", "leveldb")
+    if not os.path.isdir(d):
+        return None
+    logs, tables = [], []
+    for name in os.listdir(d):
+        m = re.fullmatch(r"(\d+)\.(log|ldb)", name)
+        if m:
+            (logs if m.group(2) == "log" else tables).append((int(m.group(1)), name))
+    def last_match(files, parse_log):
+        found = []
+        for _, name in sorted(files):
+            try:
+                with open(os.path.join(d, name), "rb") as f:
+                    data = f.read()
+            except OSError:
+                continue
+            if parse_log:
+                for rec in _log_records(data):
+                    _scan_for_uuid(rec, found)
+            else:
+                _scan_for_uuid(data, found)
+        return found[-1] if found else None
+    return last_match(logs, True) or last_match(tables, False)
+
 # ---- small json helpers -----------------------------------------------------
 
 def read_json(path, default=None):
@@ -250,6 +347,26 @@ def stash_dir(label):
 def stash_meta(label):
     return read_json(os.path.join(stash_dir(label), "manifest.json"))
 
+def _stash_uuid(label):
+    """The account uuid a stash holds: the manifest's record when present, else read from
+    the stash's own files.
+
+    Never writes. This runs from status/capture paths that hold no lock, so a write here
+    could race a switch mid-rename — and a failed manifest read must not become a rewrite.
+    Manifests gain their account_uuid only at capture/_write_stash time; until then a
+    uuid-less stash pays a rescan of its few MB per call.
+    """
+    m = stash_meta(label) or {}
+    return m.get("account_uuid") or profile_identity(os.path.join(stash_dir(label), "files"))
+
+def _uuid_owners(uid):
+    """The stashes holding this account, best candidate first: a christened label over an
+    unclaimed one, then name order."""
+    if not uid:
+        return []
+    return sorted((l for l in list_stashes() if _stash_uuid(l) == uid),
+                  key=lambda l: (bool((stash_meta(l) or {}).get("unclaimed")), l))
+
 def list_stashes():
     if not os.path.isdir(STASHES):
         return []
@@ -257,15 +374,18 @@ def list_stashes():
     return sorted(d for d in os.listdir(STASHES)
                   if not d.startswith(".") and os.path.isdir(stash_dir(d)))
 
-def _write_stash(label, keep_aside):
+def _write_stash(label, uid=None, keep_aside=False, unclaimed=False):
     """Replace <label>'s stash with the live profile's identity files.
 
     The new copy is built complete in a hidden sibling directory and swapped into place with
     renames, so an interruption at any point leaves the old stash or the new one under the
     label — never a half-written directory. The manifest is hashed from the copied bytes
     rather than the profile, so the record can never disagree with what the stash holds (the
-    post-swap verification in _apply compares against it). keep_aside moves the displaced
-    copy into ASIDES instead of deleting it.
+    post-swap verification in _apply compares against it). uid is the account the bytes
+    provably hold — None when identity couldn't be read, never a guess — so a manifest's
+    account_uuid can be trusted wherever it is present. keep_aside moves the displaced copy
+    into ASIDES (with _aside_stash's retention) instead of deleting it; unclaimed marks a
+    preserved sign-in still waiting for the user to name it.
 
     Returns (files copied, bytes copied, manifest of the copy).
     """
@@ -276,14 +396,14 @@ def _write_stash(label, keep_aside):
     os.makedirs(tmp, mode=0o700, exist_ok=True)
     n, total = copy_identity(PROFILE, os.path.join(tmp, "files"))
     files = manifest(os.path.join(tmp, "files"))
-    write_json(os.path.join(tmp, "manifest.json"), {
-        "label": label, "captured_at": time.time(), "app_version": app_version(),
-        "files": files})
+    meta = {"label": label, "captured_at": time.time(), "app_version": app_version(),
+            "account_uuid": uid, "files": files}
+    if unclaimed:
+        meta["unclaimed"] = True
+    write_json(os.path.join(tmp, "manifest.json"), meta)
     if os.path.exists(dest):
         if keep_aside:
-            aside = os.path.join(ASIDES, time.strftime("%Y%m%d-%H%M%S") + "-" + label)
-            os.makedirs(ASIDES, mode=0o700, exist_ok=True)
-            os.rename(dest, aside)
+            _aside_stash(label)
         else:
             shutil.rmtree(dest)
     os.rename(tmp, dest)
@@ -298,8 +418,16 @@ def cmd_capture(label):
                  "a partial profile that fails when installed later.")
     if next(walk_identity(PROFILE), None) is None:
         sys.exit(f"nothing to capture — no identity files found under {PROFILE}")
+    uid = profile_identity(PROFILE)
+    others = [l for l in _uuid_owners(uid) if l != label]
+    if others:
+        # Downstream, owner lookups assume one stash per account; a second label would make
+        # every refresh and pairing pick between them arbitrarily.
+        sys.exit(f"this profile is signed into the account already stashed as {others[0]!r}.\n"
+                 f"Refresh that stash instead:   desktop-switch.py capture {others[0]}\n"
+                 f"or fix its label first:       desktop-switch.py rename {others[0]} {label}")
     replacing = label in list_stashes()
-    n, total, files = _write_stash(label, keep_aside=replacing)
+    n, total, files = _write_stash(label, uid, keep_aside=replacing)
     _set_active(label, files)
     print(f"captured {n} files ({total/1e6:.1f} MB) as {label!r}"
           + (" — the previous copy is kept aside" if replacing else ""))
@@ -313,12 +441,13 @@ def cmd_recapture(label=""):
     sign-in. Recapturing puts the fresh session in the stash, so one sign-in per long parking
     is the whole cost instead of one per revisit.
 
-    The label defaults to the account this tool last installed, and anything else is refused:
-    the ACTIVE record is the only identity available for a drifted profile, so recapturing
-    under a different name — or with no record at all — could overwrite a good stash with
-    another account's files. A hand sign-in as a different account still recaptures under the
-    recorded label; `rename` fixes the name afterwards, and the aside copy keeps the history
-    either way.
+    The stash to refresh is the one that provably holds this profile's account — identity is
+    read from the profile's own files, and a label naming any other stash is refused rather
+    than let one account's files overwrite another's capture. When the files don't yield an
+    identity (older app layouts), the ACTIVE record — the account this tool last installed —
+    stands in, with the same refusals. A hand sign-in as a different account still recaptures
+    under the provable owner; `rename` fixes the name afterwards, and the aside copy keeps
+    the history either way.
     """
     if app_running():
         sys.exit("Claude.app is running — quit it first.\n"
@@ -326,24 +455,37 @@ def cmd_recapture(label=""):
                  "a partial profile that fails when installed later.")
     if _journal():
         sys.exit("an earlier operation did not finish — run `desktop-switch.py repair` first")
+    if next(walk_identity(PROFILE), None) is None:
+        sys.exit(f"nothing to recapture — no identity files found under {PROFILE}")
+    uid = profile_identity(PROFILE)
+    owner = next(iter(_uuid_owners(uid)), None)   # the stash provably holding these bytes
     claimed = (read_json(ACTIVE) or {}).get("label")
-    label = label or claimed
-    if not claimed:
-        sys.exit("the tool has no record of which account this profile holds (signout-local,\n"
-                 "undo, and hand sign-ins clear it), so recapture cannot attribute it to a\n"
-                 "stash safely. If you know which account is signed in, quit the app and run:\n"
+    label = label or owner or claimed
+    if not label:
+        sys.exit("neither the profile's files nor this tool's records say which account is\n"
+                 "signed in here (signout-local, undo, and hand sign-ins clear the record),\n"
+                 "so recapture cannot attribute it to a stash safely. If you know which\n"
+                 "account it is, quit the app and run:\n"
                  "  desktop-switch.py capture <label>   (the label's old stash is kept aside)")
     if label not in list_stashes():
         sys.exit(f"unknown stash: {label}\nknown: {', '.join(list_stashes()) or '(none)'}\n"
                  "recapture refreshes an existing stash — use `capture` for a new label")
-    if claimed != label:
+    if owner and owner != label:
+        sys.exit(f"the profile here is signed into the account stashed as {owner!r}, not\n"
+                 f"{label!r} — refusing to overwrite {label!r}'s stash with it. Run\n"
+                 f"`recapture {owner}`, then `rename` if that label is wrong.")
+    if not owner and claimed and claimed != label:
         sys.exit(f"the profile here was last installed as {claimed!r}, not {label!r} — refusing\n"
                  f"to overwrite {label!r}'s stash with it. Run `recapture {claimed}`, then\n"
                  f"`rename` if that label is wrong.")
-    if next(walk_identity(PROFILE), None) is None:
-        sys.exit(f"nothing to recapture — no identity files found under {PROFILE}")
+    if uid and not owner and (_stash_uuid(label) or uid) != uid:
+        # the reading and the stash's own identity disagree — adopting here would overwrite a
+        # known account's capture with a different account's files
+        sys.exit(f"the profile here holds a different account than {label!r}'s stash does —\n"
+                 f"refusing to overwrite it. If this sign-in should become a new stash, run:\n"
+                 f"  desktop-switch.py capture <label>")
     with Lock():
-        n, total, files = _write_stash(label, keep_aside=True)
+        n, total, files = _write_stash(label, uid, keep_aside=True)
         _set_active(label, files)
     print(f"recaptured {label!r} from the live profile ({n} files, {total/1e6:.1f} MB)")
     print("the previous copy is kept aside; switching back to this account is free again")
@@ -382,6 +524,7 @@ def cmd_rename(old, new):
     os.rename(stash_dir(old), stash_dir(new))
     meta = stash_meta(new) or {}
     meta["label"] = new
+    meta.pop("unclaimed", None)   # being named is exactly what an unclaimed stash was waiting for
     write_json(os.path.join(stash_dir(new), "manifest.json"), meta)
     active = read_json(ACTIVE) or {}
     if active.get("label") == old:      # the record of what is installed follows the rename
@@ -395,22 +538,6 @@ def _set_active(label, files=None):
     # files: a manifest the caller just computed for these same bytes, to skip re-hashing.
     write_json(ACTIVE, {"label": label, "at": time.time(),
                         "files": manifest(PROFILE) if files is None else files})
-
-def identify_exact():
-    """The stash the profile matches byte for byte, or None.
-
-    Certainty, not a best guess — the caller overwrites a stash on the strength of it, and
-    guessing wrong there costs the ability to switch to that account at all.
-    """
-    if not os.path.isdir(PROFILE):
-        return None
-    cur = manifest(PROFILE)
-    if not cur:
-        return None
-    for label in list_stashes():
-        if (stash_meta(label) or {}).get("files") == cur:
-            return label
-    return None
 
 def identify():
     """(label, note) for the profile on disk: which stash it matches, if any.
@@ -502,27 +629,32 @@ def cmd_switch(label, dry_run=False):
         sys.exit("This is running inside the desktop app, and switching quits that app — which\n"
                  "would kill this process mid-swap. Run it from Terminal.")
 
+    # Byte-verification later proves the install copied faithfully; only this proves the
+    # bytes are the account the manifest claims. A disagreement means the label or the
+    # manifest is lying, and installing it would sign the app into a different account
+    # than every surface reports.
+    files_uid = profile_identity(src)
+    if files_uid and meta.get("account_uuid") and files_uid != meta["account_uuid"]:
+        sys.exit(f"the stash {label!r} records one account but its files hold another —\n"
+                 f"its manifest can't be trusted. Fix the label (`rename`) or re-capture\n"
+                 f"the account before switching to it.")
+
+
     with Lock():
         print("· quitting Claude.app…")
         if not quit_app():
             sys.exit("Claude.app did not quit within 45s — nothing was changed.\n"
                      "Something is holding it open (a modal dialog?). Quit it by hand and retry.")
 
-        # The account being displaced is worth keeping switchable-back-to. Refresh its stash
-        # only when the profile still matches it exactly; a drifted profile belongs to whatever
-        # happened in the app, and overwriting a good stash with it would lose the known-good copy.
-        cur_label = identify_exact()
-        if cur_label and cur_label != label:
-            _write_stash(cur_label, keep_aside=False)
-            print(f"  refreshed the stash for {cur_label!r} before replacing it")
-        else:
-            _refresh_dead_stash(label)
+        _preserve_displaced(label)
 
         op_id = time.strftime("%Y%m%d-%H%M%S")
         rb = os.path.join(ROLLBACK, op_id)
         os.makedirs(rb, mode=0o700, exist_ok=True)
         n, _ = copy_identity(PROFILE, rb)
         print(f"· saved {n} files to roll back to")
+        for old in sorted(os.listdir(ROLLBACK))[:-12]:   # undo only ever uses the newest
+            shutil.rmtree(os.path.join(ROLLBACK, old), ignore_errors=True)
 
         write_json(JOURNAL, {"op": op_id, "phase": "staged", "target": label,
                              "rollback": rb, "staging": _staging(op_id), "moved": []})
@@ -541,22 +673,81 @@ def cmd_switch(label, dry_run=False):
     print("If it opens on a sign-in screen: signing in is safe (device trust holds) — then run")
     print("`desktop-switch.py recapture` to stash the fresh session. Or undo:  desktop-switch.py undo\n")
 
-def _refresh_dead_stash(target):
-    """Replace the displaced account's stash with the live profile when its capture predates
-    the installed app version.
+def _aside_stash(label):
+    """Move a stash's current content aside before it is overwritten, and bound the pile.
 
-    A pre-update capture cannot work as captured (installing it lands on a login screen),
-    while the profile being displaced holds whatever session has actually been working under
-    the new version. The byte-exact guard above is deliberately not required here: it protects
-    known-good captures from drifted profiles, and this capture is known-dead — the worst a
-    drifted profile can do is mislabel the stash (the ACTIVE record is a record, not a
-    reading, so a hand sign-in as another account would be stashed under this label; `rename`
-    fixes that). The displaced bytes go aside rather than being deleted, so even that case
-    loses nothing. If the profile is itself a signed-out login screen (the user never logged
-    in after a failed switch), its bytes are stashed and the version warning clears — the
-    stash is no worse than before, and the aside copy keeps the history.
+    The newest aside of each label always survives the pruning — it may be the only good
+    copy of an account whose stash a bad refresh displaced, and refreshes of OTHER labels
+    must not be able to age it out."""
+    if not os.path.isdir(stash_dir(label)):
+        return
+    os.makedirs(ASIDES, mode=0o700, exist_ok=True)
+    os.rename(stash_dir(label), os.path.join(ASIDES, time.strftime("%Y%m%d-%H%M%S") + "-" + label))
+    entries = sorted(os.listdir(ASIDES))          # names start with the timestamp: oldest first
+    keep = set(entries[-12:])
+    keep.update({e[16:]: e for e in entries}.values())   # label starts after "YYYYMMDD-HHMMSS-"
+    for e in entries:
+        if e not in keep:
+            shutil.rmtree(os.path.join(ASIDES, e), ignore_errors=True)
+
+def _preserve_displaced(target):
+    """Keep the account being displaced switchable-back-to.
+
+    Identity decides where the profile's bytes belong: they refresh the stash holding the
+    same account uuid, whatever the labels or this tool's own records claim — which is what
+    catches a login screen that got a different account typed into it. The target's own
+    stash is never touched: switching to an account you are already on means "install the
+    capture", and rewriting it first would just install the live bytes back while
+    destroying the capture (the rollback preserves the live bytes instead). A sign-in that
+    matches no stash refreshes the recorded label when that stash has no identity of its
+    own to contradict the reading, and is otherwise kept as an unclaimed stash for the user
+    to name — never written over a labeled stash. When identity can't be read at all,
+    records fill in: a byte-exact match only freshens that stash's bookkeeping, and the
+    recorded label is refreshed only when its capture predates the installed app version,
+    i.e. when what is being overwritten could not have worked anyway — recorded with no
+    account_uuid, because bytes nobody identified must not be stamped as verified.
     """
+    cur = manifest(PROFILE)
+    if not cur:
+        return                                # signed-out shell: nothing worth keeping
+    exact = next((l for l in list_stashes()
+                  if (stash_meta(l) or {}).get("files") == cur), None)
+    uid = profile_identity(PROFILE)
     claimed = (read_json(ACTIVE) or {}).get("label")
+    if uid:
+        owners = _uuid_owners(uid)
+        owner = exact if exact in owners else (owners[0] if owners else None)
+        if owner == target:
+            print(f"  the profile already belongs to {target!r}; its capture is what gets installed")
+            return
+        if owner:
+            if exact == owner:
+                print(f"  stash for {owner!r}: already current")
+            else:
+                _write_stash(owner, uid, keep_aside=True)
+                print(f"  stash for {owner!r}: refreshed, identity-verified")
+            return
+        if claimed and claimed != target and claimed in list_stashes() \
+                and _stash_uuid(claimed) is None:
+            # The record says this label was installed, and its stash carries no identity
+            # to disagree with the reading — adopt it, healing the stash and recording the
+            # uuid it now provably holds.
+            _write_stash(claimed, uid, keep_aside=True)
+            print(f"  stash for {claimed!r}: refreshed from the live profile; its account "
+                  f"is now recorded")
+            return
+        q = "unclaimed-" + time.strftime("%Y%m%d-%H%M%S")
+        _write_stash(q, uid, unclaimed=True)
+        print(f"  this profile's account has no stash — kept it as {q!r}; name it with:\n"
+              f"    desktop-switch.py rename {q} <label>")
+        return
+    if exact and exact != target:
+        # Byte-identical to its stash: the files need no rewrite, only fresher bookkeeping.
+        m = stash_meta(exact) or {}
+        m.update({"captured_at": time.time(), "app_version": app_version()})
+        write_json(os.path.join(stash_dir(exact), "manifest.json"), m)
+        print(f"  stash for {exact!r}: already current")
+        return
     if not claimed or claimed == target or claimed not in list_stashes():
         return
     m = stash_meta(claimed) or {}
@@ -805,10 +996,28 @@ def cmd_add():
 
 def cmd_status():
     print(f"\nprofile:  {PROFILE}")
-    print(f"app:      {'RUNNING — quit before capturing or switching' if app_running() else 'not running'}"
+    running = app_running()
+    print(f"app:      {'RUNNING — quit before capturing or switching' if running else 'not running'}"
           f"  (v{app_version()})")
-    label, note = identify()
-    print(f"account:  {label or 'unknown'}" + (f"  — {note}" if note else ""))
+    if running or _journal():
+        # A running app holds newer state in memory, and a half-swapped profile mid-repair
+        # can carry one account's Local Storage next to another's cookies — in both cases a
+        # confident read off the disk would be wrong, so the record answers instead.
+        label, note = identify()
+        print(f"account:  {label or 'unknown'}" + (f"  — {note}" if note else ""))
+    else:
+        # At rest the profile can be read outright, which beats any record.
+        uid = profile_identity(PROFILE)
+        owners = _uuid_owners(uid)
+        if owners:
+            print(f"account:  {owners[0]}  — read from the profile itself")
+        elif uid:
+            print(f"account:  {uid[:8]}…  — signed in, but no stash holds this account")
+        else:
+            # Nothing readable (an app update may have moved the store): the record still
+            # knows what was installed.
+            label, note = identify()
+            print(f"account:  {label or 'unknown'}" + (f"  — {note}" if note else ""))
     j = _journal()
     if j:
         print(f"\n  ⚠ an unfinished switch to {j.get('target')!r} is open (phase {j.get('phase')}).")

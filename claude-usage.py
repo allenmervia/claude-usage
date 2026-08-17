@@ -1098,8 +1098,8 @@ def mock_insights():
 def mock_desktop():
     return {"active": "side",
             "stashes": [{"label": l, "files": 34, "age_days": 0.4, "app_version": desktop_app_version(),
-                         "stale": False, "version_mismatch": False,
-                         "active": l == "side", "can_switch": l != "side"}
+                         "stale": False, "version_mismatch": False, "account_uuid": None,
+                         "unclaimed": False, "active": l == "side", "can_switch": l != "side"}
                         for l, *_ in MOCK_ACCOUNTS],
             "needs_repair": False, "app_running": True, "needs_confirm": True,
             "app_version": desktop_app_version()}
@@ -1160,6 +1160,11 @@ def _desktop_state():
             "files": len(m.get("files") or {}),
             "age_days": round(age, 1),
             "app_version": m.get("app_version"),
+            # which account the stash provably holds (read from its files at capture/switch
+            # time by desktop-switch.py); None for captures that predate identity tracking
+            "account_uuid": m.get("account_uuid"),
+            # a sign-in kept safe during a switch, waiting for the user to name it
+            "unclaimed": bool(m.get("unclaimed")),
             # Stale predicts "switching to this stash will hit the sign-in banner". The active
             # account's session lives in the app, not its parked copy, so it is never stale here.
             "stale": age > STASH_STALE_DAYS and label != active,
@@ -1512,32 +1517,46 @@ def attach_display(rows):
     return rows
 
 def _match_desktop(rows):
-    """Pair each desktop stash with the Claude account it names, so one card can carry both.
+    """Pair each desktop stash with the Claude account it belongs to, so one card carries both.
 
-    A stash label is free text the user typed, so the pairing is by name: the account's email,
-    its email localpart, or its display label, case-insensitively — tried in that order because
-    emails are unique and display names collide (several of one person's logins share a name).
-    A tie within a tier attaches nothing: guessing would let one click switch the desktop app to
-    a different person's account than the CLI. An unmatched stash stays in the top-level list,
-    which the bar renders separately — renaming the stash to the account's email pairs it.
+    Identity outranks names: a stash that recorded which account uuid it holds (the same uuid
+    space the usage API reports) pairs with that account and nothing else — a mislabeled stash
+    must pair with the account it is, not the one it is named after. A stash with no recorded
+    uuid pairs by name: the account's email, its localpart, or its display label,
+    case-insensitively, in that order because emails are unique and display names collide.
+    A tie within a tier attaches nothing: guessing would let one click switch the desktop app
+    to a different person's account than the CLI. Unclaimed stashes never pair — riding an
+    account's card would offer one-click switching to a stash whose whole state is "name me
+    first". An unmatched stash stays in the top-level list, which the bar renders separately.
     """
     ds = rows_desktop_state.get("ds")
     if not ds:
         return
     claude = [r for r in rows if r.get("provider", "claude") == "claude"]
     claimed = set()
+    def attach(st, r):
+        st["matched_uuid"] = r["uuid"]
+        claimed.add(r["uuid"])
+        r["display"]["desktop"] = {k: st[k] for k in
+                                   ("label", "active", "can_switch", "stale",
+                                    "version_mismatch")}
     for st in ds["stashes"]:
+        uid = st.get("account_uuid")
+        if not uid or st.get("unclaimed"):
+            continue
+        hits = [r for r in claude if r["uuid"] == uid and r["uuid"] not in claimed]
+        if hits:
+            attach(st, hits[0])
+    for st in ds["stashes"]:
+        if st.get("account_uuid"):
+            continue        # identity known: the uuid pass above was its only legitimate match
         key = st["label"].strip().lower()
         for keyer in (lambda r: (r.get("email") or "").lower(),
                       lambda r: (r.get("email") or "").split("@")[0].lower(),
                       lambda r: (r.get("label") or "").strip().lower()):
             hits = [r for r in claude if keyer(r) == key and r["uuid"] not in claimed]
             if len(hits) == 1:
-                st["matched_uuid"] = hits[0]["uuid"]
-                claimed.add(hits[0]["uuid"])
-                hits[0]["display"]["desktop"] = {k: st[k] for k in
-                                                 ("label", "active", "can_switch", "stale",
-                                                  "version_mismatch")}
+                attach(st, hits[0])
                 break
             if hits:
                 break
@@ -2578,6 +2597,10 @@ def cmd_doctor():
                 say("warn", "the desktop app's account isn't one this tool captured",
                     "capture it: ./tools/desktop-switch.py add")
             for st in ds["stashes"]:
+                if st["unclaimed"]:
+                    say("warn", f"{st['label']}: a sign-in kept safe during a switch, not yet named",
+                        f"name it: ./tools/desktop-switch.py rename {st['label']} <label>")
+                    continue
                 # A version mismatch outranks age: an update is known to invalidate captures,
                 # while age only might.
                 if st["version_mismatch"] and st["active"]:
