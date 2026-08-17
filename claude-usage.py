@@ -1117,7 +1117,9 @@ DESKTOP_STASHES = os.path.join(STATE_DIR, "desktop-stashes")
 DESKTOP_ACTIVE  = os.path.join(STATE_DIR, "desktop-active.json")
 DESKTOP_JOURNAL = os.path.join(STATE_DIR, "desktop-journal.json")
 DESKTOP_APP     = "/Applications/Claude.app"
-STASH_STALE_DAYS = 14      # past this a stash is old enough that its session may have lapsed
+# The server invalidates sessions parked past about a day. Matches STALE_DAYS in
+# tools/desktop-switch.py so every surface warns from the same threshold.
+STASH_STALE_DAYS = 1
 
 def _read_json_file(path):
     try:
@@ -1141,8 +1143,9 @@ def _desktop_state():
         return None
     if not os.path.isdir(DESKTOP_STASHES):
         return None
+    # Dot-names are desktop-switch.py working directories, not stashes.
     labels = sorted(d for d in os.listdir(DESKTOP_STASHES)
-                    if os.path.isdir(os.path.join(DESKTOP_STASHES, d)))
+                    if not d.startswith(".") and os.path.isdir(os.path.join(DESKTOP_STASHES, d)))
     if not labels:
         return None
     active = (_read_json_file(DESKTOP_ACTIVE) or {}).get("label")
@@ -1157,7 +1160,9 @@ def _desktop_state():
             "files": len(m.get("files") or {}),
             "age_days": round(age, 1),
             "app_version": m.get("app_version"),
-            "stale": age > STASH_STALE_DAYS,
+            # Stale predicts "switching to this stash will hit the sign-in banner". The active
+            # account's session lives in the app, not its parked copy, so it is never stale here.
+            "stale": age > STASH_STALE_DAYS and label != active,
             # An app update can migrate or re-key the account stores, after which a pre-update
             # capture lands on a login screen when installed. Computed once here so every
             # surface warns from the same fact.
@@ -2587,8 +2592,9 @@ def cmd_doctor():
                         "switching to it will likely land on a login screen; log in there and its "
                         "saved copy refreshes on the next switch away.")
                 elif st["stale"]:
-                    say("warn", f"{st['label']}: captured {st['age_days']:.0f} days ago and may no longer work",
-                        "if switching to it lands on a login screen, re-add it with `add`.")
+                    say("warn", f"{st['label']}: parked {st['age_days']:.1f} days; its session has likely lapsed",
+                        "switching to it will likely show the sign-in banner. Sign in there, quit "
+                        "the app, then run ./tools/desktop-switch.py recapture to refresh the stash.")
 
     section("Menu bar")
     bundle = _app_bundle_path()

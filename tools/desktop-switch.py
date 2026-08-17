@@ -30,6 +30,8 @@ today. So: switch by swapping, never log out.
   desktop-switch.py signout-local       clear the session files without logging out
   desktop-switch.py status              which account is installed, plus stashes and health
   desktop-switch.py capture <label>     stash the signed-in account's profile as <label>
+  desktop-switch.py recapture [<label>] refresh a stash from the live profile (run after a
+                                        forced sign-in; defaults to the installed account)
   desktop-switch.py list                stashes, with age and app version
   desktop-switch.py switch <label>      swap to that account (quits and reopens the app)
   desktop-switch.py switch <label> -n   dry run: show exactly what would move, change nothing
@@ -54,6 +56,11 @@ LOCK     = os.path.join(STATE, "desktop-switch.lock")
 
 APP_EXEC   = "/Applications/Claude.app/Contents/MacOS/Claude"
 APP_BUNDLE = "com.anthropic.claudefordesktop"
+
+# A stash survives short parking, not long: since mid-Aug 2026 the server invalidates sessions
+# left idle for roughly a day, so a stash parked past this age usually comes back to the
+# "sign in again" banner even though its cookies are unexpired.
+STALE_DAYS = 1.0
 
 # The account-bearing stores: a sign-in rewrites these and leaves the rest of the profile alone.
 # Directories are swapped whole. tools/profile-probe.py re-derives this set if an app update
@@ -246,7 +253,41 @@ def stash_meta(label):
 def list_stashes():
     if not os.path.isdir(STASHES):
         return []
-    return sorted(d for d in os.listdir(STASHES) if os.path.isdir(stash_dir(d)))
+    # Dot-names are excluded so _write_stash's build directory never shows up as a stash.
+    return sorted(d for d in os.listdir(STASHES)
+                  if not d.startswith(".") and os.path.isdir(stash_dir(d)))
+
+def _write_stash(label, keep_aside):
+    """Replace <label>'s stash with the live profile's identity files.
+
+    The new copy is built complete in a hidden sibling directory and swapped into place with
+    renames, so an interruption at any point leaves the old stash or the new one under the
+    label — never a half-written directory. The manifest is hashed from the copied bytes
+    rather than the profile, so the record can never disagree with what the stash holds (the
+    post-swap verification in _apply compares against it). keep_aside moves the displaced
+    copy into ASIDES instead of deleting it.
+
+    Returns (files copied, bytes copied, manifest of the copy).
+    """
+    dest = stash_dir(label)
+    tmp = os.path.join(STASHES, f".building-{label}")
+    if os.path.exists(tmp):
+        shutil.rmtree(tmp)
+    os.makedirs(tmp, mode=0o700, exist_ok=True)
+    n, total = copy_identity(PROFILE, os.path.join(tmp, "files"))
+    files = manifest(os.path.join(tmp, "files"))
+    write_json(os.path.join(tmp, "manifest.json"), {
+        "label": label, "captured_at": time.time(), "app_version": app_version(),
+        "files": files})
+    if os.path.exists(dest):
+        if keep_aside:
+            aside = os.path.join(ASIDES, time.strftime("%Y%m%d-%H%M%S") + "-" + label)
+            os.makedirs(ASIDES, mode=0o700, exist_ok=True)
+            os.rename(dest, aside)
+        else:
+            shutil.rmtree(dest)
+    os.rename(tmp, dest)
+    return n, total, files
 
 def cmd_capture(label):
     if not label:
@@ -255,20 +296,57 @@ def cmd_capture(label):
         sys.exit("Claude.app is running — quit it first.\n"
                  "Its session stores are flushed to disk on quit, so a capture now would stash\n"
                  "a partial profile that fails when installed later.")
-    dest = stash_dir(label)
-    if os.path.exists(dest):
-        shutil.rmtree(dest)
-    os.makedirs(dest, mode=0o700, exist_ok=True)
-    n, total = copy_identity(PROFILE, os.path.join(dest, "files"))
-    if not n:
-        shutil.rmtree(dest)
+    if next(walk_identity(PROFILE), None) is None:
         sys.exit(f"nothing to capture — no identity files found under {PROFILE}")
-    write_json(os.path.join(dest, "manifest.json"), {
-        "label": label, "captured_at": time.time(), "app_version": app_version(),
-        "files": manifest(PROFILE),
-    })
-    _set_active(label)
-    print(f"captured {n} files ({total/1e6:.1f} MB) as {label!r}")
+    replacing = label in list_stashes()
+    n, total, files = _write_stash(label, keep_aside=replacing)
+    _set_active(label, files)
+    print(f"captured {n} files ({total/1e6:.1f} MB) as {label!r}"
+          + (" — the previous copy is kept aside" if replacing else ""))
+
+def cmd_recapture(label=""):
+    """Refresh an existing stash from the live profile, keeping the displaced copy aside.
+
+    This is the recovery step after a switch lands on the sign-in banner: the sign-in the user
+    just did lives only in the profile, while the stash still holds the invalidated session —
+    left alone, every future switch to that label reinstalls the dead copy and demands another
+    sign-in. Recapturing puts the fresh session in the stash, so one sign-in per long parking
+    is the whole cost instead of one per revisit.
+
+    The label defaults to the account this tool last installed, and anything else is refused:
+    the ACTIVE record is the only identity available for a drifted profile, so recapturing
+    under a different name — or with no record at all — could overwrite a good stash with
+    another account's files. A hand sign-in as a different account still recaptures under the
+    recorded label; `rename` fixes the name afterwards, and the aside copy keeps the history
+    either way.
+    """
+    if app_running():
+        sys.exit("Claude.app is running — quit it first.\n"
+                 "Its session stores are flushed to disk on quit, so a recapture now would stash\n"
+                 "a partial profile that fails when installed later.")
+    if _journal():
+        sys.exit("an earlier operation did not finish — run `desktop-switch.py repair` first")
+    claimed = (read_json(ACTIVE) or {}).get("label")
+    label = label or claimed
+    if not claimed:
+        sys.exit("the tool has no record of which account this profile holds (signout-local,\n"
+                 "undo, and hand sign-ins clear it), so recapture cannot attribute it to a\n"
+                 "stash safely. If you know which account is signed in, quit the app and run:\n"
+                 "  desktop-switch.py capture <label>   (the label's old stash is kept aside)")
+    if label not in list_stashes():
+        sys.exit(f"unknown stash: {label}\nknown: {', '.join(list_stashes()) or '(none)'}\n"
+                 "recapture refreshes an existing stash — use `capture` for a new label")
+    if claimed != label:
+        sys.exit(f"the profile here was last installed as {claimed!r}, not {label!r} — refusing\n"
+                 f"to overwrite {label!r}'s stash with it. Run `recapture {claimed}`, then\n"
+                 f"`rename` if that label is wrong.")
+    if next(walk_identity(PROFILE), None) is None:
+        sys.exit(f"nothing to recapture — no identity files found under {PROFILE}")
+    with Lock():
+        n, total, files = _write_stash(label, keep_aside=True)
+        _set_active(label, files)
+    print(f"recaptured {label!r} from the live profile ({n} files, {total/1e6:.1f} MB)")
+    print("the previous copy is kept aside; switching back to this account is free again")
 
 def cmd_list():
     stashes = list_stashes()
@@ -280,8 +358,11 @@ def cmd_list():
         m = stash_meta(label) or {}
         age = (time.time() - m.get("captured_at", 0)) / 86400
         mark = "▶" if label == active else " "
+        # The active row is the account in use, not a parked stash — no sign-in prediction there.
+        stale = (f"  (parked >{STALE_DAYS:g}d — expect a sign-in)"
+                 if age > STALE_DAYS and label != active else "")
         print(f" {mark} {label:<20} {len(m.get('files') or {}):>5} files  "
-              f"captured {age:.1f}d ago  app v{m.get('app_version')}")
+              f"captured {age:.1f}d ago  app v{m.get('app_version')}{stale}")
 
 def cmd_forget(label):
     if label not in list_stashes():
@@ -310,8 +391,10 @@ def cmd_rename(old, new):
 
 # ---- which account is installed --------------------------------------------
 
-def _set_active(label):
-    write_json(ACTIVE, {"label": label, "at": time.time(), "files": manifest(PROFILE)})
+def _set_active(label, files=None):
+    # files: a manifest the caller just computed for these same bytes, to skip re-hashing.
+    write_json(ACTIVE, {"label": label, "at": time.time(),
+                        "files": manifest(PROFILE) if files is None else files})
 
 def identify_exact():
     """The stash the profile matches byte for byte, or None.
@@ -348,12 +431,15 @@ def identify():
         # An open journal already explains the mismatch; blaming the app would send the reader
         # off to re-capture a profile that is mid-swap and about to be repaired.
         return None, "a switch is unfinished — run `desktop-switch.py repair`"
-    claimed = (read_json(ACTIVE) or {}).get("label")
+    active = read_json(ACTIVE)
+    claimed = (active or {}).get("label")
     if claimed:
         # Running the app rewrites these stores constantly, so an exact match only holds right
         # after a swap. Drift is the normal case and says nothing about which account is signed
         # in — report what was last installed, and be clear it is a record rather than a reading.
         return claimed, "from this tool's record; the files have drifted since, which is normal"
+    if active is not None:
+        return None, "record cleared (signout-local or undo) — a switch or capture re-establishes it"
     return None, "not captured yet"
 
 # ---- the switch -------------------------------------------------------------
@@ -374,12 +460,32 @@ def cmd_switch(label, dry_run=False):
         sys.exit("an earlier operation did not finish — run `desktop-switch.py repair` first")
     meta = stash_meta(label) or {}
     src = os.path.join(stash_dir(label), "files")
+    age_days = (((time.time() - meta["captured_at"]) / 86400)
+                if meta.get("captured_at") is not None else None)
+
+    cur_ver = app_version()
+    # Both warnings print for dry runs too — the preview's job is to predict the real run, and
+    # these are the two lines that predict a switch landing on a sign-in screen.
+    if meta.get("app_version") and cur_ver and meta["app_version"] != cur_ver:
+        # stderr, not stdout: wrappers keep stdout for results. Both versions must be
+        # readable: with either unknown there is no basis to warn, and the doctor/bar
+        # surfaces (which share this predicate) stay silent on unknown too.
+        print(f"warning: {label!r} was captured under app v{meta['app_version']}, now v{cur_ver}.\n"
+              f"         If the app has migrated its stores since, this may land on a login screen.",
+              file=sys.stderr)
+    if age_days is not None and age_days > STALE_DAYS:
+        print(f"warning: {label!r} has been parked {age_days:.1f}d, and the server invalidates\n"
+              f"         sessions idle for about a day — expect the sign-in banner. Signing in\n"
+              f"         there is safe (device trust holds). Afterwards, refresh the stash:\n"
+              f"         desktop-switch.py recapture",
+              file=sys.stderr)
 
     if dry_run:
         cur_label, note = identify()
-        print(f"\nwould switch to {label!r} (captured under app v{meta.get('app_version')})")
+        age = f", {age_days:.1f}d ago" if age_days is not None else ""
+        print(f"\nwould switch to {label!r} (captured under app v{meta.get('app_version')}{age})")
         print(f"currently installed: {cur_label or 'unknown'}{' — ' + note if note else ''}")
-        print(f"app version now:     {app_version()}")
+        print(f"app version now:     {cur_ver}")
         files = list(walk_identity(src))
         size = sum(os.path.getsize(p) for _, p in files)
         print(f"\nwould replace {len(files)} files ({size/1e6:.1f} MB) under:")
@@ -396,16 +502,6 @@ def cmd_switch(label, dry_run=False):
         sys.exit("This is running inside the desktop app, and switching quits that app — which\n"
                  "would kill this process mid-swap. Run it from Terminal.")
 
-    cur_ver = app_version()
-    if meta.get("app_version") and cur_ver and meta["app_version"] != cur_ver:
-        # stderr, not stdout: wrappers keep stdout for results, and this warning is the one
-        # line that predicts a switch landing on a login screen. Both versions must be
-        # readable: with either unknown there is no basis to warn, and the doctor/bar
-        # surfaces (which share this predicate) stay silent on unknown too.
-        print(f"warning: {label!r} was captured under app v{meta['app_version']}, now v{cur_ver}.\n"
-              f"         If the app has migrated its stores since, this may land on a login screen.",
-              file=sys.stderr)
-
     with Lock():
         print("· quitting Claude.app…")
         if not quit_app():
@@ -417,12 +513,7 @@ def cmd_switch(label, dry_run=False):
         # happened in the app, and overwriting a good stash with it would lose the known-good copy.
         cur_label = identify_exact()
         if cur_label and cur_label != label:
-            shutil.rmtree(stash_dir(cur_label))
-            os.makedirs(stash_dir(cur_label), mode=0o700, exist_ok=True)
-            copy_identity(PROFILE, os.path.join(stash_dir(cur_label), "files"))
-            write_json(os.path.join(stash_dir(cur_label), "manifest.json"), {
-                "label": cur_label, "captured_at": time.time(), "app_version": app_version(),
-                "files": manifest(PROFILE)})
+            _write_stash(cur_label, keep_aside=False)
             print(f"  refreshed the stash for {cur_label!r} before replacing it")
         else:
             _refresh_dead_stash(label)
@@ -447,7 +538,8 @@ def cmd_switch(label, dry_run=False):
     print("· reopening Claude.app…")
     launch_app()
     print(f"\nswitched the desktop app to {label!r}.")
-    print("If it opens on a login screen, run:  desktop-switch.py undo\n")
+    print("If it opens on a sign-in screen: signing in is safe (device trust holds) — then run")
+    print("`desktop-switch.py recapture` to stash the fresh session. Or undo:  desktop-switch.py undo\n")
 
 def _refresh_dead_stash(target):
     """Replace the displaced account's stash with the live profile when its capture predates
@@ -471,17 +563,9 @@ def _refresh_dead_stash(target):
     cur_ver = app_version()
     if not (m.get("app_version") and cur_ver and m["app_version"] != cur_ver):
         return
-    files = manifest(PROFILE)
-    if not files:
+    if next(walk_identity(PROFILE), None) is None:
         return
-    aside = os.path.join(ASIDES, time.strftime("%Y%m%d-%H%M%S") + "-" + claimed)
-    os.makedirs(ASIDES, mode=0o700, exist_ok=True)
-    os.rename(stash_dir(claimed), aside)
-    os.makedirs(stash_dir(claimed), mode=0o700, exist_ok=True)
-    copy_identity(PROFILE, os.path.join(stash_dir(claimed), "files"))
-    write_json(os.path.join(stash_dir(claimed), "manifest.json"), {
-        "label": claimed, "captured_at": time.time(), "app_version": cur_ver,
-        "files": files})
+    _write_stash(claimed, keep_aside=True)
     print(f"  refreshed the stash for {claimed!r} from the live profile; its capture predated "
           f"app v{cur_ver} (old copy kept aside)")
 
@@ -604,10 +688,20 @@ def cmd_undo():
         _rm(os.path.join(PROFILE, item))
     n, _ = copy_identity(rb, PROFILE)
     label, note = identify()
-    if label:
+    # A restored profile is pre-switch, drifted bytes, so identify() usually falls through to
+    # the ACTIVE record — which still names the account the undone switch installed. Writing
+    # that here would be a wrong guess that recapture later trusts enough to overwrite a stash
+    # on, so record a label only on a byte-exact match and otherwise clear it.
+    if label and note is None:
         _set_active(label)
+    else:
+        write_json(ACTIVE, {"label": None, "at": time.time(), "files": {}})
+        label = None
     print(f"restored {n} files from {rbs[-1]} — the desktop app is back on "
           f"{label or 'the previous account'}.")
+    if not label:
+        print("which account that is goes unrecorded after an undo; the next switch or a")
+        print("`capture <label>` with the app quit re-establishes it.")
     launch_app()
 
 def _ask(prompt, default=None):
@@ -736,6 +830,11 @@ def main():
     elif cmd == "signout-local": cmd_signout_local()
     elif cmd == "list":    cmd_list()
     elif cmd == "capture": cmd_capture(arg)
+    elif cmd == "recapture":
+        if flags:
+            sys.exit("recapture takes no flags — it replaces the stash immediately, no dry run.\n"
+                     "Preview the stash state with `list` or `status` instead.")
+        cmd_recapture(arg)
     elif cmd == "switch":  cmd_switch(arg, dry_run=bool({"-n", "--dry-run"} & flags))
     elif cmd == "undo":    cmd_undo()
     elif cmd == "repair":  cmd_repair()

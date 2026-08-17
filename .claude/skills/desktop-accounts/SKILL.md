@@ -17,8 +17,10 @@ path. macOS only — it drives Claude.app and the macOS Keychain.
 **Never log out in the app.** A logout revokes that account's session server-side, which kills
 its stash permanently — restoring the files afterwards only ever reaches a login screen. To
 reach a login screen safely, `signout-local` clears the session files while leaving the session
-valid. If a switch lands on a login screen, the first question is whether that account was
-logged out since it was captured; that is the usual cause, not a broken stash.
+valid. A switch landing on a login screen usually has one of three causes: a stash parked past
+its lifetime (common — one sign-in recovers it; see "Stash lifetime"), an app update that
+migrated the session stores since capture (`switch` warns when the versions differ), or a
+logout since capture (unrecoverable). A broken stash is rarely the reason.
 
 ## Where you can run what
 
@@ -47,7 +49,8 @@ Say the shape of it plainly:
 
 - Each account must be **captured once**, and capturing needs that account signed into the app.
   So the first setup spends one login per account beyond the one already signed in. After that,
-  switching never logs in again.
+  switching between recently used accounts needs no login — but a stash parked for more than a
+  day or so needs one sign-in when returned to (see "Stash lifetime").
 - Capturing and switching **quit and reopen the app**, killing any Claude Code sessions running
   inside it. Sessions resume from the app's list, but a turn in flight is lost. Park them first.
 - Their **device stays trusted** — device registration is deliberately left in place — so
@@ -71,6 +74,7 @@ app's log-out button, which silently destroys a stash.
 | Stashes with age and app version | `list` |
 | Switch to a captured account | `switch <label>` |
 | Preview a switch, change nothing | `switch <label> -n` |
+| Refresh a stash after a forced sign-in | `recapture` (app must be quit) |
 | Add another account (interactive) | `add` |
 | Undo the last switch | `undo` |
 | Finish/roll back an interrupted run | `repair` |
@@ -101,11 +105,15 @@ for nothing.
 asks for both names up front, clears the session locally rather than logging out, waits for
 them to log in, then proves the switch works.
 
-**"The switch landed on a login screen."** Ask whether that account was logged out in the app
-since capture. If yes, its session is revoked and the stash cannot be recovered — re-add it
-with `add`. If no, the stash may be missing a file; the candidates are `buddy-tokens.json` and
-`config.json`, noted in the tool's IDENTITY comment. Either way `undo` restores the previous
-account first.
+**"The switch landed on a login screen."** Check the stash's age with `list` first — it marks
+stashes parked past the lifetime. Marked: this is stash lifetime, not breakage. The user signs
+in on that screen **as that same account**, quits the app, and runs `recapture` so the fresh
+session is stashed; or `undo` restores the previous account without a sign-in. If the stash is
+fresh, check for the tool's app-version warning (an update since capture can invalidate it),
+then ask whether that account was logged out in the app since capture — if yes, its session is
+revoked and the stash cannot be recovered: run `undo` first to get back to a working account,
+then re-add it with `add`. Only after ruling those out suspect a missing file; the candidates
+are `buddy-tokens.json` and `config.json`, noted in the tool's IDENTITY comment.
 
 **"Which account am I on?"** Report `status`, and be honest that it is the tool's record of what
 it last installed, not a reading from the app — a login done by hand is not visible to it.
@@ -119,8 +127,17 @@ Usage percentages come from the CLI's stored refresh tokens, so an account only 
 it has been logged into with the `claude` CLI at least once. A desktop-only account is
 switchable but has no usage numbers.
 
-## Unproven
+## Stash lifetime
 
-Whether a stash still works after days rather than minutes is not yet known — it depends on how
-long the session cookies stay valid. If an old stash stops working, re-adding it with `add` is
-the fix. Do not promise durability.
+A stash survives short parking (hours), not long parking. Since mid-August 2026 the server
+invalidates sessions that sit idle for more than about a day: the stash restores correctly and
+its cookies are unexpired, but the app opens on the "For your security, sign in again" banner.
+This is server policy, not a tool defect, so do not debug the stash when an old one lands on a
+login screen — and treat the one-day figure as current behavior, not a guarantee.
+
+So: switching to an account used earlier the same day just works; returning to one parked for
+days costs one sign-in at the banner (a password step only — device registration is untouched,
+per the onboarding notes). That sign-in lives only in the live profile, and the stash still
+holds the dead capture, so without a `recapture` the account signs in again on every revisit,
+not just the first. `switch` warns before installing a stash parked past a day; the recovery
+steps live in "The switch landed on a login screen" above.
