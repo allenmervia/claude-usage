@@ -448,7 +448,11 @@ def _stash_uuid(label):
     uuid-less stash pays a rescan of its few MB per call.
     """
     m = stash_meta(label) or {}
-    u = m.get("account_uuid") or profile_identity(os.path.join(stash_dir(label), "files"))
+    if m.get("account_uuid"):
+        return m["account_uuid"]
+    if m.get("identity_unreadable"):
+        return None      # scanned before, nothing readable — don't pay the rescan every call
+    u = profile_identity(os.path.join(stash_dir(label), "files"))
     return u if _is_uuid(u) else None    # a signed-out capture is attributable to no account
 
 def _uuid_owners(uid):
@@ -490,6 +494,19 @@ def _write_stash(label, uid=None, keep_aside=False, unclaimed=False):
     files = manifest(os.path.join(tmp, "files"))
     meta = {"label": label, "captured_at": time.time(), "app_version": app_version(),
             "account_uuid": uid, "files": files}
+    # The captured bytes get their own verdict at birth, so a dead capture is knowable
+    # BEFORE a click tries to install it — the switch-time refusal must be the last net,
+    # not the first signal. Log-sourced identity also backfills a uuid the caller didn't
+    # have; table residue backfills nothing (it can name an earlier account).
+    verdict, source = profile_identity(os.path.join(tmp, "files"), with_source=True)
+    meta["bytes_checked"] = True               # the verdict below is recorded; never re-scan
+    if verdict == SIGNED_OUT:
+        meta["revoked"] = True
+        meta["revoked_reason"] = "captured-signed-out"
+    elif meta["account_uuid"] is None and _is_uuid(verdict) and source == "log":
+        meta["account_uuid"] = verdict
+    elif verdict is None:
+        meta["identity_unreadable"] = True     # nothing readable in there
     if unclaimed:
         meta["unclaimed"] = True
     write_json(os.path.join(tmp, "manifest.json"), meta)
@@ -670,15 +687,17 @@ def _release_try_lock():
     except OSError:
         pass
 
-def _mark_revoked(label):
-    """Stamp a stash as holding a session its account ended by hand (in-app logout). The flag
-    lives in the manifest so any recapture — which rewrites the manifest — clears it."""
+def _mark_revoked(label, reason="hand-logout"):
+    """Stamp a stash as holding a dead session — one that cannot come up signed in. The flag
+    lives in the manifest so any recapture — which rewrites the manifest — clears it; the
+    reason ("hand-logout" or "captured-signed-out") only picks the wording surfaces use."""
     if label not in list_stashes():
         return False
     m = stash_meta(label) or {}
     if m.get("revoked"):
         return False
     m["revoked"] = True
+    m["revoked_reason"] = reason
     write_json(os.path.join(stash_dir(label), "manifest.json"), m)
     return True
 
@@ -730,11 +749,31 @@ def cmd_observe(heal=False):
     actionable = ((uid == SIGNED_OUT and not app_running())
                   or (_is_uuid(uid) and source == "log"
                       and (out["drifted"] or out["untracked"])))
-    if not heal or not actionable or _journal():
+    # Stashes that never got a verdict at capture (pre-identity captures) get one here, once:
+    # a dead capture must warn from the manifest like version_mismatch does, not first from a
+    # refused click. The outcome is always written — uuid, revoked, or identity_unreadable —
+    # so no stash is scanned twice.
+    backfill = [l for l in stash_ids
+                if not (stash_meta(l) or {}).get("bytes_checked")
+                and not (stash_meta(l) or {}).get("revoked")]
+    if not heal or not (actionable or backfill) or _journal():
         print(json.dumps(out)); return
     if not _try_lock():
         print(json.dumps(out)); return
     try:
+        for l in backfill:
+            v, s = profile_identity(os.path.join(stash_dir(l), "files"), with_source=True)
+            if v == SIGNED_OUT and _mark_revoked(l, reason="captured-signed-out"):
+                out["revoked"].append(l)
+            m = stash_meta(l) or {}
+            m["bytes_checked"] = True
+            if _is_uuid(v) and s == "log" and not m.get("account_uuid"):
+                m["account_uuid"] = v
+            elif v is None:
+                m["identity_unreadable"] = True
+            write_json(os.path.join(stash_dir(l), "manifest.json"), m)
+        if not actionable:
+            print(json.dumps(out)); return
         if claimed != (read_json(ACTIVE) or {}).get("label"):
             print(json.dumps(out)); return   # a switch beat us to it; its record wins
         if uid == SIGNED_OUT:

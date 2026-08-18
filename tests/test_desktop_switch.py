@@ -611,6 +611,64 @@ class TestObserve(_ToolCase):
         self.assertEqual(out["healed"], "allen")
         self.assertEqual(out["revoked"], [])          # its account is still signed in
 
+    def test_capture_records_a_signed_out_verdict_on_the_bytes(self):
+        # _preserve_displaced's version-gated tail can stash login-screen bytes; the writer
+        # itself must record that verdict so surfaces warn before any click
+        write_log(self.profile, [record(batch(("put", KEY, account_json(UUID_A)))),
+                                 record(batch(("del", KEY)))])
+        self.ds._write_stash("dead", keep_aside=False)
+        m = self.ds.stash_meta("dead") or {}
+        self.assertTrue(m.get("revoked"))
+        self.assertEqual(m.get("revoked_reason"), "captured-signed-out")
+
+    def test_capture_backfills_uuid_from_the_captured_bytes(self):
+        self.sign_in(UUID_A)
+        self.ds._write_stash("fresh", keep_aside=False)   # caller passed no uid
+        self.assertEqual((self.ds.stash_meta("fresh") or {}).get("account_uuid"), UUID_A)
+
+    def test_unreadable_capture_is_marked_scanned_once(self):
+        self.touch_cookie()                                # files, but no identity anywhere
+        self.ds._write_stash("mystery", keep_aside=False)
+        self.assertTrue((self.ds.stash_meta("mystery") or {}).get("identity_unreadable"))
+
+    def test_observe_backfills_legacy_stashes_once(self):
+        # a pre-identity stash holding dead bytes gets its verdict on the first heal tick,
+        # not on the first refused click
+        self.sign_in(UUID_A)
+        self.make_stash("legacy", None)
+        d = os.path.join(self.state, "desktop-stashes", "legacy", "files")
+        write_log(d, [record(batch(("put", KEY, account_json(UUID_B)))),
+                      record(batch(("del", KEY)))])
+        self.ds.write_json(self.ds.ACTIVE, {"label": "legacy", "at": 1.0, "files": {}})
+        out = self.observe()
+        self.assertIn("legacy", out["revoked"])
+        m = self.ds.stash_meta("legacy") or {}
+        self.assertEqual(m.get("revoked_reason"), "captured-signed-out")
+
+    def test_observe_backfill_marks_unreadable_stashes_scanned(self):
+        self.sign_in(UUID_A)
+        self.make_stash("allen", None)                     # cookie-only files, no identity
+        self.ds.write_json(self.ds.ACTIVE, {"label": "allen", "at": 1.0, "files": {}})
+        self.observe()
+        self.assertTrue((self.ds.stash_meta("allen") or {}).get("identity_unreadable"))
+
+    def test_observe_audits_uuid_carrying_stashes_for_dead_bytes(self):
+        # the incident class: a recapture-era stash records a uuid but its bytes hold a
+        # signed-out session — the one-time audit must catch it, not the refused click
+        self.sign_in(UUID_A)
+        self.make_stash("allen", UUID_A)
+        self.make_stash("allen-2", UUID_B)
+        d = os.path.join(self.state, "desktop-stashes", "allen-2", "files")
+        write_log(d, [record(batch(("put", KEY, account_json(UUID_B)))),
+                      record(batch(("del", KEY)))])
+        self.ds.write_json(self.ds.ACTIVE, {"label": "allen", "at": 1.0, "files": {}})
+        out = self.observe()
+        self.assertIn("allen-2", out["revoked"])
+        m = self.ds.stash_meta("allen-2") or {}
+        self.assertEqual(m.get("revoked_reason"), "captured-signed-out")
+        m2 = self.ds.stash_meta("allen") or {}
+        self.assertTrue(m2.get("bytes_checked"))     # audited once, never again
+
     def test_recapture_clears_the_revoked_flag(self):
         self.sign_in(UUID_A)
         self.make_stash("allen", UUID_A)

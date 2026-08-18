@@ -1186,8 +1186,10 @@ def _desktop_state():
             "version_mismatch": bool(m.get("app_version") and app_ver
                                      and m["app_version"] != app_ver),
             "active": label == active,
-            # a hand logout inside the app ended this stash's session; recapture clears it
+            # this stash's session is dead (hand logout, or captured already signed out);
+            # recapture clears it. The reason only picks the warning's wording.
             "revoked": bool(m.get("revoked")),
+            "revoked_reason": m.get("revoked_reason"),
             # Switching restarts the app, so a consumer must confirm rather than act on a click.
             # A revoked stash is not clickable at all: installing a session known to be dead
             # can only land on the sign-in banner, and every surface must refuse from this
@@ -1597,7 +1599,7 @@ def _match_desktop(rows):
         # absent — it is an active-account, whole-panel fact, surfaced by the footer.
         r["display"]["desktop"] = {k: st.get(k) for k in
                                    ("label", "active", "can_switch", "stale",
-                                    "version_mismatch", "revoked")}
+                                    "version_mismatch", "revoked", "revoked_reason")}
 
 # attach_display runs deep inside rendering while desktop_state is fetched at the top of the
 # payload build; this hands one snapshot from the one place to the other without threading a
@@ -2987,9 +2989,11 @@ def cmd_doctor():
                         f"name it: ./tools/desktop-switch.py rename {st['label']} <label>")
                     continue
                 if st.get("revoked"):
-                    # definitive, so it outranks every likelihood below: a hand logout inside
-                    # the app ended this stash's session server-side
-                    say("warn", f"{st['label']}: was signed out inside the app; its saved session is dead",
+                    # definitive, so it outranks every likelihood below
+                    what = ("its saved copy was captured signed out"
+                            if st.get("revoked_reason") == "captured-signed-out"
+                            else "was signed out inside the app; its saved session is dead")
+                    say("warn", f"{st['label']}: {what}",
                         "sign into it in the app once, quit the app, then "
                         "./tools/desktop-switch.py recapture")
                     continue
