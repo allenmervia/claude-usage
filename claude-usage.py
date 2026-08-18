@@ -575,8 +575,6 @@ def collect(ingest=True, act=None):
         save_cache(rows, now)
         append_history(rows, now)
         if act:
-            desktop_observe(heal=True)     # reconcile the desktop record with hand sign-ins
-                                           # first, so every consumer below sees healed state
             rows = maybe_auto_switch(rows)
         return rows
     if cache and cache.get("rows"):                           # every Claude read errored → last known Claude
@@ -1097,144 +1095,6 @@ def mock_insights():
         ],
     }
 
-def mock_desktop():
-    return {"active": "side",
-            "stashes": [{"label": l, "files": 34, "age_days": 0.4, "app_version": desktop_app_version(),
-                         "stale": False, "copy_old": False, "version_mismatch": False,
-                         "account_uuid": None, "unclaimed": False, "revoked": False,
-                         "active": l == "side", "can_switch": l != "side"}
-                        for l, *_ in MOCK_ACCOUNTS],
-            "active_at": None, "observed": None,
-            "needs_repair": False, "app_running": True, "needs_confirm": True,
-            "app_version": desktop_app_version()}
-
-# ---- the desktop app's account ----------------------------------------------
-# The desktop app signs in separately from the CLI, and its account is a set of files rather
-# than a token we can read — tools/desktop-switch.py stashes them per account and swaps them in.
-# What is shown here is that tool's own state, read straight off disk: the stash list, and its
-# record of which one was last installed. Deliberately no hashing, unlike `desktop-switch.py
-# status` — this runs on every menu tick, and the stores drift on every app run anyway, so a
-# match would be false as often as not. The label is therefore a record, never a reading, and
-# every surface says so rather than implying we can see into the app.
-
-DESKTOP_STASHES = os.path.join(STATE_DIR, "desktop-stashes")
-DESKTOP_ACTIVE  = os.path.join(STATE_DIR, "desktop-active.json")
-DESKTOP_JOURNAL = os.path.join(STATE_DIR, "desktop-journal.json")
-DESKTOP_APP     = "/Applications/Claude.app"
-# The server invalidates sessions parked past about a day. Matches STALE_DAYS in
-# tools/desktop-switch.py so every surface warns from the same threshold.
-STASH_STALE_DAYS = 1
-
-def _read_json_file(path):
-    try:
-        with open(path) as f: return json.load(f)
-    except Exception:
-        return None
-
-def desktop_state():
-    if mock_enabled():
-        return mock_desktop()
-    return _desktop_state()
-
-def _desktop_state():
-    """The desktop app's switchable accounts, or None when the feature isn't set up here.
-
-    None means "say nothing": no desktop app installed, or nothing captured yet. A surface
-    should not advertise switching to someone who has no stashes — the onboarding for that
-    lives in `doctor`, which is where a user goes to ask what's missing.
-    """
-    if not os.path.isdir(DESKTOP_APP):
-        return None
-    if not os.path.isdir(DESKTOP_STASHES):
-        return None
-    # Dot-names are desktop-switch.py working directories, not stashes.
-    labels = sorted(d for d in os.listdir(DESKTOP_STASHES)
-                    if not d.startswith(".") and os.path.isdir(os.path.join(DESKTOP_STASHES, d)))
-    if not labels:
-        return None
-    rec = _read_json_file(DESKTOP_ACTIVE) or {}
-    active = rec.get("label")
-    now = time.time()
-    app_ver = desktop_app_version()
-    stashes = []
-    for label in labels:
-        m = _read_json_file(os.path.join(DESKTOP_STASHES, label, "manifest.json")) or {}
-        # a missing or unreadable manifest must read as OLD, not fresh: these fields gate
-        # unattended swaps, and unknown-defaults-to-go is how garbage gets installed
-        age = (now - m["captured_at"]) / 86400 if m.get("captured_at") else None
-        # The copy's age alone, active account included. A switch away refreshes the
-        # displaced stash only from a byte-exact or known-dead profile, so an aged copy
-        # under the active account predicts the sign-in banner on a switch away and back.
-        copy_old = age is None or age > STASH_STALE_DAYS
-        stashes.append({
-            "label": label,
-            "files": len(m.get("files") or {}),
-            "age_days": round(age, 1) if age is not None else None,
-            "app_version": m.get("app_version"),
-            # which account the stash provably holds (read from its files at capture/switch
-            # time by desktop-switch.py); None for captures that predate identity tracking
-            "account_uuid": m.get("account_uuid"),
-            # a sign-in kept safe during a switch, waiting for the user to name it
-            "unclaimed": bool(m.get("unclaimed")),
-            # Stale predicts "switching to this stash will hit the sign-in banner". The active
-            # account's session lives in the app, not its parked copy, so it is never stale here.
-            "stale": copy_old and label != active,
-            "copy_old": copy_old,
-            # An app update can migrate or re-key the account stores, after which a pre-update
-            # capture lands on a login screen when installed. Computed once here so every
-            # surface warns from the same fact.
-            "version_mismatch": bool(m.get("app_version") and app_ver
-                                     and m["app_version"] != app_ver),
-            "active": label == active,
-            # this stash's session is dead (hand logout, or captured already signed out);
-            # recapture clears it. The reason only picks the warning's wording.
-            "revoked": bool(m.get("revoked")),
-            "revoked_reason": m.get("revoked_reason"),
-            # Switching restarts the app, so a consumer must confirm rather than act on a click.
-            # A revoked stash is not clickable at all: installing a session known to be dead
-            # can only land on the sign-in banner, and every surface must refuse from this
-            # one computed fact.
-            "can_switch": label != active and not m.get("revoked"),
-        })
-    # Whether a switch costs the user anything depends entirely on the app being open. With it
-    # closed there is nothing to quit and no session to lose, so the swap is as unremarkable as
-    # a CLI switch and a click can just do it. With it open the same click closes live sessions,
-    # which is a thing to be asked about rather than discovered afterwards.
-    running = desktop_app_running()
-    observed = desktop_observe()       # report-only here; collect's act path healed already
-    return {"active": active, "stashes": stashes,
-            # the profile's own identity vs the record, when a refresh observed it — lets a
-            # surface say "the app is signed into an account not captured here"
-            "observed": observed,
-            # when the installed account last changed (any switch or capture), for holdoffs
-            "active_at": rec.get("at"),
-            "needs_repair": bool(_read_json_file(DESKTOP_JOURNAL)),
-            "app_running": running,
-            "needs_confirm": running,
-            "app_version": app_ver}
-
-DESKTOP_EXEC = os.path.join(DESKTOP_APP, "Contents", "MacOS", "Claude")
-
-def _proc_names():
-    return subprocess.run(["ps", "-Ao", "comm="], capture_output=True, text=True).stdout.splitlines()
-
-def desktop_app_running():
-    """True while the desktop app is open.
-
-    Matched on the full executable path: pgrep does not report this process at all — it sees the
-    "Claude Helper" children and misses the parent — so a pgrep check would call a running app
-    closed and let a click silently kill live sessions.
-    """
-    return any(line.strip() == DESKTOP_EXEC for line in _proc_names())
-
-def desktop_app_version():
-    try:
-        import plistlib
-        with open(os.path.join(DESKTOP_APP, "Contents", "Info.plist"), "rb") as f:
-            return plistlib.load(f).get("CFBundleShortVersionString")
-    except Exception:
-        return None
-
 # ---- rendering --------------------------------------------------------------
 
 def rel(dt):
@@ -1422,11 +1282,10 @@ def render_table(rows):
                    else f"{len(latched)} accounts are")
         print(f"{C['y']}⚠ {subject} signed out and no longer refreshing. "
               f"Sign back in with `claude-usage relogin {who}`.{C['x']}\n")
-    aw = None if mock_enabled() else load_autoswitch()    # a real switch under invented data
-    for line in ([] if aw is None else                    # would read as part of the fiction
-                 [last_auto_line(aw), last_desktop_line(aw)]):
-        if line:
-            print(f"{C['dim']}{line}{C['x']}\n")
+    # suppressed under mock: a real switch record under invented data would read as fiction
+    line = None if mock_enabled() else last_auto_line()
+    if line:
+        print(f"{C['dim']}{line}{C['x']}\n")
     n = len([r for r in rows if is_claude(r) and not r.get("is_team")])
     if n <= 1:
         lead = "No personal accounts tracked yet" if n == 0 else "Only one account tracked so far"
@@ -1540,81 +1399,13 @@ def attach_display(rows):
                 t["window_s"] = win_s
             d["trend"] = t
         r["display"] = d
-    _match_desktop(rows)
     return rows
 
-def desktop_pairs(rows, ds):
-    """{stash label: account row} for every stash attributable to exactly one account.
-
-    Identity outranks names: a stash that recorded which account uuid it holds (the same uuid
-    space the usage API reports) pairs with that account and nothing else — a mislabeled stash
-    must pair with the account it is, not the one it is named after. A stash with no recorded
-    uuid pairs by name: the account's email, its localpart, or its display label,
-    case-insensitively, in that order because emails are unique and display names collide.
-    A tie within a tier attaches nothing: guessing would let a click or an auto-switch move
-    the desktop app to a different person's account than the CLI. Unclaimed stashes never
-    pair — their whole state is "name me first"."""
-    claude = [r for r in rows if r.get("provider", "claude") == "claude"]
-    claimed, pairs = set(), {}
-    def take(st, r):
-        pairs[st["label"]] = r
-        claimed.add(r["uuid"])
-    for st in ds["stashes"]:
-        uid = st.get("account_uuid")
-        if not uid or st.get("unclaimed"):
-            continue
-        hits = [r for r in claude if r["uuid"] == uid and r["uuid"] not in claimed]
-        if hits:
-            take(st, hits[0])
-    for st in ds["stashes"]:
-        if st.get("account_uuid") or st.get("unclaimed"):
-            continue        # identity known: the uuid pass above was its only legitimate match;
-                            # unclaimed: its whole state is "name me first"
-        key = st["label"].strip().lower()
-        for keyer in (lambda r: (r.get("email") or "").lower(),
-                      lambda r: (r.get("email") or "").split("@")[0].lower(),
-                      lambda r: (r.get("label") or "").strip().lower()):
-            # ambiguity is judged against ALL accounts, not the unclaimed remainder — a name
-            # that fits two accounts stays refused even after the uuid pass claimed one of
-            # them, otherwise a mislabeled stash's claim would resolve the tie by elimination
-            hits = [r for r in claude if keyer(r) == key]
-            if len(hits) == 1 and hits[0]["uuid"] not in claimed:
-                take(st, hits[0])
-                break
-            if hits:
-                break
-    return pairs
-
-def _match_desktop(rows):
-    """Fold the stash pairing into the render: the paired account's card carries the stash,
-    and an unmatched stash stays in the top-level list, which the bar renders separately."""
-    ds = rows_desktop_state.get("ds")
-    if not ds:
-        return
-    by_label = {st["label"]: st for st in ds["stashes"]}
-    for label, r in desktop_pairs(rows, ds).items():
-        st = by_label[label]
-        st["matched_uuid"] = r["uuid"]
-        # The card's slice of the stash: switch-target facts. copy_old is deliberately
-        # absent — it is an active-account, whole-panel fact, surfaced by the footer.
-        r["display"]["desktop"] = {k: st.get(k) for k in
-                                   ("label", "active", "can_switch", "stale",
-                                    "version_mismatch", "revoked", "revoked_reason")}
-
-# attach_display runs deep inside rendering while desktop_state is fetched at the top of the
-# payload build; this hands one snapshot from the one place to the other without threading a
-# parameter through every renderer.
-rows_desktop_state = {}
-
 def render_json(rows):
-    rows_desktop_state["ds"] = ds = desktop_state()
     rows = attach_display(sort_rows(rows))
-    # `desktop` is its own key rather than more `accounts`: those rows carry usage windows and
-    # drive the title gauges, and a desktop stash has neither — it is a switch target only.
     aw = load_autoswitch()
     print(json.dumps({"accounts": rows,
                       "gauges": [list(s) for s in title_specs(rows)],
-                      "desktop": ds,
                       # the record of an identity change belongs in every surface. `line` is the
                       # sentence, preformatted here so the bar and the table can never disagree
                       # on wording or recency; `enabled` marks the mode as armed.
@@ -1622,14 +1413,9 @@ def render_json(rows):
                       # under invented data would read as part of the fiction
                       "auto_switch": ({"enabled": bool(aw.get("enabled")),
                                        "last": aw.get("last_auto"),
-                                       "line": last_auto_line(aw),
-                                       "desktop_enabled": bool(aw.get("desktop")),
-                                       "desktop_last": aw.get("last_desktop_auto"),
-                                       "desktop_pending": aw.get("desktop_pending"),
-                                       "desktop_line": last_desktop_line(aw)}
+                                       "line": last_auto_line(aw)}
                                       if not mock_enabled()
-                                      and (aw.get("enabled") or aw.get("last_auto")
-                                           or aw.get("desktop") or aw.get("last_desktop_auto"))
+                                      and (aw.get("enabled") or aw.get("last_auto"))
                                       else None),
                       # the bar has no other way to know, and unmarked invented numbers are
                       # worse than no numbers — they get screenshotted and believed
@@ -2171,9 +1957,8 @@ def cmd_relogin(target):
 # Opt-in: when the ACTIVE account's 5-hour or weekly window is spent, move the CLI credential to
 # the best parked account so new work continues. The check rides the normal refresh (every surface
 # funnels through collect()), so reaction time is bounded by the refresh interval — that latency is
-# accepted; there is no event to hook when a limit trips. It only ever moves the CLI credential:
-# the desktop app's account is a file swap that requires quitting the app, which would kill its
-# hosted sessions, so the notification points at the menu bar's confirm flow instead.
+# accepted; there is no event to hook when a limit trips. It only ever moves the CLI
+# credential; the desktop app signs in separately and is left alone.
 
 AUTOSWITCH = os.path.join(STATE_DIR, "autoswitch.json")
 AUTO_COOLDOWN_S   = 15 * 60   # after an auto-switch: absorb API lag on the new window, no flapping
@@ -2223,9 +2008,8 @@ def update_autoswitch(updates):
         return st
 
 def _recent_stamp(record):
-    """The record's local_short timestamp, or None when it isn't recent (older than a day) or
-    carries an unusable ts — one recency rule for every auto-switch sentence, so adjacent
-    surfaces can't disagree about what 'recent' means."""
+    """The record's local_short timestamp, or None when it isn't recent (older than a day)
+    or carries an unusable ts."""
     ts = (record or {}).get("ts")
     if not isinstance(ts, (int, float)) or time.time() - ts >= 86400:
         return None
@@ -2280,23 +2064,17 @@ def _weekly_reset_ts(r):
     dt = parse_dt((r.get("seven_day") or {}).get("resets_at"))
     return dt.timestamp() if dt else float("inf")
 
-def auto_pick(rows, has_full_creds, scoped=False, leaving=None):
+def auto_pick(rows, has_full_creds, scoped=False):
     """Accounts worth switching to, best first. Drain strategy: among accounts with at least
     DRAIN_MIN_HEADROOM of 5-hour room, spend the weekly budget that expires soonest — unspent
     weekly capacity evaporates at reset, so the account resetting first is the one to burn
     (ties: higher plan tier, then more 5-hour room). Thin-headroom accounts come after those,
     best-room first — a last resort, not a drain target. Rows missing either window number are
-    excluded — a refuge must be verifiably usable, not just not-known-bad.
-
-    `leaving` names the account being switched away from, by uuid: the desktop tier passes the
-    desktop app's account, which need not be the CLI-active one — and the CLI-active account is
-    then a perfectly good desktop target. Default None keeps the CLI meaning (leaving = the
-    active row)."""
+    excluded — a refuge must be verifiably usable, not just not-known-bad."""
     roomy, thin = [], []
     for r in rows:
         if not is_claude(r): continue
-        skip_self = r["uuid"] == leaving if leaving else r.get("active")
-        if skip_self or r.get("error") or r.get("is_team"): continue
+        if r.get("active") or r.get("error") or r.get("is_team"): continue
         fh, wk = _win_pct(r, "five_hour"), _win_pct(r, "seven_day")
         if fh is None or wk is None: continue
         if any(pct is not None and pct >= cap for _n, pct, _ra, cap in _limit_windows(r, scoped)):
@@ -2409,20 +2187,16 @@ def _release_switch_lock(fd):
         pass
 
 def maybe_auto_switch(rows):
-    """Called on every fresh refresh; returns the rows to render (active flags moved if a CLI
-    switch fired). The CLI and desktop tiers arm separately and run independently: the CLI
-    credential and the desktop app hold their own accounts, and either can be the exhausted
-    one."""
+    """Called on every fresh refresh; returns the rows to render (active flags moved
+    if a switch fired)."""
     st = load_autoswitch()
     if mock_enabled():
         return rows
     if st.get("enabled"):
-        rows = _cli_auto_tick(rows, st, time.time())
-    if st.get("desktop"):
-        _desktop_auto_tick(rows, st, time.time())
+        rows = _auto_tick(rows, st, time.time())
     return rows
 
-def _cli_auto_tick(rows, st, now):
+def _auto_tick(rows, st, now):
     scoped = bool(st.get("scoped"))
     kind, payload = auto_decision(rows, last_switch_info(), now, _has_full_creds, scoped)
     if kind == "stranded":
@@ -2468,10 +2242,6 @@ def _cli_auto_tick(rows, st, now):
             record_last_switch("claude", auto=True)
             # notification copy stays dash-free: no em dashes in anything osascript posts
             body = f"{active.get('email')} hit its {reason}. CLI now on {e['email']}."
-            if desktop_state() and not st.get("desktop"):
-                # with the desktop tier armed, its own tick handles (and notifies about)
-                # the app — pointing the user at the menu bar would race it
-                body += " Desktop app unchanged; switch it from the menu bar."
             if note:
                 body += " Note: ~/.claude.json still shows the old account's name."
             _notify("claude-usage auto-switch", body)
@@ -2489,271 +2259,12 @@ def _cli_auto_tick(rows, st, now):
     finally:
         _release_switch_lock(lock)
 
-# ---- desktop auto-switch -----------------------------------------------------
-# The desktop app's account is a file swap that needs the app closed, so this tier never has
-# the CLI tier's luxury of switching mid-anything. Two rules keep it safe unattended:
-# swap-only-fresh — only stashes young enough (and version-matched enough) to come up signed
-# in are targets, because an unattended swap onto the sign-in banner helps nobody — and
-# closed-app-only: with the app open the intent is parked as a pending swap that executes on
-# the first tick that finds the app closed, so no session is ever killed and the app is never
-# launched by a switch the user didn't click.
-
-def desktop_fresh(st):
-    """Whether a hands-free swap may land on this stash: it must come up signed in."""
-    return bool(st.get("can_switch")) and not st.get("stale") \
-        and not st.get("version_mismatch") and not st.get("unclaimed") \
-        and not st.get("revoked")
-
-def desktop_auto_decision(rows, ds, now, last_swap_ts, manual_at, scoped=False):
-    """The desktop tier's pure core:
-    ('idle'|'broken'|'unwatched'|'cooldown'|'swap'|'pending'|'stuck', payload).
-
-    'swap'/'pending' carry {"cands": [(row, stash label), ...], "from": label, "reason": str};
-    'stuck' carries the reason alone. 'broken' (an interrupted operation needs repair) and
-    'unwatched' (the active stash pairs with no tracked account) are conditions the user must
-    fix — an armed tier that can't act must say why, not go quiet. Acts only when the desktop
-    app's own account — which need not be the CLI-active one — is verifiably exhausted."""
-    if not ds:
-        return "idle", None
-    if ds.get("needs_repair"):
-        return "broken", None
-    pairs = desktop_pairs(rows, ds)
-    cur = pairs.get(ds.get("active"))
-    if cur is None:
-        # the installed account can't be matched to a tracked one, so its usage is invisible
-        return ("unwatched", None) if ds.get("active") else ("idle", None)
-    if cur.get("error") or cur.get("stale"):
-        return "idle", None            # the desktop account's usage isn't current — never act
-    reason = exhaustion_reason(cur, scoped)
-    if not reason:
-        return "idle", None
-    if last_swap_ts and 0 <= now - last_swap_ts < AUTO_COOLDOWN_S:
-        return "cooldown", None
-    # `manual_at` is the installed-account timestamp, which auto swaps also refresh; treating
-    # it as manual is safe while AUTO_COOLDOWN_S >= MANUAL_HOLDOFF_S (the stricter bound wins)
-    if manual_at and 0 <= now - manual_at < MANUAL_HOLDOFF_S:
-        return "cooldown", None        # a switch or capture just happened by hand — their call
-    by_label = {s["label"]: s for s in ds["stashes"]}
-    stash_of = {r["uuid"]: lbl for lbl, r in pairs.items()}
-    cands = [(r, stash_of[r["uuid"]])
-             for r in auto_pick(rows, lambda _u: True, scoped, leaving=cur["uuid"])
-             if r["uuid"] in stash_of and desktop_fresh(by_label[stash_of[r["uuid"]]])]
-    if not cands:
-        return "stuck", reason
-    payload = {"cands": cands, "from": ds.get("active"), "reason": reason}
-    return ("pending" if ds.get("app_running") else "swap"), payload
-
-DESKTOP_PROFILE = os.path.expanduser("~/Library/Application Support/Claude")
-OBSERVE_CACHE = os.path.join(STATE_DIR, "desktop-observed.json")
-_desktop_observed = {}
-
-def _run_desktop_tool(args, timeout):
-    """Run the swap tool with the CU_* overrides scrubbed: an unattended invocation must
-    never inherit a shell's test sandboxing or app-control no-ops."""
-    env = {k: v for k, v in os.environ.items() if not k.startswith("CU_")}
-    return subprocess.run([sys.executable, desktop_tool()] + args,
-                          capture_output=True, text=True, timeout=timeout, env=env)
-
-def _observe_sig():
-    """Cheap change detector: the observe verdict can only change when the profile's Local
-    Storage, the active record, the journal, or a stash manifest changes. The leveldb path
-    is the tool's business, mirrored here because only the parent can skip the subprocess
-    (interpreter startup is most of its cost)."""
-    sig = []
-    def stat_of(path, name):
-        try:
-            s = os.stat(path)
-            sig.append((name, int(s.st_mtime), s.st_size))
-        except OSError:
-            sig.append((name, "missing", 0))
-    try:
-        with os.scandir(os.path.join(DESKTOP_PROFILE, "Local Storage", "leveldb")) as it:
-            for e in it:
-                stat_of(e.path, "ls/" + e.name)
-    except OSError:
-        sig.append(("ls", "missing", 0))
-    stat_of(DESKTOP_ACTIVE, "active")
-    stat_of(DESKTOP_JOURNAL, "journal")
-    try:
-        with os.scandir(DESKTOP_STASHES) as it:
-            for e in it:
-                stat_of(os.path.join(e.path, "manifest.json"), "st/" + e.name)
-    except OSError:
-        pass
-    return repr(sorted(sig))
-
-def desktop_observe(heal=False):
-    """One observe per process: reconcile the desktop record with the profile's own identity
-    (hand sign-ins drift them apart; see the tool's cmd_observe). collect()'s act path runs
-    it first with heal=True; every later caller gets that verdict from the memo, so a
-    report-only read can never shadow a heal. Returns the tool's verdict dict, {"error": ...}
-    when observe itself failed (a broken safety net must be visible, not None), or None when
-    the desktop feature isn't set up.
-
-    Skipped entirely — verdict served from the on-disk cache — when nothing it reads has
-    changed since the last run, unless that run left something unacted (lock was busy, app
-    was open during a sign-out) that a retry could now do."""
-    if "out" in _desktop_observed:
-        return _desktop_observed["out"]
-    out = None
-    if os.path.isdir(DESKTOP_APP) and os.path.isdir(DESKTOP_STASHES):
-        if any(k in os.environ for k in ("CU_DESKTOP_STATE", "CU_DESKTOP_PROFILE")):
-            # a sandboxed harness: the scrub below would aim the tool at REAL state, so
-            # mutating is the one thing this process must not do
-            heal = False
-        sig = _observe_sig()
-        cached = _read_json_file(OBSERVE_CACHE) or {}
-        if cached.get("sig") == sig and not (heal and cached.get("retry")):
-            out = cached.get("out")
-        else:
-            try:
-                r = _run_desktop_tool(["observe"] + (["--heal"] if heal else []), timeout=10)
-                if r.returncode == 0:
-                    out = json.loads(r.stdout)
-                else:
-                    tail = (r.stderr or r.stdout or "observe failed").strip().splitlines()
-                    out = {"error": tail[-1][:200] if tail else "observe failed"}
-            except Exception as e:
-                out = {"error": str(e)[:200]}
-            retry = bool(out.get("error")
-                         or (out.get("drifted") and not out.get("healed"))
-                         or (out.get("signed_out") and not out.get("cleared")))
-            try:
-                _replace_file(OBSERVE_CACHE,
-                              json.dumps({"sig": sig, "out": out, "retry": retry}))
-            except Exception:
-                pass
-    _desktop_observed["out"] = out
-    return out
-
-DESKTOP_SWAP_TIMEOUT_S = 90   # a closed-app swap is a few-MB copy plus hashing; anything
-                              # longer is a stalled disk — and this must stay under the
-                              # 120s _switch_lock expiry or a held lock could be stolen
-
-def _desktop_swap(label):
-    """Swap the closed app to `label` without relaunching it. (ok, tool output/why-not).
-
-    The tool honors CU_* override variables (test sandboxing, app-control no-ops); an
-    unattended swap must never inherit those from whatever shell the refresh ran in."""
-    if any(k in os.environ for k in ("CU_DESKTOP_STATE", "CU_DESKTOP_PROFILE")):
-        return False, "CU_ overrides present; refusing to swap real state from a sandbox"
-    try:
-        r = _run_desktop_tool(["switch", label, "--no-launch"], timeout=DESKTOP_SWAP_TIMEOUT_S)
-        if r.returncode < 0:
-            return False, f"the swap tool was killed by signal {-r.returncode}"
-        return r.returncode == 0, (r.stdout + r.stderr).strip()
-    except subprocess.TimeoutExpired:
-        return False, "timed out"
-    except Exception as e:
-        return False, str(e)
-
-def _desktop_decide(rows, st, now):
-    """One decision from current reality: reads the real desktop state (never mock — this
-    tick swaps real files, whatever the render is showing) and returns (kind, payload, ds)."""
-    ds = _desktop_state()
-    last = st.get("last_desktop_auto") or {}
-    kind, payload = desktop_auto_decision(rows, ds, now, last.get("ts"),
-                                          (ds or {}).get("active_at"),
-                                          bool(st.get("scoped")))
-    return kind, payload, ds
-
-def _desktop_auto_tick(rows, st, now):
-    """The impure shell around desktop_auto_decision, run on every fresh refresh while
-    `autoswitch desktop` is on. Never launches the app; never quits it (the tool refuses
-    a running app in --no-launch mode — enforced there, adjacent to the quit)."""
-    kind, payload, ds = _desktop_decide(rows, st, now)
-    if kind in ("idle", "stuck", "broken", "unwatched") and st.get("desktop_pending"):
-        # a queued promise that can no longer execute must not keep being displayed;
-        # resetting the pending-notify key lets the NEXT episode notify immediately
-        update_autoswitch({"desktop_pending": None, "last_desktop_pending_notify": None})
-    if kind == "broken":
-        _notify_hourly("last_desktop_broken_notify", "claude-usage",
-                       "A desktop switch was interrupted and auto-switch is paused. "
-                       "Run `desktop-switch.py repair`.")
-        return
-    if kind == "unwatched":
-        _notify_hourly("last_desktop_unwatched_notify", "claude-usage",
-                       "The desktop app's account isn't one the CLI tracks, so auto-switch "
-                       "can't watch its limits. Sign into it once with the claude CLI, or "
-                       "check the stash's recorded account.")
-        return
-    if kind in ("idle", "cooldown"):
-        return
-    if kind == "stuck":
-        _notify_hourly("last_desktop_stuck_notify", "claude-usage",
-                       f"The desktop app's account hit its {payload} but no captured account "
-                       f"is fresh enough to swap to unattended. Switch from the menu bar, or "
-                       f"refresh a capture with `desktop-switch.py recapture`.")
-        return
-    if kind == "pending":
-        best = payload["cands"][0][1]
-        update_autoswitch({"desktop_pending": {"to": best, "from": payload["from"],
-                                               "reason": payload["reason"], "ts": now}})
-        _notify_hourly("last_desktop_pending_notify", "claude-usage",
-                       f"Desktop app account {payload['from']} hit its {payload['reason']}. "
-                       f"It will move to {best} when the app closes. Or switch now from the "
-                       f"menu bar.")
-        return
-    lock = _switch_lock()
-    if lock is None:
-        return
-    try:
-        # decide again under the lock: another tick may have swapped, the user may have
-        # switched or opened the app, the state may have changed — stale intent must die here
-        kind, payload, ds = _desktop_decide(rows, load_autoswitch(), time.time())
-        if kind != "swap":
-            return
-        out = ""
-        for _r, label in payload["cands"]:
-            ok, out = _desktop_swap(label)
-            if ok:
-                update_autoswitch({"last_desktop_auto": {"ts": now, "from": payload["from"],
-                                                         "to": label,
-                                                         "reason": payload["reason"]},
-                                   "desktop_pending": None,
-                                   "last_desktop_stuck_notify": None,
-                                   "last_desktop_failed_notify": None,
-                                   "last_desktop_pending_notify": None})
-                _notify("claude-usage auto-switch",
-                        f"Desktop app moved from {payload['from']} to {label} after its "
-                        f"{payload['reason']}. It will be on {label} when you next open it.")
-                return
-            if out == "timed out":
-                break                       # a stalled disk won't improve on the next candidate
-            fresh = _desktop_state()        # a manual action may have raced us — re-check
-            if not fresh or fresh.get("app_running") or fresh.get("needs_repair") \
-                    or fresh.get("active") != payload["from"]:
-                return
-        detail = out.splitlines()[-1].replace("—", "-")[:160] if out else "unknown error"
-        _notify_hourly("last_desktop_failed_notify", "claude-usage",
-                       f"The desktop app's account hit its {payload['reason']} and the swap "
-                       f"failed ({detail}). Check `desktop-switch.py status`.")
-    finally:
-        _release_switch_lock(lock)
-
-def last_desktop_line(st=None):
-    """The one sentence describing the last desktop auto-swap (or the queued one), shared by
-    the text surfaces — None when there is nothing recent to say. The pending line ages out
-    on the same one-day rule as every other line: a promise nothing has refreshed in a day
-    is stale, not standing."""
-    st = st if st is not None else load_autoswitch()
-    pend = st.get("desktop_pending") or {}
-    if pend.get("to") and _recent_stamp(pend):
-        return (f"desktop switch to {pend['to']} queued until the app closes "
-                f"({pend.get('reason')})")
-    last = st.get("last_desktop_auto") or {}
-    when = _recent_stamp(last)
-    if not when:
-        return None
-    return (f"desktop auto-switched {last.get('from')} → {last.get('to')} "
-            f"({last.get('reason')}, {when})")
-
 def cmd_autoswitch(args):
     arg = args[0] if args else ""
-    if arg not in ("", "on", "off", "scoped", "desktop"):
+    if arg not in ("", "on", "off", "scoped"):
         # an unknown word must not fall through to the status view: `autoswitch onn` read as
         # "show status" leaves the user believing they armed a feature that is still off
-        print("usage: claude-usage autoswitch [on|off|scoped on|off|desktop on|off]",
+        print("usage: claude-usage autoswitch [on|off|scoped on|off]",
               file=sys.stderr)
         sys.exit(2)
     if arg == "on":
@@ -2774,36 +2285,15 @@ def cmd_autoswitch(args):
         st = update_autoswitch({"scoped": sub == "on"})
         print("scoped trigger " + ("ON — a model-scoped weekly cap at 100% now switches too"
                                    if st["scoped"] else "off"))
-        if st["scoped"] and not st.get("enabled") and not st.get("desktop"):
+        if st["scoped"] and not st.get("enabled"):
             print("note: auto-switch itself is off — arm it with `claude-usage autoswitch on`")
-    elif arg == "desktop":
-        sub = args[1] if len(args) > 1 else ""
-        if sub not in ("on", "off"):
-            print("usage: claude-usage autoswitch desktop on|off", file=sys.stderr); sys.exit(2)
-        if sub == "on":
-            st = update_autoswitch({"desktop": True})
-            print("desktop auto-switch ON — when the desktop app's account hits a limit, the app\n"
-                  "is swapped to the best captured account whose stash is fresh enough to come\n"
-                  "up signed in. Only while the app is closed; with it open the swap waits and\n"
-                  "a notification offers the menu bar instead.\n"
-                  "turn it off with:  claude-usage autoswitch desktop off")
-            if not _desktop_state():   # the real state — mock stashes must not vouch for setup
-                print("note: no desktop captures found — set up desktop switching first "
-                      "(see the README)")
-        else:
-            # one write: a crash between separate disable/clear writes would orphan a pending
-            # promise no tick could ever clear again
-            update_autoswitch({"desktop": False, "desktop_pending": None,
-                               "last_desktop_pending_notify": None})
-            print("desktop auto-switch off")
     else:
         st = load_autoswitch()
         print("auto-switch is " + ("ON" if st.get("enabled") else "off")
-              + (" (scoped trigger on)" if st.get("scoped") else "")
-              + ("; desktop ON" if st.get("desktop") else "; desktop off"))
-        for line in (last_auto_line(st), last_desktop_line(st)):
-            if line:
-                print(line)
+              + (" (scoped trigger on)" if st.get("scoped") else ""))
+        line = last_auto_line(st)
+        if line:
+            print(line)
 
 # ---- native app presence (for doctor) ---------------------------------------
 
@@ -2814,73 +2304,7 @@ def _app_bundle_path():
             return p
     return None
 
-def _app_installed(bundle):
-    return any(os.path.isdir(os.path.join(base, bundle))
-               for base in ("/Applications", os.path.expanduser("~/Applications")))
-
 # ---- doctor -----------------------------------------------------------------
-
-def desktop_tool():
-    return os.path.join(os.path.dirname(os.path.realpath(__file__)), "tools", "desktop-switch.py")
-
-def _switch_verdict(text):
-    """The reason a desktop-switch run failed, as one flowing sentence.
-
-    The tool's output mixes pre-switch warnings (a `warning:` line plus its indented
-    continuations), `· ` progress lines, `! ` rollback diagnostics naming the error that
-    forced a rollback, and the verdict it exited with. The warnings and progress predate
-    the failure and are dropped; the diagnostics and verdict explain it and are kept,
-    joined into one string the bar can wrap itself (their line breaks are terminal
-    formatting). A crash is the exception: a traceback's one readable line is its last,
-    so that alone is kept.
-    """
-    lines = text.strip().splitlines()
-    if any(ln.startswith("Traceback (most recent call last") for ln in lines):
-        kept = [ln.strip() for ln in lines if ln.strip()]
-        return kept[-1] if kept else ""
-    verdict, in_warning = [], False
-    for ln in lines:
-        if ln.startswith("warning:"):
-            in_warning = True
-        elif not ln.strip() or ln.startswith("·"):
-            continue
-        elif in_warning and ln[:1].isspace():
-            continue
-        else:
-            in_warning = False
-            verdict.append(ln.strip())
-    return " ".join(verdict)
-
-def cmd_desktop_switch(label):
-    """Swap the desktop app to a captured account, for the menu bar to call.
-
-    Failure text goes to stderr and the exit status carries the verdict, which is what the
-    bar reads. Pre-switch warnings share that stream, so the verdict is separated out with
-    _switch_verdict rather than forwarded wholesale.
-    """
-    tool = desktop_tool()
-    if not label:
-        _fail("usage: claude-usage desktop-switch <label>")
-    if not os.path.exists(tool):
-        _fail(f"{tool} is missing — restore it from the repo")
-    r = subprocess.run([sys.executable, tool, "switch", label], capture_output=True, text=True)
-    if r.returncode < 0:
-        # killed by a signal: the tool wrote no verdict of its own, so name the signal
-        # rather than report whatever partial output it left behind
-        _fail(f"desktop switch was killed by signal {-r.returncode}; "
-              f"check ./tools/desktop-switch.py status")
-    if r.returncode != 0:
-        # the last raw line is the net under the parser: when nothing qualifies as a
-        # verdict (say, output that is all warnings), a fragment still beats no reason
-        out = (r.stderr or r.stdout).strip()
-        tail = out.splitlines()[-1].strip() if out else ""
-        _fail(_switch_verdict(out) or tail or "desktop switch failed")
-    if r.stderr.strip():
-        # warnings from the tool (e.g. the stash predates an app update) ride stderr so a
-        # successful exit can't swallow them for terminal callers; the bar warns from the
-        # version_mismatch flag instead, since it reads stderr only on failure
-        print(r.stderr.strip(), file=sys.stderr)
-    print(r.stdout.strip())
 
 def cmd_doctor():
     """Check everything that has to line up for the bar to work, and name the fix for whatever doesn't."""
@@ -2977,84 +2401,6 @@ def cmd_doctor():
                 say("warn", f"{r['email']}: shown from a past snapshot, and switching to it won't work",
                     "sign into it with `codex login` once to capture its credential.")
 
-    section("Desktop app")
-    if not os.path.isdir(DESKTOP_APP):
-        say("warn", "the Claude desktop app isn't installed",
-            "optional — this section only matters if you use it.")
-    else:
-        ds = desktop_state()            # populates the observed verdict itself, report-only
-        if not ds:
-            say("warn", "no desktop accounts captured yet, so the app can't be switched here",
-                "capture each account once: ./tools/desktop-switch.py add")
-        else:
-            if ds["needs_repair"]:
-                say("bad", "a desktop switch was interrupted",
-                    "run: ./tools/desktop-switch.py repair")
-            obs = ds.get("observed") or {}
-            if obs.get("error"):
-                say("warn", f"couldn't read which account the desktop app is signed into "
-                    f"({obs['error']})", "drift healing is paused until this reads again")
-            # each state below is exclusive, and each suppresses the green "last set to"
-            # line: an ok would assert the very record the warning disputes
-            if obs.get("untracked"):
-                say("warn", "the app is signed into an account not captured here",
-                    "capture it: quit the app, then ./tools/desktop-switch.py add")
-            elif obs.get("drifted"):
-                say("warn", f"the app is signed into {obs['drifted']!r}, "
-                    f"not the recorded {ds['active']!r}",
-                    "the next refresh heals the record on its own")
-            elif obs.get("signed_out") and not ds.get("app_running"):
-                # gated on the app being closed: mid-login the log passes through a
-                # signed-out state, and a transient must not send anyone to recapture
-                say("warn", "the app is signed out",
-                    "open it and sign in (device trust holds), quit it, then "
-                    "./tools/desktop-switch.py recapture")
-            elif ds["active"]:
-                say("ok", f"desktop app last set to {ds['active']}")
-            else:
-                say("warn", "the desktop app's account isn't one this tool captured",
-                    "capture it: quit the app, then ./tools/desktop-switch.py add")
-            for st in ds["stashes"]:
-                if st["unclaimed"]:
-                    say("warn", f"{st['label']}: a sign-in kept safe during a switch, not yet named",
-                        f"name it: ./tools/desktop-switch.py rename {st['label']} <label>")
-                    continue
-                if st.get("revoked"):
-                    # definitive, so it outranks every likelihood below
-                    what = ("its saved copy was captured signed out"
-                            if st.get("revoked_reason") == "captured-signed-out"
-                            else "was signed out inside the app; its saved session is dead")
-                    say("warn", f"{st['label']}: {what}",
-                        "sign into it in the app once, quit the app, then "
-                        "./tools/desktop-switch.py recapture")
-                    continue
-                # A version mismatch outranks age: an update is known to invalidate captures,
-                # while age only might.
-                if st["version_mismatch"] and st["active"]:
-                    # The account in use can't be switched to, and its live session is the one
-                    # thing that can refresh the dead capture without a login.
-                    say("warn", f"{st['label']}: the app updated since this account was captured",
-                        "re-capture while its session is live: quit the app, then "
-                        f"./tools/desktop-switch.py capture {st['label']} "
-                        "(switching away also refreshes it automatically)")
-                elif st["version_mismatch"]:
-                    say("warn", f"{st['label']}: captured under app v{st['app_version']}, now v{ds['app_version']}",
-                        "switching to it will likely land on a login screen; log in there and its "
-                        "saved copy refreshes on the next switch away.")
-                elif st["stale"]:
-                    aged = (f"parked {st['age_days']:.1f} days" if st["age_days"] is not None
-                            else "of unknown age (its manifest is unreadable)")
-                    say("warn", f"{st['label']}: {aged}; its session has likely lapsed",
-                        "switching to it will likely show the sign-in banner. Sign in there, quit "
-                        "the app, then run ./tools/desktop-switch.py recapture to refresh the stash.")
-                elif st["copy_old"] and st["active"]:
-                    aged = (f"is {st['age_days']:.1f} days old" if st["age_days"] is not None
-                            else "is of unknown age (its manifest is unreadable)")
-                    say("warn", f"{st['label']}: its saved copy {aged}",
-                        "a switch away and back would reinstall that aged copy and likely hit "
-                        "the sign-in banner. Quit the app, then run "
-                        "./tools/desktop-switch.py recapture to refresh it.")
-
     section("Menu bar")
     bundle = _app_bundle_path()
     if not bundle:
@@ -3083,6 +2429,13 @@ def cmd_doctor():
     if stale:
         say("warn", "an old xbar plugin link is still present",
             "delete " + ", ".join(stale) + " — see the README's upgrade note.")
+    leftovers = sorted(os.path.basename(p) for p in glob.glob(os.path.join(STATE_DIR, "desktop-*")))
+    if leftovers:
+        armed = " (its auto-switch setting no longer does anything)" if \
+            load_autoswitch().get("desktop") else ""
+        say("warn", "desktop app switching was removed, but its saved state is still on disk" + armed,
+            "the stashes hold saved sign-ins; when you no longer want them: "
+            "rm -r ~/.claude-usage/desktop-*")
 
     section("Shell")
     cu = os.path.expanduser("~/.local/bin/claude-usage")
@@ -3154,8 +2507,8 @@ def cmd_setup():
     rows = collect(act=False)
     render_table(rows)
     if rows:
-        print("From now on, sign into another Claude account (CLI or desktop app) and it appears on")
-        print("the next run — and in the menu bar on its next refresh. No need to run setup again.\n")
+        print("From now on, log into another Claude account with the `claude` CLI once and it appears")
+        print("on the next run — and in the menu bar on its next refresh. No need to run setup again.\n")
 
 # ---- commands ---------------------------------------------------------------
 
@@ -3468,6 +2821,10 @@ def main():
         cmd_setup(); return
     if arg == "app":
         cmd_app(dev="--dev" in sys.argv[2:]); return
+    if arg == "desktop-switch":
+        print("desktop app switching was removed — this tool covers the CLI account only",
+              file=sys.stderr)
+        sys.exit(2)
     if arg in ("install", "interval", "--xbar"):
         print(f"`{arg}` went with the xbar plugin — the menu bar is `claude-usage app` now"
               + ("; `--json` is the machine format" if arg == "--xbar" else ""), file=sys.stderr)
@@ -3484,8 +2841,6 @@ def main():
         cmd_mock(sys.argv[2] if len(sys.argv) > 2 else ""); return
     if arg == "autoswitch":
         cmd_autoswitch(sys.argv[2:]); return
-    if arg == "desktop-switch":
-        cmd_desktop_switch(sys.argv[2] if len(sys.argv) > 2 else ""); return
     if arg == "creds-debug":
         # Non-secret metadata about each stored credential, for debugging refresh failures.
         # One formatter for every row so the live and stored credentials stay grep-comparable,

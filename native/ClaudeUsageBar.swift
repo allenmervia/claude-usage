@@ -18,7 +18,6 @@ import ServiceManagement
 struct Payload: Decodable {
     var accounts: [Account]
     var gauges: [[Double?]]?
-    var desktop: Desktop?
     var auto_switch: AutoSwitch?
     var mock: Bool?
     var updated_ts: Double?
@@ -30,117 +29,6 @@ struct Payload: Decodable {
 struct AutoSwitch: Decodable {
     var enabled: Bool?
     var line: String?
-    var desktop_enabled: Bool?
-    var desktop_line: String?
-}
-
-// The desktop app's account is a set of files rather than a token, so it carries no usage and
-// sits apart from `accounts`. `needs_confirm` is the backend's judgement, not ours: with the app
-// closed a swap costs nothing and behaves like any other switch, and only an open app turns the
-// same click into "quit this and close what is running in it".
-struct Desktop: Decodable {
-    var active: String?
-    var stashes: [Stash]
-    var observed: Observed?
-    var needs_repair: Bool?
-    var app_running: Bool?
-    var needs_confirm: Bool?
-
-    /// The observe verdict against the record, distilled to the one state the panel acts on.
-    /// Nil when the two agree — or while a repair is pending: mid-swap bytes look exactly
-    /// like a hand logout, and the repair warning already names the only action the tool
-    /// will accept in that state.
-    enum Drift {
-        case unreadable          // observe itself failed, so drift would go undetected
-        case untracked           // the app is on an account no stash holds
-        case drifted(to: String, recorded: String?, healsItself: Bool)
-        case signedOut           // at rest, with no session at all
-    }
-    var drift: Drift? {
-        guard needs_repair != true, let o = observed else { return nil }
-        if o.error != nil { return .unreadable }
-        if o.untracked == true { return .untracked }
-        if let real = o.drifted, o.healed == nil {
-            // The heal acts only on log-sourced identity: a compacted table's answer can be
-            // an earlier account's residue, so a table verdict is reported but never healed,
-            // and the line must not promise otherwise.
-            return .drifted(to: real, recorded: o.recorded ?? active,
-                            healsItself: o.source == "log")
-        }
-        // Mid-login the log passes through a signed-out state, so with the app open this
-        // reading proves nothing; with it closed, the record points at no session at all.
-        if o.signed_out == true, app_running != true { return .signedOut }
-        return nil
-    }
-
-    /// The record is contradicted by the profile's own evidence, so the "desktop" chip is a
-    /// claim in dispute and wears a question mark. An unreadable verdict is absence of
-    /// evidence, not contradiction: the line reports it, but the chip stays plain.
-    var recordDisputed: Bool {
-        switch drift {
-        case nil, .unreadable: return false
-        default: return true
-        }
-    }
-
-    /// The capsule naming where the desktop app is signed in, per the record.
-    var chipText: String { recordDisputed ? "desktop?" : "desktop" }
-
-    /// The verdict's one line in the panel, above the cards. Same ladder as doctor's; the
-    /// states doctor treats as fine stay silent here too: an already-healed drift is fixed
-    /// in this very payload, and an unconfirmed pre-identity capture is no alarm.
-    var driftLine: String? {
-        switch drift {
-        case nil:
-            return nil
-        case .unreadable:
-            return "Couldn't read which account the desktop app is signed into, so drift healing is paused. `doctor` has the details."
-        case .untracked:
-            return app_running == true
-                ? "The desktop app is signed into an account not captured here. Quit the app, then run `desktop-switch.py add` to capture it."
-                : "The desktop app is signed into an account not captured here. Run `desktop-switch.py add` to capture it."
-        case let .drifted(real, recorded, healsItself):
-            let claim = recorded.map { "not the recorded '\($0)'" } ?? "which the record does not show"
-            let fact = "The desktop app is signed into '\(real)', \(claim)."
-            return healsItself ? fact + " The record heals on the next refresh." : fact
-        case .signedOut:
-            return "The desktop app is signed out. Sign in there, quit the app, then run `desktop-switch.py recapture`."
-        }
-    }
-}
-
-// The observe verdict (tools/desktop-switch.py observe): the profile's own identity next to
-// the record of what was installed. The record follows this tool's switches, but a hand
-// sign-in or logout inside the app moves the account without telling it; the verdict is how
-// this surface avoids asserting the stale record as truth. Every field optional so payloads
-// from before the verdict existed still decode.
-struct Observed: Decodable {
-    var signed_out: Bool?
-    var source: String?
-    var recorded: String?
-    var drifted: String?
-    var healed: String?
-    var untracked: Bool?
-    var error: String?
-}
-
-struct Stash: Decodable, Identifiable {
-    var label: String
-    var revoked: Bool?
-    var files: Int?
-    var age_days: Double?
-    var app_version: String?
-    var stale: Bool?
-    var copy_old: Bool?
-    var version_mismatch: Bool?
-    var active: Bool?
-    var can_switch: Bool?
-    var matched_uuid: String?
-    var id: String { label }
-    /// The one gate every switch path shares. `revoked` is re-checked beside `can_switch`
-    /// so a stash marked dead can never be installed, whatever vintage of payload claimed
-    /// it clickable.
-    var switchable: Bool { can_switch == true && revoked != true }
 }
 
 struct Account: Decodable, Identifiable {
@@ -166,20 +54,6 @@ struct Display: Decodable {
     var can_switch: Bool?
     var rows: [DisplayRow]?
     var trend: Trend?
-    var desktop: DisplayDesktop?
-}
-
-// The desktop app's stash for this same account, folded into the account's card so one click
-// moves both surfaces. Present only when a stash's name pairs with this account.
-struct DisplayDesktop: Decodable {
-    var label: String
-    var active: Bool?
-    var can_switch: Bool?
-    var stale: Bool?
-    var revoked: Bool?
-    var version_mismatch: Bool?
-    /// Same gate as Stash.switchable, for the copy folded into an account's card.
-    var switchable: Bool { can_switch == true && revoked != true }
 }
 
 struct DisplayRow: Decodable {
@@ -363,7 +237,6 @@ final class Model: ObservableObject {
     @Published var refreshing = false
     @Published var switching: String?          // uuid mid-switch
     @Published var lastError: String?
-    @Published var confirmTarget: String?
     // A failed switch is reported separately from a failed refresh: the refresh that every switch
     // triggers succeeds, and if both shared one field that success would erase the failure before
     // it could be read — the click would look like it did nothing at all. This one survives until
@@ -403,20 +276,17 @@ final class Model: ObservableObject {
         return m
     }
 
-    // A switch made outside this app — the CLI, the desktop-switch tool, another session's
-    // auto-switch — would otherwise leave the gauges wearing the displaced account's numbers
-    // until the next timer tick. Every switch stamps one of these two backend state files, so
-    // polling their mtimes bounds that lag at seconds. (A re-login through `claude /login`
-    // writes only the credential store and stamps neither; that path still waits for the timer.)
-    private nonisolated static let switchStamps = ["last-switch.json", "desktop-active.json"].map {
-        NSString(string: "~/.claude-usage/" + $0).expandingTildeInPath
-    }
+    // A switch made outside this app — the CLI, or another session's auto-switch — would
+    // otherwise leave the gauges wearing the displaced account's numbers until the next timer
+    // tick. Every switch stamps this backend state file, so polling its mtime bounds that lag
+    // at seconds. (A re-login through `claude /login` writes only the credential store and
+    // stamps nothing; that path still waits for the timer.)
+    private nonisolated static let switchStamp =
+        NSString(string: "~/.claude-usage/last-switch.json").expandingTildeInPath
 
-    private nonisolated static func stampDates() -> [Date?] {
-        switchStamps.map {
-            (try? URL(fileURLWithPath: $0)
-                .resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
-        }
+    private nonisolated static func stampDate() -> Date? {
+        (try? URL(fileURLWithPath: switchStamp)
+            .resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
     }
 
     func startWatcher() {
@@ -424,10 +294,10 @@ final class Model: ObservableObject {
         // Detached at utility priority: the stat calls must stay off the main thread, and the
         // cadence must not wake it — only a detected change hops to the actor.
         watcher = Task.detached(priority: .utility) { [weak self] in
-            var seen = Model.stampDates()
+            var seen = Model.stampDate()
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 10_000_000_000)
-                let now = Model.stampDates()
+                let now = Model.stampDate()
                 guard now != seen else { continue }
                 guard let self else { return }
                 // A switch driven from this app stamps these files mid-flight; reading the
@@ -503,31 +373,6 @@ final class Model: ObservableObject {
         await refresh(force: true)
     }
 
-    /// One click, both surfaces: the CLI switch (instant) and then the desktop swap. Ordered so
-    /// the cheap, reliable part lands even when the desktop half fails; errors from either side
-    /// surface together rather than the second silently masking the first.
-    func switchAll(_ account: Account) async {
-        guard switching == nil else { return }
-        switching = account.uuid
-        defer { switching = nil }
-        var errs: [String] = []
-        actionError = nil
-        if account.display?.can_switch == true {
-            do { _ = try await Backend.run(["switch", account.uuid]) }
-            catch { errs.append("CLI: \(error.localizedDescription)") }
-        }
-        if let st = account.display?.desktop, st.switchable,
-           payload?.desktop?.needs_repair != true {
-            do { _ = try await Backend.run(["desktop-switch", st.label]) }
-            catch { errs.append("desktop: \(error.localizedDescription)") }
-        }
-        // actionError, not lastError: the refresh below succeeds and clears lastError, which
-        // would erase this before it could be read and leave a failed click looking like a
-        // click that did nothing.
-        actionError = errs.isEmpty ? nil : errs.joined(separator: " · ")
-        await refresh(force: true)
-    }
-
     /// Bring back an account the server signed out. The one interactive step happens in a
     /// Terminal window the backend opens; this call stays in flight for as long as the user
     /// takes over there, and returns once the account is captured and the CLI is back on
@@ -547,28 +392,6 @@ final class Model: ObservableObject {
     }
 
     static func loginKey(_ uuid: String) -> String { "login:" + uuid }
-
-    func switchDesktop(_ label: String) async {
-        guard switching == nil else { return }
-        // A confirm sheet outlives the refresh that marks its stash revoked, so the click
-        // that closes one can ask for a session known to be dead. The refusal sits here, on
-        // the freshest payload, where every switch route converges.
-        if payload?.desktop?.stashes.first(where: { $0.label == label })?.revoked == true {
-            actionError = "\(label) was signed out in the desktop app; sign in there and recapture first."
-            return
-        }
-        switching = "desktop:" + label
-        defer { switching = nil }
-        actionError = nil
-        do {
-            _ = try await Backend.run(["desktop-switch", label])
-        } catch {
-            actionError = error.localizedDescription
-        }
-        await refresh(force: true)
-    }
-
-    var desktop: Desktop? { payload?.desktop }
 
     var claude: [Account] { payload?.accounts.filter { !$0.isCodex } ?? [] }
     var codex: [Account] { payload?.accounts.filter { $0.isCodex } ?? [] }
@@ -629,15 +452,6 @@ func parseISO(_ s: String) -> Date? {
 }
 
 // MARK: - Views
-
-// The advisory strip above the account cards: one dress for every warning line, so the
-// repair and drift notices render under the same rules.
-private func warningLine(_ text: String, sev: Double) -> some View {
-    Text(text)
-        .font(.system(size: 11)).foregroundStyle(sevColor(sev))
-        .fixedSize(horizontal: false, vertical: true)
-        .padding(.horizontal, 6).padding(.bottom, 2)
-}
 
 struct MenuView: View {
     @EnvironmentObject var model: Model
@@ -705,7 +519,6 @@ struct MenuView: View {
         }
         .onAppear {
             model.hoveredMixRow = nil
-            model.confirmTarget = nil
             Task { await model.refresh() }
         }
     }
@@ -717,25 +530,13 @@ struct MenuView: View {
                 .padding(.vertical, 14)
                 .frame(maxWidth: .infinity)
         }
-        if model.desktop?.needs_repair == true {
-            warningLine("A desktop switch was interrupted. Run `desktop-switch.py repair` before switching again.", sev: 95)
-        }
-        if let line = model.desktop?.driftLine {
-            warningLine(line, sev: 70)
-        }
         if let aw = model.payload?.auto_switch {
-            // one binding feeds both the rows and the emptiness test, so a future third
-            // line can't update one and miss the other
-            let lines = [aw.line, aw.desktop_line].compactMap { $0 }
-            let cli = aw.enabled ?? false, desktop = aw.desktop_enabled ?? false
-            ForEach(lines, id: \.self) { line in
+            if let line = aw.line {
                 Text(line)
                     .font(.system(size: 10.5)).foregroundStyle(.secondary)
                     .padding(.horizontal, 6).padding(.bottom, 2)
-            }
-            if lines.isEmpty, cli || desktop {
-                let scope = cli && desktop ? "CLI and desktop app" : desktop ? "desktop app" : "CLI"
-                Text("auto-switch armed (\(scope)) — switches accounts when a limit hits")
+            } else if aw.enabled ?? false {
+                Text("auto-switch armed — switches accounts when a limit hits")
                     .font(.system(size: 10)).foregroundStyle(.tertiary)
                     .padding(.horizontal, 6).padding(.bottom, 2)
             }
@@ -745,16 +546,6 @@ struct MenuView: View {
         if !model.codex.isEmpty {
             SectionHeader("CODEX")
             ForEach(model.codex) { AccountCard(account: $0) }
-        }
-        if let d = model.desktop {
-            let orphans = d.stashes.filter { $0.matched_uuid == nil }
-            if !orphans.isEmpty {
-                SectionHeader("DESKTOP APP")
-                Text("Not paired with an account above. Rename a stash to the account's email to merge them.")
-                    .font(.system(size: 10)).foregroundStyle(.secondary)
-                    .padding(.horizontal, 6)
-                ForEach(orphans) { StashCard(stash: $0, desktop: d) }
-            }
         }
     }
 }
@@ -1216,202 +1007,47 @@ struct SectionHeader: View {
     }
 }
 
-// The pre-update-capture warning, one home for both card types so the copies can't drift:
-// the badge sits in a card header, the notice in a confirm sheet. The badge skips the row
-// whose account the desktop app is on: that stash can't be switched to, and the next switch
-// away recaptures it from the live session — there is nothing for the user to do or avoid.
-// The capsule status chip every card wears — the plan tag, the desktop-location marker, a
-// stash's captured state — one dress so they read as one vocabulary.
-private func chip(_ text: String) -> some View {
-    Text(text)
-        .font(.system(size: 10, weight: .semibold))
-        .foregroundStyle(.secondary)
-        .padding(.horizontal, 7)
-        .padding(.vertical, 1)
-        .background(Capsule().fill(Color.primary.opacity(0.07)))
-}
-
-private func mismatchBadge() -> some View {
-    Text("app updated since capture")
-        .font(.system(size: 10))
-        .foregroundStyle(sevColor(70))
-        .lineLimit(1)
-}
-
-private func mismatchNotice() -> some View {
-    Text("This saved sign-in predates an app update and may land on a login screen. If it does, just log in; the saved copy refreshes on the next switch away.")
-        .font(.system(size: 11))
-        .foregroundStyle(sevColor(70))
-        .fixedSize(horizontal: false, vertical: true)
-}
-
-// The long-parked-capture warning, same shape as the pair above: one home for badge and
-// notice so the copies can't drift. Mismatch outranks age wherever both could show: an app
-// update is known to invalidate a capture, age only might.
-private func staleBadge() -> some View {
-    Text("may have expired")
-        .font(.system(size: 10))
-        .foregroundStyle(sevColor(70))
-        .lineLimit(1)
-}
-
-private func staleNotice() -> some View {
-    Text("This saved sign-in has been parked for a while and may land on a login screen. If it does, just log in; the saved copy refreshes on the next switch away.")
-        .font(.system(size: 11))
-        .foregroundStyle(sevColor(70))
-        .fixedSize(horizontal: false, vertical: true)
-}
-
-// The dead-capture state: a logout inside the desktop app ended this stash's session
-// server-side, so the card refuses the switch instead of warning on the way. The notice
-// lives on the card itself: a dead stash never opens a confirm sheet, which is where the
-// other notices ride.
-private func revokedBadge() -> some View {
-    Text("signed out in app")
-        .font(.system(size: 10))
-        .foregroundStyle(sevColor(95))
-        .lineLimit(1)
-        .layoutPriority(1)
-}
-
-private func revokedNotice() -> some View {
-    Text("A logout inside the desktop app ended this saved sign-in, so switching to it could only reach the login screen. Sign into the account in the app once, quit the app, then run `desktop-switch.py recapture`.")
-        .font(.system(size: 11))
-        .foregroundStyle(sevColor(95))
-        .fixedSize(horizontal: false, vertical: true)
-}
-
-// One ladder for both card types. Revoked is definitive — a logout inside the app ended the
-// parked session server-side — so it outranks the two likelihoods below it. Revoked and
-// mismatch both stay quiet on the active stash: its session lives in the app, not the parked
-// copy, and the next switch away recaptures the copy from it.
-@ViewBuilder private func stashBadge(revoked: Bool?, mismatch: Bool?, stale: Bool?, active: Bool?) -> some View {
-    if revoked == true {
-        if active != true { revokedBadge() }
-    } else if mismatch == true {
-        if active != true { mismatchBadge() }
-    } else if stale == true {
-        staleBadge()
-    }
-}
-
 struct AccountCard: View {
     @EnvironmentObject var model: Model
     let account: Account
     @State private var hovered = false
 
-    private var confirming: Bool { model.confirmTarget == account.uuid }
-    private var stash: DisplayDesktop? { account.display?.desktop }
-
     /// The account you are on, and the only card that lights up: the one the CLI is signed
     /// into — the same account the title gauge draws, so the panel and the gauge never name
-    /// different accounts. The desktop app's location is the chips' job, not this border's.
+    /// different accounts.
     private var isCurrent: Bool {
         // Alone in its section there is no question of which account you are on, so lighting the
         // only card states the obvious in the loudest available color.
         guard (account.isCodex ? model.codex : model.claude).count > 1 else { return false }
         return account.active == true
     }
-    private var cliSwitchable: Bool { account.display?.can_switch == true }
-    private var desktopSwitchable: Bool {
-        stash?.switchable == true && model.desktop?.needs_repair != true
-    }
+    private var switchable: Bool { account.display?.can_switch == true }
     private var signingIn: Bool { model.switching == Model.loginKey(account.uuid) }
     /// This card has something in flight — a switch or a sign-in — and owns the spinner slot.
     private var busy: Bool { model.switching == account.uuid || signingIn }
 
-    // A switchable card is one control, the way a table row or menu row is: click anywhere on it
-    // and this account becomes the one you are on — CLI and desktop app together, because being
-    // half-switched is never what anyone wants. The only fork is cost: with the desktop app open
-    // the click asks first (it closes live sessions); otherwise it just goes. A card whose CLI
-    // side is already active still switches the desktop here when the two have drifted apart.
-    var body: some View {
-        Group {
-            if confirming {
-                confirmCard
-            } else if account.needsLogin {
-                // Not a control. A signed-out account has one remedy and it isn't a switch, so
-                // the card states it and puts the buttons in reach instead of behaving like a
-                // row you can click into — a whole-card click here could only reach the desktop
-                // stash, which does nothing about being signed out and reports success anyway.
-                card
-            } else if cliSwitchable || desktopSwitchable {
-                Button {
-                    // A pre-update or long-parked stash confirms even with the app closed:
-                    // the swap costs nothing then, but the login screen it may land on still
-                    // deserves a heads-up, and this sheet is the only surface left to give it
-                    // (the backend's stderr warning is dropped on a successful exit).
-                    if desktopSwitchable && (model.desktop?.needs_confirm == true
-                                             || stash?.version_mismatch == true
-                                             || stash?.stale == true) {
-                        model.confirmTarget = account.uuid
-                    } else if model.confirmTarget != nil {
-                        // A question is open on another card, and this click lands outside it:
-                        // that is an answer of "not that", never a request to act here. Acting
-                        // would mean an instant switch happens or not depending on whether some
-                        // other card was asking — the same click must not carry two meanings.
-                        model.confirmTarget = nil
-                    } else {
-                        Task { await model.switchAll(account) }
-                    }
-                } label: {
-                    card
-                }
-                .buttonStyle(.plain)
-                .disabled(model.switching != nil)
-                .onHover { inside in
-                    if inside { NSCursor.pointingHand.set() } else { NSCursor.arrow.set() }
-                }
-            } else {
-                card
-            }
-        }
-        // a confirmation the user walked away from must not be waiting next time the panel opens
-        .onDisappear { if confirming { model.confirmTarget = nil } }
-    }
-
-    private var confirmCard: some View {
-        VStack(alignment: .leading, spacing: 7) {
+    // A switchable card is one control, the way a table row or menu row is: click anywhere on
+    // it and this account becomes the one you are on.
+    @ViewBuilder var body: some View {
+        if account.needsLogin {
+            // Not a control. A signed-out account has one remedy and it isn't a switch, so
+            // the card states it and puts the button in reach instead of behaving like a
+            // row you can click into.
             card
-            if model.desktop?.needs_confirm == true {
-                Text("Claude Code Desktop will quit and reopen. Make sure your sessions are at a good stopping place.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+        } else if switchable {
+            Button {
+                Task { await model.switchTo(account.uuid) }
+            } label: {
+                card
             }
-            if stash?.version_mismatch == true {
-                mismatchNotice()
-            } else if stash?.stale == true {
-                staleNotice()
+            .buttonStyle(.plain)
+            .disabled(model.switching != nil)
+            .onHover { inside in
+                if inside { NSCursor.pointingHand.set() } else { NSCursor.arrow.set() }
             }
-            HStack(spacing: 8) {
-                Spacer()
-                Button("Cancel") { model.confirmTarget = nil }
-                    .controlSize(.small)
-                if cliSwitchable {
-                    // the escape valve for "my sessions are mid-flight": the CLI moves now, and a
-                    // later click on this same card brings the desktop app across
-                    Button("CLI only") {
-                        model.confirmTarget = nil
-                        Task { await model.switchTo(account.uuid) }
-                    }
-                    .controlSize(.small)
-                }
-                Button(cliSwitchable ? "Switch both" : "Move desktop here") {
-                    model.confirmTarget = nil
-                    Task { await model.switchAll(account) }
-                }
-                .controlSize(.small)
-                .keyboardShortcut(.defaultAction)
-            }
+        } else {
+            card
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
-        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.08)))
-        .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .strokeBorder(Color.accentColor.opacity(0.55), lineWidth: 1)
-        )
     }
 
     private var card: some View {
@@ -1431,9 +1067,6 @@ struct AccountCard: View {
                     }
                 }
             }
-            if stash?.revoked == true, stash?.active != true {
-                revokedNotice()
-            }
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
@@ -1450,8 +1083,7 @@ struct AccountCard: View {
     }
 
     /// What a signed-out account shows in place of its gauges: what happened, what fixes it,
-    /// and the button that does the fixing. The desktop swap stays reachable but named, so it
-    /// can't be mistaken for the remedy the way an unlabelled whole-card click was.
+    /// and the button that does the fixing.
     private var signedOutBody: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(account.error ?? "signed out by the server")
@@ -1463,9 +1095,7 @@ struct AccountCard: View {
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
-            } else if !confirming {
-                // While a confirmation is open the sheet below carries the buttons; a second
-                // pair here would ask the same question twice.
+            } else {
                 HStack(spacing: 8) {
                     // No .defaultAction: several accounts are usually signed out at once, and
                     // shortcuts don't nest — Return would fire whichever card SwiftUI resolved
@@ -1473,19 +1103,6 @@ struct AccountCard: View {
                     Button("Sign in") { Task { await model.signIn(account) } }
                         .controlSize(.small)
                         .buttonStyle(.borderedProminent)
-                    if let st = stash, desktopSwitchable {
-                        Button("Move desktop here") {
-                            // The same warnings a whole-card swap gets: this click can still
-                            // quit an app with live sessions in it.
-                            if model.desktop?.needs_confirm == true || st.version_mismatch == true
-                                || st.stale == true {
-                                model.confirmTarget = account.uuid
-                            } else {
-                                Task { await model.switchDesktop(st.label) }
-                            }
-                        }
-                        .controlSize(.small)
-                    }
                     Spacer(minLength: 0)
                 }
                 .disabled(model.switching != nil)
@@ -1500,7 +1117,7 @@ struct AccountCard: View {
             // carried by the lit card, not by anything here. The slot is always one Text in one
             // font — a baseline-less placeholder would flip the row's alignment mode on hover and
             // shift every glyph beside it.
-            Text(hovered && !account.needsLogin && (cliSwitchable || desktopSwitchable) ? "⇄" : "")
+            Text(hovered && !account.needsLogin && switchable ? "⇄" : "")
                 .font(.system(size: 10, weight: .semibold))
                 .foregroundStyle(Color.accentColor)
                 .opacity(busy ? 0 : 1)
@@ -1517,128 +1134,16 @@ struct AccountCard: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
-            stashBadge(revoked: stash?.revoked, mismatch: stash?.version_mismatch,
-                       stale: stash?.stale, active: stash?.active)
             Spacer(minLength: 4)
-            // Where the desktop app is signed in when that isn't the lit card — after a
-            // "CLI only" switch the two surfaces differ, and without this chip the desktop's
-            // account would be shown nowhere.
-            if stash?.active == true, account.active != true {
-                chip(model.desktop?.chipText ?? "desktop")
-            }
             if let plan = account.display?.plan, !plan.isEmpty {
-                chip(plan)
-            }
-        }
-    }
-}
-
-// A stash the tool holds that pairs with no account above, usually because its label matches no
-// email. Same card grammar as an account: one control, ⇄ on hover, a desktop chip when the
-// desktop app is signed in here — the lit border stays reserved for the account the CLI is on.
-// A click can close live sessions, so with the app open it asks first.
-struct StashCard: View {
-    @EnvironmentObject var model: Model
-    let stash: Stash
-    let desktop: Desktop
-    @State private var hovered = false
-
-    private var confirming: Bool { model.confirmTarget == "desktop:" + stash.label }
-    private var isSwitching: Bool { model.switching == "desktop:" + stash.label }
-
-    var body: some View {
-        Group {
-            if confirming {
-                confirmCard
-            } else if stash.switchable {
-                Button {
-                    // A pre-update or long-parked stash confirms even with the app closed —
-                    // same rationale as AccountCard: this sheet is the only warning surface left.
-                    if desktop.needs_confirm == true || stash.version_mismatch == true
-                        || stash.stale == true {
-                        model.confirmTarget = "desktop:" + stash.label
-                    }
-                    else if model.confirmTarget != nil { model.confirmTarget = nil }  // dismiss, don't act
-                    else { Task { await model.switchDesktop(stash.label) } }
-                } label: { card }
-                .buttonStyle(.plain)
-                .disabled(model.switching != nil || desktop.needs_repair == true)
-                .onHover { inside in
-                    if inside { NSCursor.pointingHand.set() } else { NSCursor.arrow.set() }
-                }
-            } else {
-                card
-            }
-        }
-        // The panel is torn down and rebuilt as it opens and closes, and a confirmation the user
-        // walked away from must not be waiting for them next time: reopening the menu is itself
-        // a decision not to answer it.
-        .onDisappear { if confirming { model.confirmTarget = nil } }
-    }
-
-    private var confirmCard: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            card
-            if desktop.needs_confirm == true {
-                Text("Claude Code Desktop will quit and reopen. Make sure your sessions are at a good stopping place.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            if stash.version_mismatch == true {
-                mismatchNotice()
-            } else if stash.stale == true {
-                staleNotice()
-            }
-            HStack(spacing: 8) {
-                Spacer()
-                Button("Cancel") { model.confirmTarget = nil }
-                    .controlSize(.small)
-                Button(desktop.needs_confirm == true ? "Quit and switch" : "Switch anyway") {
-                    model.confirmTarget = nil
-                    Task { await model.switchDesktop(stash.label) }
-                }
-                .controlSize(.small)
-                .keyboardShortcut(.defaultAction)
-            }
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
-        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.08)))
-        .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .strokeBorder(Color.accentColor.opacity(0.55), lineWidth: 1)
-        )
-    }
-
-    private var card: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text(hovered && stash.switchable ? "⇄" : "")
+                Text(plan)
                     .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(Color.accentColor)
-                    .opacity(isSwitching ? 0 : 1)
-                    .frame(width: 13, alignment: .leading)
-                    .overlay(alignment: .leading) {
-                        if isSwitching { ProgressView().controlSize(.mini) }
-                    }
-                Text(stash.label).font(.system(size: 13, weight: .semibold))
-                stashBadge(revoked: stash.revoked, mismatch: stash.version_mismatch,
-                           stale: stash.stale, active: stash.active)
-                Spacer(minLength: 4)
-                chip(stash.active == true ? desktop.chipText : "captured")
-            }
-            if stash.revoked == true, stash.active != true {
-                revokedNotice()
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 1)
+                    .background(Capsule().fill(Color.primary.opacity(0.07)))
             }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
-        .background(
-            RoundedRectangle(cornerRadius: 8)
-                .fill(Color.primary.opacity(hovered ? 0.08 : 0.03))
-        )
-        .onHover { hovered = $0 }
     }
 }
 
@@ -1689,21 +1194,12 @@ struct FooterView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             if let err = model.actionError {
-                // six lines: a failed switch reports the tool's whole refusal, and the joined
-                // CLI-and-desktop pair is the longest realistic text; the remedy is its tail
+                // roomy on purpose: a failed switch or sign-in shows the backend's whole
+                // message, which wraps
                 Text("⚠ \(err)").font(.system(size: 11)).foregroundStyle(sevColor(95)).lineLimit(6)
             }
             if let err = model.lastError {
                 warnRow("⚠ \(err)")
-            }
-            // Not `stale` — that's a switch-target fact that skips the active row. Revoked and
-            // version-mismatched copies keep their own warnings: age adds nothing to a dead
-            // session, and switching away refreshes a pre-update capture by itself.
-            if let old = model.desktop?.stashes.first(where: {
-                $0.active == true && $0.copy_old == true
-                && $0.version_mismatch != true && $0.revoked != true
-            }) {
-                warnRow("⚠ the desktop app's saved copy of \(old.label) is old; recapture before switching away to avoid a sign-in")
             }
             if model.payload?.accounts.contains(where: { $0.stale == true }) == true {
                 warnRow("⚠ last known values — rate-limited; updates on the next refresh")

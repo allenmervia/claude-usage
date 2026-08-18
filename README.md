@@ -109,13 +109,10 @@ Two things to know:
   which account the CLI holds; the account you leave keeps its session, so the tool
   can still refresh it. **`/logout` revokes that account's token server-side** — the
   tool then can't refresh it and will show "sign into it again" until you re-login.
-- **Usage and switching are two separate one-time costs.** The desktop app holds its
+- **Usage is read through the CLI's stored credentials.** The desktop app holds its
   own session in encrypted storage, so no usage figure can be read from it. To see an
   account's usage, log into it once with the `claude` CLI in a terminal (as above);
-  after that it's tracked regardless of how you use it. To *switch* the desktop app
-  between accounts, capture each one once — see [Switching the desktop app](#switching-the-desktop-app).
-  Neither implies the other: a desktop-only account can be switchable with no usage
-  numbers, and a CLI-registered account shows usage without being switchable in the app.
+  after that it's tracked regardless of how you use it.
 
 ## Commands
 
@@ -138,9 +135,9 @@ claude-usage forget X   drop an account by email, label or id (and delete its st
 ## Switching accounts
 
 Click an account in the menu and the CLI switches to it — no browser, no
-`/logout`+`/login`. Rows you can switch to are marked `⇄`; hold **⌥** and the row
-spells out what the click will do. The bar then redraws with the ▶ moved to the new
-account. If a switch can't go through, the menu says why at the bottom.
+`/logout`+`/login`. Rows you can switch to are marked `⇄` on hover. The bar then
+redraws with the ▶ moved to the new account. If a switch can't go through, the menu
+says why at the bottom.
 
 It works by minting a fresh access token from that account's stored refresh token and
 writing it into Claude Code's Keychain item, so your next `claude` run *is* that
@@ -169,9 +166,8 @@ Two things to know:
   its full credentials stored — with the `claude` CLI for a Claude account, `codex
   login` for a Codex one. Until then the menu says so rather than writing a partial
   credential.
-- **This command switches the CLI account.** The desktop app has its own session and
-  its own command; see [Switching the desktop app](#switching-the-desktop-app). In the
-  menu bar the two move together, so one click is usually all you need.
+- **This command switches the CLI account.** The desktop app signs in separately and
+  is not affected.
 
 ## Signing an account back in
 
@@ -228,106 +224,11 @@ nothing moves and a notification names the earliest reset instead.
 
 Because an auto-switch changes which account gets billed without a click, it is never
 silent: each one posts a macOS notification and leaves a record in the menu bar
-dropdown and the table output. `autoswitch on` moves only the CLI credential — the
-desktop app has its own auto-switch, below.
+dropdown and the table output.
 
 A new `claude` run is on the new account immediately; a session already
 mid-conversation picks up the new credential on its own within about ten minutes,
 no restart needed.
-
-### Auto-switching the desktop app
-
-`claude-usage autoswitch desktop on` extends auto-switching to the desktop app
-(requires [desktop switching](#switching-the-desktop-app) to be set up). When the
-app's own account — which need not be the CLI's — hits a limit, the app is swapped
-to the best captured account, under two rules that keep it safe unattended:
-
-- **Swap only fresh.** An unattended swap onto a sign-in screen helps nobody, so only
-  stashes that will come up signed in — fresh (see
-  [stash lifetime](#switching-the-desktop-app)) and captured under the current app
-  version — are targets. If none qualifies, nothing moves and a notification says
-  which recovery to run.
-- **Closed app only, and no surprise launches.** With the app open, the swap is
-  queued instead — a notification offers the menu bar's switch for "now" — and it
-  executes on the first refresh that finds the app closed. The swap never quits the
-  app and never launches it; it refuses if the app opened meanwhile, and the app is
-  simply on the new account the next time you open it.
-
-The same picker, guardrails, and records apply as for the CLI, and the two
-auto-switches arm independently.
-
-## Switching the desktop app
-
-The Claude desktop app signs in separately from the CLI, and changing accounts in it
-normally means logging out and back in — which triggers a verification email every
-time. This switches it by swapping the session files instead: no logout, no login, no
-email.
-
-```bash
-./tools/desktop-switch.py add        # capture another account (once per account)
-./tools/desktop-switch.py switch X   # swap to it
-./tools/desktop-switch.py status     # what is installed, and health
-./tools/desktop-switch.py undo       # put back what the last switch overwrote
-```
-
-Each account has to be captured once, and capturing needs that account signed into the
-app — so setup spends one login per account. After that, switching never logs in again.
-`add` walks the whole thing: it captures the account you're on, clears the local session
-so the app shows a login screen, waits while you sign into the other account, captures
-that, and switches back to prove it works.
-
-**Never use the app's log-out button.** Logging out revokes that account's session
-server-side, which kills its stash permanently — the files restore fine but there's no
-session left behind them, so the app lands on a login screen. That's why `add` clears
-the session locally instead: the account you leave stays valid and switchable.
-
-Switching quits and reopens the app, so any Claude Code sessions running inside it are
-closed. They resume from the app's own list, but a turn in flight is lost. With the app
-already closed, a switch is just a file swap and costs nothing.
-
-Device registration is deliberately left in place, which is what keeps the machine
-trusted and the verification emails away. Your MCP config, app preferences and usage
-history stay put too — only the account's own session stores move.
-
-Every switch copies what it overwrites into a rollback directory first, and records the
-operation in a journal before touching anything, so an interrupted run can be rolled
-forward or back (`repair`) rather than leaving the profile half one account and half
-another. `undo` restores the exact bytes the last switch replaced.
-
-A stash survives short parking, not long: the server invalidates sessions left idle
-past about a day, so a stash parked longer usually comes back to the sign-in banner
-(the bar and `doctor` flag it as stale). The active account's own saved copy ages
-the same way — it is what a switch away and back reinstalls — so the bar's footer,
-`doctor`, and `list` say when it has grown old and `recapture` refreshes it. An app
-update has the same effect — a pre-update capture lands on a login screen, and both
-surfaces warn when a stash
-predates the installed version. Either way, recovery is one login per account: sign
-in at the login screen the switch lands on, then `desktop-switch.py recapture` to
-put the fresh session in the stash.
-
-Signing in or out inside the app by hand is noticed and handled. The switcher keeps a
-note of which account it last installed; every refresh compares that note against the
-profile's own identity. A hand sign-in to a captured account points the note at the
-right stash on its own. A hand logout kills the displaced stash's session (as above),
-so that stash is flagged instead of offered — recovery is the same one login plus
-`recapture`, and `doctor` names the affected stash. An account the app is signed into
-but you never captured is called out rather than guessed at.
-
-Each capture records which account it holds, read from the profile's own storage —
-the same account id the usage API reports. That reading, not the labels, decides what
-a switch away preserves, so signing into the "wrong" account at a login screen
-refreshes that account's stash rather than poisoning the one the switcher expected.
-The reading also gates the risky moves:
-
-- `capture` refuses a second label for an already-stashed account.
-- `switch` refuses a stash whose files disagree with the account its manifest claims.
-- A sign-in matching no stash is kept as `unclaimed-<timestamp>` for you to `rename`,
-  never written over a labeled stash.
-- Whatever a refresh overwrites is kept under `desktop-stash-asides`.
-
-The account id's location in the profile is the app's private business; if an update
-moves it, reads degrade to "unknown", records fill in, and `profile-probe.py`
-re-derives where it went.
 
 ## Menu bar
 
@@ -351,11 +252,7 @@ The dropdown has two tabs:
   is open, plan tags, and click-anywhere-to-switch on parked accounts (a ⇄ appears on
   hover). The account you're on is the card that's lit — the account the CLI is signed
   into, the same one the title gauge draws — unless it's the only account in its
-  section, where there's nothing to distinguish it from. One click moves both surfaces
-  together, and if moving the desktop app would close sessions running inside it, the
-  card asks first and offers to move the CLI alone. After a CLI-only move the desktop
-  app stays behind on the old account; a small "desktop" chip on that card marks where
-  it is until a full switch brings the two surfaces back together.
+  section, where there's nothing to distinguish it from.
 - **Insights** — the weekly burn (each account's current week as a band on one
   shared timeline, its recorded burn inside, one line marking now — hover for values,
   hover a name for its email and provider) and the model mix (see
@@ -364,10 +261,9 @@ The dropdown has two tabs:
 Refresh cadence, launch at login, and quit live behind the gear. Refreshes are cheap —
 one small `/usage` request per account, and these are **status calls that don't count
 against your usage limits** — so short cadences are fine. The app is a shell over
-this script: it runs `claude-usage --json` on its timer and `claude-usage switch` or
-`claude-usage desktop-switch` when you click, so every number and phrase comes from the
-same place as the terminal table — which is also the fallback if you'd rather skip the
-app entirely.
+this script: it runs `claude-usage --json` on its timer and `claude-usage switch` when
+you click, so every number and phrase comes from the same place as the terminal table —
+which is also the fallback if you'd rather skip the app entirely.
 
 Building with `claude-usage app --dev` installs a second copy named *Claude Usage (dev)*
 alongside the everyday one, so a branch can be tried without replacing a working bar.
