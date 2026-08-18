@@ -7,6 +7,7 @@ Run:  python3 -m unittest discover -s tests
 import contextlib
 import importlib.util
 import io
+import json
 import os
 import tempfile
 import unittest
@@ -454,6 +455,173 @@ class TestIdentityGuards(_ToolCase):
         m2 = self.ds.stash_meta("named") or {}
         self.assertNotIn("unclaimed", m2)
         self.assertEqual(m2["label"], "named")
+
+
+class TestObserve(_ToolCase):
+    """cmd_observe: reconcile the record with the profile's own identity."""
+
+    def setUp(self):
+        super().setUp()
+        self.touch_cookie()
+
+    def observe(self, heal=True):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.ds.cmd_observe(heal=heal)
+        return json.loads(buf.getvalue())
+
+    def test_hand_signin_heals_the_record_and_revokes_the_displaced_stash(self):
+        # the incident: hand logout of the recorded account, hand sign-in to another
+        self.sign_in(UUID_A)
+        self.make_stash("allen", UUID_A)
+        self.make_stash("allen-2", UUID_B)
+        self.ds.write_json(self.ds.ACTIVE, {"label": "allen-2", "at": 1.0, "files": {}})
+        out = self.observe()
+        self.assertEqual(out["healed"], "allen")
+        self.assertEqual(out["revoked"], ["allen-2"])
+        self.assertEqual((self.ds.read_json(self.ds.ACTIVE) or {}).get("label"), "allen")
+        self.assertTrue((self.ds.stash_meta("allen-2") or {}).get("revoked"))
+        self.assertFalse((self.ds.stash_meta("allen") or {}).get("revoked"))
+
+    def test_matching_record_is_left_alone(self):
+        self.sign_in(UUID_A)
+        self.make_stash("allen", UUID_A)
+        self.ds.write_json(self.ds.ACTIVE, {"label": "allen", "at": 1.0, "files": {}})
+        out = self.observe()
+        self.assertIsNone(out["healed"])
+        self.assertEqual(out["revoked"], [])
+
+    def test_report_only_never_writes(self):
+        self.sign_in(UUID_A)
+        self.make_stash("allen", UUID_A)
+        self.make_stash("allen-2", UUID_B)
+        self.ds.write_json(self.ds.ACTIVE, {"label": "allen-2", "at": 1.0, "files": {}})
+        out = self.observe(heal=False)
+        self.assertIsNone(out["healed"])
+        self.assertEqual((self.ds.read_json(self.ds.ACTIVE) or {}).get("label"), "allen-2")
+        self.assertFalse((self.ds.stash_meta("allen-2") or {}).get("revoked"))
+
+    def test_at_rest_signout_clears_the_record_and_revokes(self):
+        write_log(self.profile, [record(batch(("put", KEY, account_json(UUID_A)))),
+                                 record(batch(("del", KEY)))])
+        self.make_stash("allen", UUID_A)
+        self.ds.write_json(self.ds.ACTIVE, {"label": "allen", "at": 1.0, "files": {}})
+        out = self.observe()
+        self.assertTrue(out["cleared"])
+        self.assertEqual(out["revoked"], ["allen"])
+        self.assertIsNone((self.ds.read_json(self.ds.ACTIVE) or {}).get("label"))
+
+    def test_signout_while_app_runs_is_report_only(self):
+        write_log(self.profile, [record(batch(("put", KEY, account_json(UUID_A)))),
+                                 record(batch(("del", KEY)))])
+        self.make_stash("allen", UUID_A)
+        self.ds.write_json(self.ds.ACTIVE, {"label": "allen", "at": 1.0, "files": {}})
+        self.ds.app_running = lambda: True     # mid-login transients must not revoke anything
+        out = self.observe()
+        self.assertFalse(out["cleared"])
+        self.assertEqual(out["revoked"], [])
+        self.assertEqual((self.ds.read_json(self.ds.ACTIVE) or {}).get("label"), "allen")
+
+    def test_untracked_signin_is_surfaced_and_displaced_stash_revoked(self):
+        self.sign_in(UUID_B)                   # no stash holds B
+        self.make_stash("allen", UUID_A)
+        self.ds.write_json(self.ds.ACTIVE, {"label": "allen", "at": 1.0, "files": {}})
+        out = self.observe()
+        self.assertTrue(out["untracked"])
+        self.assertIsNone(out["healed"])
+        self.assertEqual(out["revoked"], ["allen"])
+
+    def test_uuidless_recorded_stash_is_unconfirmed_not_untracked(self):
+        # the live-fleet case: the record names a pre-identity stash that cannot confirm
+        # nor deny — no alarm, no revoke
+        self.sign_in(UUID_A)
+        self.make_stash("allen", None)
+        self.ds.write_json(self.ds.ACTIVE, {"label": "allen", "at": 1.0, "files": {}})
+        out = self.observe()
+        self.assertTrue(out["unconfirmed"])
+        self.assertFalse(out["untracked"])
+        self.assertEqual(out["revoked"], [])
+        self.assertFalse((self.ds.stash_meta("allen") or {}).get("revoked"))
+
+    def test_unknown_identity_changes_nothing(self):
+        self.make_stash("allen", UUID_A)
+        self.ds.write_json(self.ds.ACTIVE, {"label": "allen", "at": 1.0, "files": {}})
+        out = self.observe()
+        self.assertIsNone(out["observed"])
+        self.assertIsNone(out["healed"])
+        self.assertEqual(out["revoked"], [])
+
+    def test_healing_steps_aside_while_a_switch_holds_the_lock(self):
+        self.sign_in(UUID_A)
+        self.make_stash("allen", UUID_A)
+        self.ds.write_json(self.ds.ACTIVE, {"label": "allen-2", "at": 1.0, "files": {}})
+        self.make_stash("allen-2", UUID_B)
+        self.ds.write_json(self.ds.LOCK, {"pid": os.getpid(), "at": 1.0})   # a live pid
+        out = self.observe()
+        self.assertIsNone(out["healed"])
+        self.assertEqual((self.ds.read_json(self.ds.ACTIVE) or {}).get("label"), "allen-2")
+
+    def test_drift_is_reported_even_in_report_only_mode(self):
+        self.sign_in(UUID_A)
+        self.make_stash("allen", UUID_A)
+        self.make_stash("allen-2", UUID_B)
+        self.ds.write_json(self.ds.ACTIVE, {"label": "allen-2", "at": 1.0, "files": {}})
+        out = self.observe(heal=False)
+        self.assertEqual(out["drifted"], "allen")     # doctor can see what a heal would do
+        self.assertIsNone(out["healed"])
+
+    def test_open_journal_blocks_healing(self):
+        # a half-applied switch looks exactly like a hand logout; repair owns that state
+        self.sign_in(UUID_A)
+        self.make_stash("allen", UUID_A)
+        self.make_stash("allen-2", UUID_B)
+        self.ds.write_json(self.ds.ACTIVE, {"label": "allen-2", "at": 1.0, "files": {}})
+        self.ds.write_json(self.ds.JOURNAL, {"op": "x", "phase": "applying"})
+        out = self.observe()
+        self.assertEqual(out["drifted"], "allen")
+        self.assertIsNone(out["healed"])
+        self.assertEqual(out["revoked"], [])
+        self.assertEqual((self.ds.read_json(self.ds.ACTIVE) or {}).get("label"), "allen-2")
+
+    def test_table_residue_is_reported_but_never_healed(self):
+        # compacted tables can hold an earlier account's residue; only log evidence acts
+        write_store_file(self.profile, "000007.ldb", account_json(UUID_A))
+        self.make_stash("allen", UUID_A)
+        self.make_stash("allen-2", UUID_B)
+        self.ds.write_json(self.ds.ACTIVE, {"label": "allen-2", "at": 1.0, "files": {}})
+        out = self.observe()
+        self.assertEqual(out["source"], "table")
+        self.assertEqual(out["drifted"], "allen")
+        self.assertIsNone(out["healed"])
+        self.assertFalse((self.ds.stash_meta("allen-2") or {}).get("revoked"))
+
+    def test_record_naming_a_deleted_stash_reads_untracked(self):
+        self.sign_in(UUID_B)                          # no stash holds B
+        self.ds.write_json(self.ds.ACTIVE, {"label": "gone", "at": 1.0, "files": {}})
+        out = self.observe()
+        self.assertTrue(out["untracked"])
+        self.assertFalse(out["unconfirmed"])
+
+    def test_same_account_duplicate_stash_is_not_revoked_on_heal(self):
+        self.sign_in(UUID_A)
+        self.make_stash("allen", UUID_A)
+        self.make_stash("allen-copy", UUID_A)         # legacy duplicate of the same account
+        self.ds.write_json(self.ds.ACTIVE, {"label": "allen-copy", "at": 1.0, "files": {}})
+        out = self.observe()
+        self.assertEqual(out["healed"], "allen")
+        self.assertEqual(out["revoked"], [])          # its account is still signed in
+
+    def test_recapture_clears_the_revoked_flag(self):
+        self.sign_in(UUID_A)
+        self.make_stash("allen", UUID_A)
+        meta_path = os.path.join(self.state, "desktop-stashes", "allen", "manifest.json")
+        m = self.ds.stash_meta("allen")
+        m["revoked"] = True
+        self.ds.write_json(meta_path, m)
+        self.ds.write_json(self.ds.ACTIVE, {"label": "allen", "at": 1.0, "files": {}})
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.ds.cmd_recapture("allen")
+        self.assertFalse((self.ds.stash_meta("allen") or {}).get("revoked"))
 
 
 if __name__ == "__main__":

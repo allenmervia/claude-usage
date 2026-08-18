@@ -302,6 +302,14 @@ predates the installed version. Either way, recovery is one login per account: s
 in at the login screen the switch lands on, then `desktop-switch.py recapture` to
 put the fresh session in the stash.
 
+Signing in or out inside the app by hand is noticed and handled. The switcher keeps a
+note of which account it last installed; every refresh compares that note against the
+profile's own identity. A hand sign-in to a captured account points the note at the
+right stash on its own. A hand logout kills the displaced stash's session (as above),
+so that stash is flagged instead of offered — recovery is the same one login plus
+`recapture`, and `doctor` names the affected stash. An account the app is signed into
+but you never captured is called out rather than guessed at.
+
 Each capture records which account it holds, read from the profile's own storage —
 the same account id the usage API reports. That reading, not the labels, decides what
 a switch away preserves, so signing into the "wrong" account at a login screen

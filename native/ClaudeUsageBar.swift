@@ -48,6 +48,7 @@ struct Desktop: Decodable {
 
 struct Stash: Decodable, Identifiable {
     var label: String
+    var revoked: Bool?
     var files: Int?
     var age_days: Double?
     var app_version: String?
@@ -92,6 +93,7 @@ struct DisplayDesktop: Decodable {
     var active: Bool?
     var can_switch: Bool?
     var stale: Bool?
+    var revoked: Bool?
     var version_mismatch: Bool?
 }
 

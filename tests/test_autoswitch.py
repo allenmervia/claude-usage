@@ -408,7 +408,7 @@ class TestDesktopPairsTies(unittest.TestCase):
 class TestMatchDesktopIdentity(unittest.TestCase):
     """Stash-to-account pairing: recorded identity outranks the label."""
 
-    STASH_KEYS = {"active": False, "can_switch": True, "stale": False,
+    STASH_KEYS = {"active": False, "can_switch": True, "stale": False, "revoked": False,
                   "version_mismatch": False}
 
     def _rows(self):

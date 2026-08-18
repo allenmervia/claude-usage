@@ -29,6 +29,9 @@ today. So: switch by swapping, never log out.
   desktop-switch.py add                 START HERE — capture another account, safely
   desktop-switch.py signout-local       clear the session files without logging out
   desktop-switch.py status              which account is installed, plus stashes and health
+  desktop-switch.py observe [--heal]    reconcile the record with the profile's own identity
+                                        (hand sign-ins heal the record; a hand logout marks
+                                        the displaced stash for a sign-in + recapture)
   desktop-switch.py capture <label>     stash the signed-in account's profile as <label>
   desktop-switch.py recapture [<label>] refresh a stash from the live profile (run after a
                                         forced sign-in; defaults to the installed account)
@@ -343,9 +346,12 @@ def _log_identity(d, logs):
                     last = SIGNED_OUT        # tombstoned, or rewritten without an account
     return last
 
-def profile_identity(root):
+def profile_identity(root, with_source=False):
     """The signed-in account's uuid in a profile tree (or a stash's files/ tree),
-    SIGNED_OUT when the log shows the session was ended, or None (unknown).
+    SIGNED_OUT when the log shows the session was ended, or None (unknown). with_source
+    returns (answer, "log"|"table"|None) instead — a caller that WRITES on the answer
+    needs to know its evidence class, because only the logs are trustworthy enough to
+    act on (see below).
 
     Meaningful only at rest — a running app holds newer state in memory. Evidence quality
     decides the answer, not file numbers alone: every write lands in the write-ahead .log
@@ -361,7 +367,7 @@ def profile_identity(root):
     """
     d = os.path.join(root, "Local Storage", "leveldb")
     if not os.path.isdir(d):
-        return None
+        return (None, None) if with_source else None
     logs, tables = [], []
     for name in os.listdir(d):
         m = re.fullmatch(r"(\d+)\.(log|ldb)", name)
@@ -369,7 +375,7 @@ def profile_identity(root):
             (logs if m.group(2) == "log" else tables).append((int(m.group(1)), name))
     ans = _log_identity(d, logs)
     if ans:
-        return ans
+        return (ans, "log") if with_source else ans
     found = []
     for _, name in sorted(tables):
         try:
@@ -377,7 +383,8 @@ def profile_identity(root):
                 _scan_for_uuid(f.read(), found)
         except OSError:
             continue
-    return found[-1] if found else None
+    uid = found[-1] if found else None
+    return (uid, "table" if uid else None) if with_source else uid
 
 # ---- small json helpers -----------------------------------------------------
 
@@ -642,6 +649,111 @@ def _set_active(label, files=None):
     write_json(ACTIVE, {"label": label, "at": time.time(),
                         "files": manifest(PROFILE) if files is None else files})
 
+def _try_lock():
+    """The Lock's acquisition without its exit: observe heals opportunistically, and a busy
+    lock just means report-only this round."""
+    cur = read_json(LOCK)
+    if cur and _pid_alive(cur.get("pid")):
+        return False
+    write_json(LOCK, {"pid": os.getpid(), "at": time.time()})
+    return True
+
+def _release_try_lock():
+    try:
+        os.remove(LOCK)
+    except OSError:
+        pass
+
+def _mark_revoked(label):
+    """Stamp a stash as holding a session its account ended by hand (in-app logout). The flag
+    lives in the manifest so any recapture — which rewrites the manifest — clears it."""
+    if label not in list_stashes():
+        return False
+    m = stash_meta(label) or {}
+    if m.get("revoked"):
+        return False
+    m["revoked"] = True
+    write_json(os.path.join(stash_dir(label), "manifest.json"), m)
+    return True
+
+def cmd_observe(heal=False):
+    """Reconcile the ACTIVE record with what the profile actually holds, and say so as JSON.
+
+    The record tracks the switches THIS tool makes; a hand sign-in or logout inside the app
+    changes the account without telling it, after which every surface points at the wrong
+    card and the displaced account's stash silently holds a revoked session (an in-app
+    account change starts with a logout, which kills the parked session server-side).
+    Observing closes that gap: the profile's own storage says who is really signed in.
+
+    Report-only by default; --heal also repairs: point the record at the stash that provably
+    holds the observed account, mark a displaced stash revoked, and on an at-rest sign-out
+    clear the record. Healing acts only on evidence that cannot mislead:
+
+      * log-sourced identity — a compacted table's answer can be an earlier account's
+        residue, so table answers are reported but never acted on;
+      * a sign-out only with the app closed — mid-login the log passes through a
+        signed-out state, and a transient must not revoke anything;
+      * no open journal — a half-applied switch looks exactly like a hand logout, and
+        `repair`, not healing, owns that state;
+      * under the Lock, with the record re-read there — a click switch must not
+        interleave with the writes; a busy lock means report-only this round.
+    """
+    uid, source = profile_identity(PROFILE, with_source=True)
+    claimed = (read_json(ACTIVE) or {}).get("label")
+    stash_ids = {l: _stash_uuid(l) for l in list_stashes()}   # one scan per stash, reused
+    owner = None
+    if _is_uuid(uid):
+        owned = sorted((l for l, u in stash_ids.items() if u == uid),
+                       key=lambda l: (bool((stash_meta(l) or {}).get("unclaimed")), l))
+        owner = owned[0] if owned else None
+    out = {"observed": uid, "signed_out": uid == SIGNED_OUT, "source": source,
+           "recorded": claimed,
+           # drift is reported in BOTH modes: a report-only consumer (doctor) must be able
+           # to see what a heal would do, or it asserts the stale record as truth
+           "drifted": owner if owner and owner != claimed else None,
+           "healed": None, "cleared": False, "revoked": [],
+           "untracked": False, "unconfirmed": False}
+    if _is_uuid(uid) and not owner:
+        if claimed and stash_ids.get(claimed) is None and claimed in stash_ids:
+            # the recorded stash exists but has no identity of its own to contradict the
+            # reading (a pre-identity capture) — the record may well be right, so no alarm
+            # and no action; the next recapture backfills the identity and settles it
+            out["unconfirmed"] = True
+        else:
+            out["untracked"] = True
+    actionable = ((uid == SIGNED_OUT and not app_running())
+                  or (_is_uuid(uid) and source == "log"
+                      and (out["drifted"] or out["untracked"])))
+    if not heal or not actionable or _journal():
+        print(json.dumps(out)); return
+    if not _try_lock():
+        print(json.dumps(out)); return
+    try:
+        if claimed != (read_json(ACTIVE) or {}).get("label"):
+            print(json.dumps(out)); return   # a switch beat us to it; its record wins
+        if uid == SIGNED_OUT:
+            if claimed:
+                if _mark_revoked(claimed):
+                    out["revoked"].append(claimed)
+                _set_active(None, files={})
+                out["cleared"] = True
+        elif out["drifted"]:
+            # a same-account duplicate stash must not be revoked: only a stash that
+            # provably holds a DIFFERENT account was displaced by the hand sign-in
+            if claimed and stash_ids.get(claimed) not in (None, uid) \
+                    and _mark_revoked(claimed):
+                out["revoked"].append(claimed)
+            _set_active(out["drifted"])
+            out["healed"] = out["drifted"]
+        elif out["untracked"] and claimed and stash_ids.get(claimed):
+            # the recorded stash provably holds a different account than the profile
+            # (no stash holds the observed uid), so a hand sign-in displaced it; its
+            # session ended with the in-app logout that preceded that sign-in
+            if _mark_revoked(claimed):
+                out["revoked"].append(claimed)
+    finally:
+        _release_try_lock()
+    print(json.dumps(out))
 def identify():
     """(label, note) for the profile on disk: which stash it matches, if any.
 
@@ -1169,6 +1281,7 @@ def main():
     arg = rest[0] if rest else ""
     if   cmd == "add":     cmd_add()
     elif cmd == "status":  cmd_status()
+    elif cmd == "observe": cmd_observe(heal="--heal" in flags)
     elif cmd == "signout-local": cmd_signout_local()
     elif cmd == "list":    cmd_list()
     elif cmd == "capture": cmd_capture(arg)

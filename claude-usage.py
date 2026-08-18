@@ -575,6 +575,8 @@ def collect(ingest=True, act=None):
         save_cache(rows, now)
         append_history(rows, now)
         if act:
+            desktop_observe(heal=True)     # reconcile the desktop record with hand sign-ins
+                                           # first, so every consumer below sees healed state
             rows = maybe_auto_switch(rows)
         return rows
     if cache and cache.get("rows"):                           # every Claude read errored → last known Claude
@@ -1099,8 +1101,10 @@ def mock_desktop():
     return {"active": "side",
             "stashes": [{"label": l, "files": 34, "age_days": 0.4, "app_version": desktop_app_version(),
                          "stale": False, "version_mismatch": False, "account_uuid": None,
-                         "unclaimed": False, "active": l == "side", "can_switch": l != "side"}
+                         "unclaimed": False, "revoked": False,
+                         "active": l == "side", "can_switch": l != "side"}
                         for l, *_ in MOCK_ACCOUNTS],
+            "active_at": None, "observed": None,
             "needs_repair": False, "app_running": True, "needs_confirm": True,
             "app_version": desktop_app_version()}
 
@@ -1177,15 +1181,24 @@ def _desktop_state():
             "version_mismatch": bool(m.get("app_version") and app_ver
                                      and m["app_version"] != app_ver),
             "active": label == active,
+            # a hand logout inside the app ended this stash's session; recapture clears it
+            "revoked": bool(m.get("revoked")),
             # Switching restarts the app, so a consumer must confirm rather than act on a click.
-            "can_switch": label != active,
+            # A revoked stash is not clickable at all: installing a session known to be dead
+            # can only land on the sign-in banner, and every surface must refuse from this
+            # one computed fact.
+            "can_switch": label != active and not m.get("revoked"),
         })
     # Whether a switch costs the user anything depends entirely on the app being open. With it
     # closed there is nothing to quit and no session to lose, so the swap is as unremarkable as
     # a CLI switch and a click can just do it. With it open the same click closes live sessions,
     # which is a thing to be asked about rather than discovered afterwards.
     running = desktop_app_running()
+    observed = desktop_observe()       # report-only here; collect's act path healed already
     return {"active": active, "stashes": stashes,
+            # the profile's own identity vs the record, when a refresh observed it — lets a
+            # surface say "the app is signed into an account not captured here"
+            "observed": observed,
             # when the installed account last changed (any switch or capture), for holdoffs
             "active_at": rec.get("at"),
             "needs_repair": bool(_read_json_file(DESKTOP_JOURNAL)),
@@ -1575,9 +1588,9 @@ def _match_desktop(rows):
     for label, r in desktop_pairs(rows, ds).items():
         st = by_label[label]
         st["matched_uuid"] = r["uuid"]
-        r["display"]["desktop"] = {k: st[k] for k in
+        r["display"]["desktop"] = {k: st.get(k) for k in
                                    ("label", "active", "can_switch", "stale",
-                                    "version_mismatch")}
+                                    "version_mismatch", "revoked")}
 
 # attach_display runs deep inside rendering while desktop_state is fetched at the top of the
 # payload build; this hands one snapshot from the one place to the other without threading a
@@ -2479,7 +2492,8 @@ def _cli_auto_tick(rows, st, now):
 def desktop_fresh(st):
     """Whether a hands-free swap may land on this stash: it must come up signed in."""
     return bool(st.get("can_switch")) and not st.get("stale") \
-        and not st.get("version_mismatch") and not st.get("unclaimed")
+        and not st.get("version_mismatch") and not st.get("unclaimed") \
+        and not st.get("revoked")
 
 def desktop_auto_decision(rows, ds, now, last_swap_ts, manual_at, scoped=False):
     """The desktop tier's pure core:
@@ -2520,6 +2534,89 @@ def desktop_auto_decision(rows, ds, now, last_swap_ts, manual_at, scoped=False):
     payload = {"cands": cands, "from": ds.get("active"), "reason": reason}
     return ("pending" if ds.get("app_running") else "swap"), payload
 
+DESKTOP_PROFILE = os.path.expanduser("~/Library/Application Support/Claude")
+OBSERVE_CACHE = os.path.join(STATE_DIR, "desktop-observed.json")
+_desktop_observed = {}
+
+def _run_desktop_tool(args, timeout):
+    """Run the swap tool with the CU_* overrides scrubbed: an unattended invocation must
+    never inherit a shell's test sandboxing or app-control no-ops."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CU_")}
+    return subprocess.run([sys.executable, desktop_tool()] + args,
+                          capture_output=True, text=True, timeout=timeout, env=env)
+
+def _observe_sig():
+    """Cheap change detector: the observe verdict can only change when the profile's Local
+    Storage, the active record, the journal, or a stash manifest changes. The leveldb path
+    is the tool's business, mirrored here because only the parent can skip the subprocess
+    (interpreter startup is most of its cost)."""
+    sig = []
+    def stat_of(path, name):
+        try:
+            s = os.stat(path)
+            sig.append((name, int(s.st_mtime), s.st_size))
+        except OSError:
+            sig.append((name, "missing", 0))
+    try:
+        with os.scandir(os.path.join(DESKTOP_PROFILE, "Local Storage", "leveldb")) as it:
+            for e in it:
+                stat_of(e.path, "ls/" + e.name)
+    except OSError:
+        sig.append(("ls", "missing", 0))
+    stat_of(DESKTOP_ACTIVE, "active")
+    stat_of(DESKTOP_JOURNAL, "journal")
+    try:
+        with os.scandir(DESKTOP_STASHES) as it:
+            for e in it:
+                stat_of(os.path.join(e.path, "manifest.json"), "st/" + e.name)
+    except OSError:
+        pass
+    return repr(sorted(sig))
+
+def desktop_observe(heal=False):
+    """One observe per process: reconcile the desktop record with the profile's own identity
+    (hand sign-ins drift them apart; see the tool's cmd_observe). collect()'s act path runs
+    it first with heal=True; every later caller gets that verdict from the memo, so a
+    report-only read can never shadow a heal. Returns the tool's verdict dict, {"error": ...}
+    when observe itself failed (a broken safety net must be visible, not None), or None when
+    the desktop feature isn't set up.
+
+    Skipped entirely — verdict served from the on-disk cache — when nothing it reads has
+    changed since the last run, unless that run left something unacted (lock was busy, app
+    was open during a sign-out) that a retry could now do."""
+    if "out" in _desktop_observed:
+        return _desktop_observed["out"]
+    out = None
+    if os.path.isdir(DESKTOP_APP) and os.path.isdir(DESKTOP_STASHES):
+        if any(k in os.environ for k in ("CU_DESKTOP_STATE", "CU_DESKTOP_PROFILE")):
+            # a sandboxed harness: the scrub below would aim the tool at REAL state, so
+            # mutating is the one thing this process must not do
+            heal = False
+        sig = _observe_sig()
+        cached = _read_json_file(OBSERVE_CACHE) or {}
+        if cached.get("sig") == sig and not (heal and cached.get("retry")):
+            out = cached.get("out")
+        else:
+            try:
+                r = _run_desktop_tool(["observe"] + (["--heal"] if heal else []), timeout=10)
+                if r.returncode == 0:
+                    out = json.loads(r.stdout)
+                else:
+                    tail = (r.stderr or r.stdout or "observe failed").strip().splitlines()
+                    out = {"error": tail[-1][:200] if tail else "observe failed"}
+            except Exception as e:
+                out = {"error": str(e)[:200]}
+            retry = bool(out.get("error")
+                         or (out.get("drifted") and not out.get("healed"))
+                         or (out.get("signed_out") and not out.get("cleared")))
+            try:
+                _replace_file(OBSERVE_CACHE,
+                              json.dumps({"sig": sig, "out": out, "retry": retry}))
+            except Exception:
+                pass
+    _desktop_observed["out"] = out
+    return out
+
 DESKTOP_SWAP_TIMEOUT_S = 90   # a closed-app swap is a few-MB copy plus hashing; anything
                               # longer is a stalled disk — and this must stay under the
                               # 120s _switch_lock expiry or a held lock could be stolen
@@ -2529,11 +2626,10 @@ def _desktop_swap(label):
 
     The tool honors CU_* override variables (test sandboxing, app-control no-ops); an
     unattended swap must never inherit those from whatever shell the refresh ran in."""
-    env = {k: v for k, v in os.environ.items() if not k.startswith("CU_")}
+    if any(k in os.environ for k in ("CU_DESKTOP_STATE", "CU_DESKTOP_PROFILE")):
+        return False, "CU_ overrides present; refusing to swap real state from a sandbox"
     try:
-        r = subprocess.run([sys.executable, desktop_tool(), "switch", label, "--no-launch"],
-                           capture_output=True, text=True, timeout=DESKTOP_SWAP_TIMEOUT_S,
-                           env=env)
+        r = _run_desktop_tool(["switch", label, "--no-launch"], timeout=DESKTOP_SWAP_TIMEOUT_S)
         if r.returncode < 0:
             return False, f"the swap tool was killed by signal {-r.returncode}"
         return r.returncode == 0, (r.stdout + r.stderr).strip()
@@ -2846,7 +2942,7 @@ def cmd_doctor():
         say("warn", "the Claude desktop app isn't installed",
             "optional — this section only matters if you use it.")
     else:
-        ds = desktop_state()
+        ds = desktop_state()            # populates the observed verdict itself, report-only
         if not ds:
             say("warn", "no desktop accounts captured yet, so the app can't be switched here",
                 "capture each account once: ./tools/desktop-switch.py add")
@@ -2854,15 +2950,41 @@ def cmd_doctor():
             if ds["needs_repair"]:
                 say("bad", "a desktop switch was interrupted",
                     "run: ./tools/desktop-switch.py repair")
-            if ds["active"]:
+            obs = ds.get("observed") or {}
+            if obs.get("error"):
+                say("warn", f"couldn't read which account the desktop app is signed into "
+                    f"({obs['error']})", "drift healing is paused until this reads again")
+            # each state below is exclusive, and each suppresses the green "last set to"
+            # line: an ok would assert the very record the warning disputes
+            if obs.get("untracked"):
+                say("warn", "the app is signed into an account not captured here",
+                    "capture it: quit the app, then ./tools/desktop-switch.py add")
+            elif obs.get("drifted"):
+                say("warn", f"the app is signed into {obs['drifted']!r}, "
+                    f"not the recorded {ds['active']!r}",
+                    "the next refresh heals the record on its own")
+            elif obs.get("signed_out") and not ds.get("app_running"):
+                # gated on the app being closed: mid-login the log passes through a
+                # signed-out state, and a transient must not send anyone to recapture
+                say("warn", "the app is signed out",
+                    "open it and sign in (device trust holds), quit it, then "
+                    "./tools/desktop-switch.py recapture")
+            elif ds["active"]:
                 say("ok", f"desktop app last set to {ds['active']}")
             else:
                 say("warn", "the desktop app's account isn't one this tool captured",
-                    "capture it: ./tools/desktop-switch.py add")
+                    "capture it: quit the app, then ./tools/desktop-switch.py add")
             for st in ds["stashes"]:
                 if st["unclaimed"]:
                     say("warn", f"{st['label']}: a sign-in kept safe during a switch, not yet named",
                         f"name it: ./tools/desktop-switch.py rename {st['label']} <label>")
+                    continue
+                if st.get("revoked"):
+                    # definitive, so it outranks every likelihood below: a hand logout inside
+                    # the app ended this stash's session server-side
+                    say("warn", f"{st['label']}: was signed out inside the app; its saved session is dead",
+                        "sign into it in the app once, quit the app, then "
+                        "./tools/desktop-switch.py recapture")
                     continue
                 # A version mismatch outranks age: an update is known to invalidate captures,
                 # while age only might.
@@ -2878,7 +3000,9 @@ def cmd_doctor():
                         "switching to it will likely land on a login screen; log in there and its "
                         "saved copy refreshes on the next switch away.")
                 elif st["stale"]:
-                    say("warn", f"{st['label']}: parked {st['age_days']:.1f} days; its session has likely lapsed",
+                    aged = (f"parked {st['age_days']:.1f} days" if st["age_days"] is not None
+                            else "of unknown age (its manifest is unreadable)")
+                    say("warn", f"{st['label']}: {aged}; its session has likely lapsed",
                         "switching to it will likely show the sign-in banner. Sign in there, quit "
                         "the app, then run ./tools/desktop-switch.py recapture to refresh the stash.")
 

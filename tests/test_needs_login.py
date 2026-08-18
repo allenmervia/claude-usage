@@ -174,6 +174,8 @@ class TestCollectFreshness(Patched):
         self._patch("mock_enabled", lambda: False)
         self._patch("append_history", lambda rows, ts: None)
         self._patch("maybe_auto_switch", lambda rows: rows)
+        # collect()'s act path runs the real observe subprocess against real state otherwise
+        self._patch("desktop_observe", lambda heal=False: None)
         self.saved = []
         self._patch("save_cache", lambda rows, ts: self.saved.append(rows))
         self._patch("load_cache", lambda: {"ts": 0, "rows": [

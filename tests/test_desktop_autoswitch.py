@@ -72,6 +72,11 @@ class TestDesktopDecision(unittest.TestCase):
         self.assertEqual(kind, "swap")
         self.assertEqual([lbl for _r, lbl in payload["cands"]], ["fresh"])  # 'old' is stale
 
+    def test_revoked_stash_is_not_fresh(self):
+        rows, ds = fleet()
+        ds["stashes"][1]["revoked"] = True
+        self.assertEqual(self.decide(rows, ds)[0], "stuck")
+
     def test_version_mismatch_is_not_fresh(self):
         rows, ds = fleet()
         ds["stashes"][1]["version_mismatch"] = True
