@@ -53,6 +53,7 @@ struct Stash: Decodable, Identifiable {
     var age_days: Double?
     var app_version: String?
     var stale: Bool?
+    var copy_old: Bool?
     var version_mismatch: Bool?
     var active: Bool?
     var can_switch: Bool?
@@ -1555,11 +1556,19 @@ struct FooterView: View {
                 Text("⚠ \(err)").font(.system(size: 11)).foregroundStyle(sevColor(95)).lineLimit(3)
             }
             if let err = model.lastError {
-                Text("⚠ \(err)").font(.system(size: 10.5)).foregroundStyle(sevColor(70)).lineLimit(2)
+                warnRow("⚠ \(err)")
+            }
+            // Not `stale` — that's a switch-target fact that skips the active row. Revoked and
+            // version-mismatched copies keep their own warnings: age adds nothing to a dead
+            // session, and switching away refreshes a pre-update capture by itself.
+            if let old = model.desktop?.stashes.first(where: {
+                $0.active == true && $0.copy_old == true
+                && $0.version_mismatch != true && $0.revoked != true
+            }) {
+                warnRow("⚠ the desktop app's saved copy of \(old.label) is old; recapture before switching away to avoid a sign-in")
             }
             if model.payload?.accounts.contains(where: { $0.stale == true }) == true {
-                Text("⚠ last known values — rate-limited; updates on the next refresh")
-                    .font(.system(size: 10.5)).foregroundStyle(sevColor(70))
+                warnRow("⚠ last known values — rate-limited; updates on the next refresh")
             }
             HStack(spacing: 10) {
                 TimelineView(.periodic(from: .now, by: 10)) { ctx in
@@ -1609,6 +1618,11 @@ struct FooterView: View {
         }
         .padding(.top, 4)
         .padding(.horizontal, 4)
+    }
+
+    // One dress for the footer's warning rows, so their styling can't drift apart.
+    private func warnRow(_ text: String) -> some View {
+        Text(text).font(.system(size: 10.5)).foregroundStyle(sevColor(70)).lineLimit(2)
     }
 
     private func updatedText(now: Date) -> String {

@@ -1100,8 +1100,8 @@ def mock_insights():
 def mock_desktop():
     return {"active": "side",
             "stashes": [{"label": l, "files": 34, "age_days": 0.4, "app_version": desktop_app_version(),
-                         "stale": False, "version_mismatch": False, "account_uuid": None,
-                         "unclaimed": False, "revoked": False,
+                         "stale": False, "copy_old": False, "version_mismatch": False,
+                         "account_uuid": None, "unclaimed": False, "revoked": False,
                          "active": l == "side", "can_switch": l != "side"}
                         for l, *_ in MOCK_ACCOUNTS],
             "active_at": None, "observed": None,
@@ -1162,6 +1162,10 @@ def _desktop_state():
         # a missing or unreadable manifest must read as OLD, not fresh: these fields gate
         # unattended swaps, and unknown-defaults-to-go is how garbage gets installed
         age = (now - m["captured_at"]) / 86400 if m.get("captured_at") else None
+        # The copy's age alone, active account included. A switch away refreshes the
+        # displaced stash only from a byte-exact or known-dead profile, so an aged copy
+        # under the active account predicts the sign-in banner on a switch away and back.
+        copy_old = age is None or age > STASH_STALE_DAYS
         stashes.append({
             "label": label,
             "files": len(m.get("files") or {}),
@@ -1174,7 +1178,8 @@ def _desktop_state():
             "unclaimed": bool(m.get("unclaimed")),
             # Stale predicts "switching to this stash will hit the sign-in banner". The active
             # account's session lives in the app, not its parked copy, so it is never stale here.
-            "stale": (age is None or age > STASH_STALE_DAYS) and label != active,
+            "stale": copy_old and label != active,
+            "copy_old": copy_old,
             # An app update can migrate or re-key the account stores, after which a pre-update
             # capture lands on a login screen when installed. Computed once here so every
             # surface warns from the same fact.
@@ -1588,6 +1593,8 @@ def _match_desktop(rows):
     for label, r in desktop_pairs(rows, ds).items():
         st = by_label[label]
         st["matched_uuid"] = r["uuid"]
+        # The card's slice of the stash: switch-target facts. copy_old is deliberately
+        # absent — it is an active-account, whole-panel fact, surfaced by the footer.
         r["display"]["desktop"] = {k: st.get(k) for k in
                                    ("label", "active", "can_switch", "stale",
                                     "version_mismatch", "revoked")}
@@ -3005,6 +3012,13 @@ def cmd_doctor():
                     say("warn", f"{st['label']}: {aged}; its session has likely lapsed",
                         "switching to it will likely show the sign-in banner. Sign in there, quit "
                         "the app, then run ./tools/desktop-switch.py recapture to refresh the stash.")
+                elif st["copy_old"] and st["active"]:
+                    aged = (f"is {st['age_days']:.1f} days old" if st["age_days"] is not None
+                            else "is of unknown age (its manifest is unreadable)")
+                    say("warn", f"{st['label']}: its saved copy {aged}",
+                        "a switch away and back would reinstall that aged copy and likely hit "
+                        "the sign-in banner. Quit the app, then run "
+                        "./tools/desktop-switch.py recapture to refresh it.")
 
     section("Menu bar")
     bundle = _app_bundle_path()

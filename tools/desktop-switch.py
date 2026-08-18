@@ -610,11 +610,17 @@ def cmd_list():
         m = stash_meta(label) or {}
         age = (time.time() - m.get("captured_at", 0)) / 86400
         mark = "▶" if label == active else " "
-        # The active row is the account in use, not a parked stash — no sign-in prediction there.
-        stale = (f"  (parked >{STALE_DAYS:g}d — expect a sign-in)"
-                 if age > STALE_DAYS and label != active else "")
+        # The active row is the account in use, not a parked stash — no sign-in prediction
+        # there. Its saved copy still ages, so mark that plainly and leave the advice to
+        # doctor, which knows whether a switch away would refresh the copy by itself.
+        if age <= STALE_DAYS:
+            note = ""
+        elif label == active:
+            note = f"  (saved copy >{STALE_DAYS:g}d old)"
+        else:
+            note = f"  (parked >{STALE_DAYS:g}d — expect a sign-in)"
         print(f" {mark} {label:<20} {len(m.get('files') or {}):>5} files  "
-              f"captured {age:.1f}d ago  app v{m.get('app_version')}{stale}")
+              f"captured {age:.1f}d ago  app v{m.get('app_version')}{note}")
 
 def cmd_forget(label):
     if label not in list_stashes():

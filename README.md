@@ -296,8 +296,11 @@ another. `undo` restores the exact bytes the last switch replaced.
 
 A stash survives short parking, not long: the server invalidates sessions left idle
 past about a day, so a stash parked longer usually comes back to the sign-in banner
-(the bar and `doctor` flag it as stale). An app update has the same effect — a
-pre-update capture lands on a login screen, and both surfaces warn when a stash
+(the bar and `doctor` flag it as stale). The active account's own saved copy ages
+the same way — it is what a switch away and back reinstalls — so the bar's footer,
+`doctor`, and `list` say when it has grown old and `recapture` refreshes it. An app
+update has the same effect — a pre-update capture lands on a login screen, and both
+surfaces warn when a stash
 predates the installed version. Either way, recovery is one login per account: sign
 in at the login screen the switch lands on, then `desktop-switch.py recapture` to
 put the fresh session in the stash.

@@ -454,5 +454,47 @@ class TestMatchDesktopIdentity(unittest.TestCase):
         self.assertNotIn("desktop", rows[0]["display"])
 
 
+class TestDesktopCopyOld(Patched):
+    """`stale` excludes the active stash (it is not a switch target), but its parked copy
+    still ages on disk; `copy_old` carries the age-alone fact the footer warns from."""
+
+    def setUp(self):
+        import json
+        import tempfile
+        import time
+        self.tmp = tempfile.mkdtemp()
+        stashes = os.path.join(self.tmp, "stashes")
+        now = time.time()
+        for label, age_days in (("aged-active", 3), ("aged-parked", 3), ("fresh", 0.1),
+                                ("no-stamp", None)):
+            d = os.path.join(stashes, label)
+            os.makedirs(d)
+            manifest = {"label": label, "files": {"Cookies": "x"}}
+            if age_days is not None:
+                manifest["captured_at"] = now - age_days * 86400
+            with open(os.path.join(d, "manifest.json"), "w") as f:
+                json.dump(manifest, f)
+        with open(os.path.join(self.tmp, "active.json"), "w") as f:
+            json.dump({"label": "aged-active"}, f)
+        self._patch("DESKTOP_APP", self.tmp)
+        self._patch("DESKTOP_STASHES", stashes)
+        self._patch("DESKTOP_ACTIVE", os.path.join(self.tmp, "active.json"))
+        self._patch("DESKTOP_JOURNAL", os.path.join(self.tmp, "journal.json"))
+        self._patch("desktop_app_version", lambda: "2.0.0")
+        self._patch("desktop_app_running", lambda: False)
+
+    def test_copy_old_is_age_alone_and_stale_still_excludes_active(self):
+        st = {s["label"]: s for s in cu._desktop_state()["stashes"]}
+        self.assertTrue(st["aged-active"]["copy_old"])
+        self.assertFalse(st["aged-active"]["stale"])
+        self.assertTrue(st["aged-parked"]["copy_old"])
+        self.assertTrue(st["aged-parked"]["stale"])
+        self.assertFalse(st["fresh"]["copy_old"])
+        self.assertFalse(st["fresh"]["stale"])
+        # No captured_at reads as old, not fresh, same as stale's unknown-defaults-to-old.
+        self.assertTrue(st["no-stamp"]["copy_old"])
+        self.assertIsNone(st["no-stamp"]["age_days"])
+
+
 if __name__ == "__main__":
     unittest.main()
