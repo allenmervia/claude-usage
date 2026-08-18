@@ -2823,12 +2823,40 @@ def _app_installed(bundle):
 def desktop_tool():
     return os.path.join(os.path.dirname(os.path.realpath(__file__)), "tools", "desktop-switch.py")
 
+def _switch_verdict(text):
+    """The reason a desktop-switch run failed, as one flowing sentence.
+
+    The tool's output mixes pre-switch warnings (a `warning:` line plus its indented
+    continuations), `· ` progress lines, `! ` rollback diagnostics naming the error that
+    forced a rollback, and the verdict it exited with. The warnings and progress predate
+    the failure and are dropped; the diagnostics and verdict explain it and are kept,
+    joined into one string the bar can wrap itself (their line breaks are terminal
+    formatting). A crash is the exception: a traceback's one readable line is its last,
+    so that alone is kept.
+    """
+    lines = text.strip().splitlines()
+    if any(ln.startswith("Traceback (most recent call last") for ln in lines):
+        kept = [ln.strip() for ln in lines if ln.strip()]
+        return kept[-1] if kept else ""
+    verdict, in_warning = [], False
+    for ln in lines:
+        if ln.startswith("warning:"):
+            in_warning = True
+        elif not ln.strip() or ln.startswith("·"):
+            continue
+        elif in_warning and ln[:1].isspace():
+            continue
+        else:
+            in_warning = False
+            verdict.append(ln.strip())
+    return " ".join(verdict)
+
 def cmd_desktop_switch(label):
     """Swap the desktop app to a captured account, for the menu bar to call.
 
-    Failure text goes to stderr and the exit status carries the verdict, which is what the bar
-    reads — the last line is used, since that is where the tool puts the reason rather than the
-    progress it printed on the way there.
+    Failure text goes to stderr and the exit status carries the verdict, which is what the
+    bar reads. Pre-switch warnings share that stream, so the verdict is separated out with
+    _switch_verdict rather than forwarded wholesale.
     """
     tool = desktop_tool()
     if not label:
@@ -2837,13 +2865,16 @@ def cmd_desktop_switch(label):
         _fail(f"{tool} is missing — restore it from the repo")
     r = subprocess.run([sys.executable, tool, "switch", label], capture_output=True, text=True)
     if r.returncode < 0:
-        # killed by a signal: the tool wrote no verdict of its own, and stderr may hold only
-        # its pre-switch warning, whose last line would otherwise be reported as the reason
+        # killed by a signal: the tool wrote no verdict of its own, so name the signal
+        # rather than report whatever partial output it left behind
         _fail(f"desktop switch was killed by signal {-r.returncode}; "
               f"check ./tools/desktop-switch.py status")
     if r.returncode != 0:
-        msg = (r.stderr or r.stdout or "desktop switch failed").strip().splitlines()
-        _fail(msg[-1] if msg else "desktop switch failed")
+        # the last raw line is the net under the parser: when nothing qualifies as a
+        # verdict (say, output that is all warnings), a fragment still beats no reason
+        out = (r.stderr or r.stdout).strip()
+        tail = out.splitlines()[-1].strip() if out else ""
+        _fail(_switch_verdict(out) or tail or "desktop switch failed")
     if r.stderr.strip():
         # warnings from the tool (e.g. the stash predates an app update) ride stderr so a
         # successful exit can't swallow them for terminal callers; the bar warns from the

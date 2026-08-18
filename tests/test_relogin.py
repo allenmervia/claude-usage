@@ -4,11 +4,9 @@ captures the credential it writes, and hands the CLI back to the account it disp
 
 Run:  python3 -m unittest discover -s tests
 """
-import contextlib
-import io
 import unittest
 
-from support import Patched, cu
+from support import Patched, cu, run_capturing
 
 TARGET = {"uuid": "u-target", "email": "target@x.test"}
 PREV = {"uuid": "u-prev", "email": "prev@x.test"}
@@ -100,14 +98,7 @@ class TestRelogin(Patched):
 
     def _run(self, target="target@x.test"):
         """(exit_code, stdout, stderr) — 0 when the command returned without failing."""
-        out, err = io.StringIO(), io.StringIO()
-        code = 0
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            try:
-                cu.cmd_relogin(target)
-            except SystemExit as ex:
-                code = ex.code
-        return code, out.getvalue(), err.getvalue()
+        return run_capturing(cu.cmd_relogin, target)
 
     def test_success_captures_and_hands_the_cli_back(self):
         code, out, _ = self._run()

@@ -30,3 +30,19 @@ class Patched(unittest.TestCase):
         orig = getattr(cu, name)
         setattr(cu, name, stub)
         self.addCleanup(setattr, cu, name, orig)
+
+
+def run_capturing(func, *args, **kwargs):
+    """Call func with stdout/stderr captured and any SystemExit intercepted.
+
+    Returns (code, stdout, stderr); code is 0 when func returned without exiting.
+    """
+    import contextlib, io
+    out, err = io.StringIO(), io.StringIO()
+    code = 0
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        try:
+            func(*args, **kwargs)
+        except SystemExit as ex:
+            code = ex.code
+    return code, out.getvalue(), err.getvalue()

@@ -853,6 +853,8 @@ def cmd_switch(label, dry_run=False, no_launch=False):
     cur_ver = app_version()
     # Both warnings print for dry runs too — the preview's job is to predict the real run, and
     # these are the two lines that predict a switch landing on a sign-in screen.
+    # claude-usage.py's _switch_verdict strips warnings from failure text by this exact
+    # shape — the "warning:" prefix and space-indented continuation lines — so keep it.
     if meta.get("app_version") and cur_ver and meta["app_version"] != cur_ver:
         # stderr, not stdout: wrappers keep stdout for results. Both versions must be
         # readable: with either unknown there is no basis to warn, and the doctor/bar

@@ -1689,7 +1689,9 @@ struct FooterView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             if let err = model.actionError {
-                Text("⚠ \(err)").font(.system(size: 11)).foregroundStyle(sevColor(95)).lineLimit(3)
+                // six lines: a failed switch reports the tool's whole refusal, and the joined
+                // CLI-and-desktop pair is the longest realistic text; the remedy is its tail
+                Text("⚠ \(err)").font(.system(size: 11)).foregroundStyle(sevColor(95)).lineLimit(6)
             }
             if let err = model.lastError {
                 warnRow("⚠ \(err)")
