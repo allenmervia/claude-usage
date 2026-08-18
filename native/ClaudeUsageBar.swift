@@ -1133,6 +1133,23 @@ private func mismatchNotice() -> some View {
         .fixedSize(horizontal: false, vertical: true)
 }
 
+// The long-parked-capture warning, same shape as the pair above: one home for badge and
+// notice so the copies can't drift. Mismatch outranks age wherever both could show: an app
+// update is known to invalidate a capture, age only might.
+private func staleBadge() -> some View {
+    Text("may have expired")
+        .font(.system(size: 10))
+        .foregroundStyle(sevColor(70))
+        .lineLimit(1)
+}
+
+private func staleNotice() -> some View {
+    Text("This saved sign-in has been parked for a while and may land on a login screen. If it does, just log in; the saved copy refreshes on the next switch away.")
+        .font(.system(size: 11))
+        .foregroundStyle(sevColor(70))
+        .fixedSize(horizontal: false, vertical: true)
+}
+
 struct AccountCard: View {
     @EnvironmentObject var model: Model
     let account: Account
@@ -1175,12 +1192,13 @@ struct AccountCard: View {
                 card
             } else if cliSwitchable || desktopSwitchable {
                 Button {
-                    // A pre-update stash confirms even with the app closed: the swap costs
-                    // nothing then, but the login screen it may land on still deserves a
-                    // heads-up, and this sheet is the only surface left to give it (the
-                    // backend's stderr warning is dropped on a successful exit).
+                    // A pre-update or long-parked stash confirms even with the app closed:
+                    // the swap costs nothing then, but the login screen it may land on still
+                    // deserves a heads-up, and this sheet is the only surface left to give it
+                    // (the backend's stderr warning is dropped on a successful exit).
                     if desktopSwitchable && (model.desktop?.needs_confirm == true
-                                             || stash?.version_mismatch == true) {
+                                             || stash?.version_mismatch == true
+                                             || stash?.stale == true) {
                         model.confirmTarget = account.uuid
                     } else if model.confirmTarget != nil {
                         // A question is open on another card, and this click lands outside it:
@@ -1218,6 +1236,8 @@ struct AccountCard: View {
             }
             if stash?.version_mismatch == true {
                 mismatchNotice()
+            } else if stash?.stale == true {
+                staleNotice()
             }
             HStack(spacing: 8) {
                 Spacer()
@@ -1309,7 +1329,8 @@ struct AccountCard: View {
                         Button("Move desktop here") {
                             // The same warnings a whole-card swap gets: this click can still
                             // quit an app with live sessions in it.
-                            if model.desktop?.needs_confirm == true || st.version_mismatch == true {
+                            if model.desktop?.needs_confirm == true || st.version_mismatch == true
+                                || st.stale == true {
                                 model.confirmTarget = account.uuid
                             } else {
                                 Task { await model.switchDesktop(st.label) }
@@ -1348,8 +1369,10 @@ struct AccountCard: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
-            if stash?.version_mismatch == true, stash?.active != true {
-                mismatchBadge()
+            if stash?.version_mismatch == true {
+                if stash?.active != true { mismatchBadge() }
+            } else if stash?.stale == true {
+                staleBadge()
             }
             Spacer(minLength: 4)
             // Where the desktop app is signed in when that isn't the lit card — after a
@@ -1384,9 +1407,10 @@ struct StashCard: View {
                 confirmCard
             } else if stash.can_switch == true {
                 Button {
-                    // A pre-update stash confirms even with the app closed — same rationale
-                    // as AccountCard: this sheet is the only warning surface left.
-                    if desktop.needs_confirm == true || stash.version_mismatch == true {
+                    // A pre-update or long-parked stash confirms even with the app closed —
+                    // same rationale as AccountCard: this sheet is the only warning surface left.
+                    if desktop.needs_confirm == true || stash.version_mismatch == true
+                        || stash.stale == true {
                         model.confirmTarget = "desktop:" + stash.label
                     }
                     else if model.confirmTarget != nil { model.confirmTarget = nil }  // dismiss, don't act
@@ -1418,6 +1442,8 @@ struct StashCard: View {
             }
             if stash.version_mismatch == true {
                 mismatchNotice()
+            } else if stash.stale == true {
+                staleNotice()
             }
             HStack(spacing: 8) {
                 Spacer()
@@ -1451,13 +1477,10 @@ struct StashCard: View {
                     if isSwitching { ProgressView().controlSize(.mini) }
                 }
             Text(stash.label).font(.system(size: 13, weight: .semibold))
-            // Mismatch outranks age: an app update is known to invalidate a capture, age only might.
             if stash.version_mismatch == true {
                 if stash.active != true { mismatchBadge() }
             } else if stash.stale == true {
-                Text("may have expired")
-                    .font(.system(size: 10))
-                    .foregroundStyle(sevColor(70))
+                staleBadge()
             }
             Spacer(minLength: 4)
             chip(stash.active == true ? "desktop" : "captured")
