@@ -41,9 +41,87 @@ struct AutoSwitch: Decodable {
 struct Desktop: Decodable {
     var active: String?
     var stashes: [Stash]
+    var observed: Observed?
     var needs_repair: Bool?
     var app_running: Bool?
     var needs_confirm: Bool?
+
+    /// The observe verdict against the record, distilled to the one state the panel acts on.
+    /// Nil when the two agree — or while a repair is pending: mid-swap bytes look exactly
+    /// like a hand logout, and the repair warning already names the only action the tool
+    /// will accept in that state.
+    enum Drift {
+        case unreadable          // observe itself failed, so drift would go undetected
+        case untracked           // the app is on an account no stash holds
+        case drifted(to: String, recorded: String?, healsItself: Bool)
+        case signedOut           // at rest, with no session at all
+    }
+    var drift: Drift? {
+        guard needs_repair != true, let o = observed else { return nil }
+        if o.error != nil { return .unreadable }
+        if o.untracked == true { return .untracked }
+        if let real = o.drifted, o.healed == nil {
+            // The heal acts only on log-sourced identity: a compacted table's answer can be
+            // an earlier account's residue, so a table verdict is reported but never healed,
+            // and the line must not promise otherwise.
+            return .drifted(to: real, recorded: o.recorded ?? active,
+                            healsItself: o.source == "log")
+        }
+        // Mid-login the log passes through a signed-out state, so with the app open this
+        // reading proves nothing; with it closed, the record points at no session at all.
+        if o.signed_out == true, app_running != true { return .signedOut }
+        return nil
+    }
+
+    /// The record is contradicted by the profile's own evidence, so the "desktop" chip is a
+    /// claim in dispute and wears a question mark. An unreadable verdict is absence of
+    /// evidence, not contradiction: the line reports it, but the chip stays plain.
+    var recordDisputed: Bool {
+        switch drift {
+        case nil, .unreadable: return false
+        default: return true
+        }
+    }
+
+    /// The capsule naming where the desktop app is signed in, per the record.
+    var chipText: String { recordDisputed ? "desktop?" : "desktop" }
+
+    /// The verdict's one line in the panel, above the cards. Same ladder as doctor's; the
+    /// states doctor treats as fine stay silent here too: an already-healed drift is fixed
+    /// in this very payload, and an unconfirmed pre-identity capture is no alarm.
+    var driftLine: String? {
+        switch drift {
+        case nil:
+            return nil
+        case .unreadable:
+            return "Couldn't read which account the desktop app is signed into, so drift healing is paused. `doctor` has the details."
+        case .untracked:
+            return app_running == true
+                ? "The desktop app is signed into an account not captured here. Quit the app, then run `desktop-switch.py add` to capture it."
+                : "The desktop app is signed into an account not captured here. Run `desktop-switch.py add` to capture it."
+        case let .drifted(real, recorded, healsItself):
+            let claim = recorded.map { "not the recorded '\($0)'" } ?? "which the record does not show"
+            let fact = "The desktop app is signed into '\(real)', \(claim)."
+            return healsItself ? fact + " The record heals on the next refresh." : fact
+        case .signedOut:
+            return "The desktop app is signed out. Sign in there, quit the app, then run `desktop-switch.py recapture`."
+        }
+    }
+}
+
+// The observe verdict (tools/desktop-switch.py observe): the profile's own identity next to
+// the record of what was installed. The record follows this tool's switches, but a hand
+// sign-in or logout inside the app moves the account without telling it; the verdict is how
+// this surface avoids asserting the stale record as truth. Every field optional so payloads
+// from before the verdict existed still decode.
+struct Observed: Decodable {
+    var signed_out: Bool?
+    var source: String?
+    var recorded: String?
+    var drifted: String?
+    var healed: String?
+    var untracked: Bool?
+    var error: String?
 }
 
 struct Stash: Decodable, Identifiable {
@@ -59,6 +137,10 @@ struct Stash: Decodable, Identifiable {
     var can_switch: Bool?
     var matched_uuid: String?
     var id: String { label }
+    /// The one gate every switch path shares. `revoked` is re-checked beside `can_switch`
+    /// so a stash marked dead can never be installed, whatever vintage of payload claimed
+    /// it clickable.
+    var switchable: Bool { can_switch == true && revoked != true }
 }
 
 struct Account: Decodable, Identifiable {
@@ -96,6 +178,8 @@ struct DisplayDesktop: Decodable {
     var stale: Bool?
     var revoked: Bool?
     var version_mismatch: Bool?
+    /// Same gate as Stash.switchable, for the copy folded into an account's card.
+    var switchable: Bool { can_switch == true && revoked != true }
 }
 
 struct DisplayRow: Decodable {
@@ -432,7 +516,7 @@ final class Model: ObservableObject {
             do { _ = try await Backend.run(["switch", account.uuid]) }
             catch { errs.append("CLI: \(error.localizedDescription)") }
         }
-        if let st = account.display?.desktop, st.can_switch == true,
+        if let st = account.display?.desktop, st.switchable,
            payload?.desktop?.needs_repair != true {
             do { _ = try await Backend.run(["desktop-switch", st.label]) }
             catch { errs.append("desktop: \(error.localizedDescription)") }
@@ -466,6 +550,13 @@ final class Model: ObservableObject {
 
     func switchDesktop(_ label: String) async {
         guard switching == nil else { return }
+        // A confirm sheet outlives the refresh that marks its stash revoked, so the click
+        // that closes one can ask for a session known to be dead. The refusal sits here, on
+        // the freshest payload, where every switch route converges.
+        if payload?.desktop?.stashes.first(where: { $0.label == label })?.revoked == true {
+            actionError = "\(label) was signed out in the desktop app; sign in there and recapture first."
+            return
+        }
         switching = "desktop:" + label
         defer { switching = nil }
         actionError = nil
@@ -538,6 +629,15 @@ func parseISO(_ s: String) -> Date? {
 }
 
 // MARK: - Views
+
+// The advisory strip above the account cards: one dress for every warning line, so the
+// repair and drift notices render under the same rules.
+private func warningLine(_ text: String, sev: Double) -> some View {
+    Text(text)
+        .font(.system(size: 11)).foregroundStyle(sevColor(sev))
+        .fixedSize(horizontal: false, vertical: true)
+        .padding(.horizontal, 6).padding(.bottom, 2)
+}
 
 struct MenuView: View {
     @EnvironmentObject var model: Model
@@ -618,9 +718,10 @@ struct MenuView: View {
                 .frame(maxWidth: .infinity)
         }
         if model.desktop?.needs_repair == true {
-            Text("A desktop switch was interrupted. Run `desktop-switch.py repair` before switching again.")
-                .font(.system(size: 11)).foregroundStyle(sevColor(95))
-                .padding(.horizontal, 6).padding(.bottom, 2)
+            warningLine("A desktop switch was interrupted. Run `desktop-switch.py repair` before switching again.", sev: 95)
+        }
+        if let line = model.desktop?.driftLine {
+            warningLine(line, sev: 70)
         }
         if let aw = model.payload?.auto_switch {
             // one binding feeds both the rows and the emptiness test, so a future third
@@ -1161,6 +1262,39 @@ private func staleNotice() -> some View {
         .fixedSize(horizontal: false, vertical: true)
 }
 
+// The dead-capture state: a logout inside the desktop app ended this stash's session
+// server-side, so the card refuses the switch instead of warning on the way. The notice
+// lives on the card itself: a dead stash never opens a confirm sheet, which is where the
+// other notices ride.
+private func revokedBadge() -> some View {
+    Text("signed out in app")
+        .font(.system(size: 10))
+        .foregroundStyle(sevColor(95))
+        .lineLimit(1)
+        .layoutPriority(1)
+}
+
+private func revokedNotice() -> some View {
+    Text("A logout inside the desktop app ended this saved sign-in, so switching to it could only reach the login screen. Sign into the account in the app once, quit the app, then run `desktop-switch.py recapture`.")
+        .font(.system(size: 11))
+        .foregroundStyle(sevColor(95))
+        .fixedSize(horizontal: false, vertical: true)
+}
+
+// One ladder for both card types. Revoked is definitive — a logout inside the app ended the
+// parked session server-side — so it outranks the two likelihoods below it. Revoked and
+// mismatch both stay quiet on the active stash: its session lives in the app, not the parked
+// copy, and the next switch away recaptures the copy from it.
+@ViewBuilder private func stashBadge(revoked: Bool?, mismatch: Bool?, stale: Bool?, active: Bool?) -> some View {
+    if revoked == true {
+        if active != true { revokedBadge() }
+    } else if mismatch == true {
+        if active != true { mismatchBadge() }
+    } else if stale == true {
+        staleBadge()
+    }
+}
+
 struct AccountCard: View {
     @EnvironmentObject var model: Model
     let account: Account
@@ -1180,7 +1314,7 @@ struct AccountCard: View {
     }
     private var cliSwitchable: Bool { account.display?.can_switch == true }
     private var desktopSwitchable: Bool {
-        stash?.can_switch == true && model.desktop?.needs_repair != true
+        stash?.switchable == true && model.desktop?.needs_repair != true
     }
     private var signingIn: Bool { model.switching == Model.loginKey(account.uuid) }
     /// This card has something in flight — a switch or a sign-in — and owns the spinner slot.
@@ -1297,6 +1431,9 @@ struct AccountCard: View {
                     }
                 }
             }
+            if stash?.revoked == true, stash?.active != true {
+                revokedNotice()
+            }
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
@@ -1380,17 +1517,14 @@ struct AccountCard: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
-            if stash?.version_mismatch == true {
-                if stash?.active != true { mismatchBadge() }
-            } else if stash?.stale == true {
-                staleBadge()
-            }
+            stashBadge(revoked: stash?.revoked, mismatch: stash?.version_mismatch,
+                       stale: stash?.stale, active: stash?.active)
             Spacer(minLength: 4)
             // Where the desktop app is signed in when that isn't the lit card — after a
             // "CLI only" switch the two surfaces differ, and without this chip the desktop's
             // account would be shown nowhere.
             if stash?.active == true, account.active != true {
-                chip("desktop")
+                chip(model.desktop?.chipText ?? "desktop")
             }
             if let plan = account.display?.plan, !plan.isEmpty {
                 chip(plan)
@@ -1416,7 +1550,7 @@ struct StashCard: View {
         Group {
             if confirming {
                 confirmCard
-            } else if stash.can_switch == true {
+            } else if stash.switchable {
                 Button {
                     // A pre-update or long-parked stash confirms even with the app closed —
                     // same rationale as AccountCard: this sheet is the only warning surface left.
@@ -1478,23 +1612,25 @@ struct StashCard: View {
     }
 
     private var card: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 6) {
-            Text(hovered && stash.can_switch == true ? "⇄" : "")
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(Color.accentColor)
-                .opacity(isSwitching ? 0 : 1)
-                .frame(width: 13, alignment: .leading)
-                .overlay(alignment: .leading) {
-                    if isSwitching { ProgressView().controlSize(.mini) }
-                }
-            Text(stash.label).font(.system(size: 13, weight: .semibold))
-            if stash.version_mismatch == true {
-                if stash.active != true { mismatchBadge() }
-            } else if stash.stale == true {
-                staleBadge()
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text(hovered && stash.switchable ? "⇄" : "")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(Color.accentColor)
+                    .opacity(isSwitching ? 0 : 1)
+                    .frame(width: 13, alignment: .leading)
+                    .overlay(alignment: .leading) {
+                        if isSwitching { ProgressView().controlSize(.mini) }
+                    }
+                Text(stash.label).font(.system(size: 13, weight: .semibold))
+                stashBadge(revoked: stash.revoked, mismatch: stash.version_mismatch,
+                           stale: stash.stale, active: stash.active)
+                Spacer(minLength: 4)
+                chip(stash.active == true ? desktop.chipText : "captured")
             }
-            Spacer(minLength: 4)
-            chip(stash.active == true ? "desktop" : "captured")
+            if stash.revoked == true, stash.active != true {
+                revokedNotice()
+            }
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
