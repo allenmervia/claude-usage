@@ -303,12 +303,13 @@ The dropdown has two tabs:
 
 - **Usage** — the account cards: meter bars whose countdowns tick while the window
   is open, plan tags, and click-anywhere-to-switch on parked accounts (a ⇄ appears on
-  hover). The account you're on is the card that's lit, unless it's the only account in
-  its section, where there's nothing to distinguish it from. When the desktop app has
-  captured accounts it's the surface that decides which card that is, since that's
-  where the work happens; otherwise the CLI decides. One click moves both surfaces
+  hover). The account you're on is the card that's lit — the account the CLI is signed
+  into, the same one the title gauge draws — unless it's the only account in its
+  section, where there's nothing to distinguish it from. One click moves both surfaces
   together, and if moving the desktop app would close sessions running inside it, the
-  card asks first and offers to move the CLI alone.
+  card asks first and offers to move the CLI alone. After a CLI-only move the desktop
+  app stays behind on the old account; a small "desktop" chip on that card marks where
+  it is until a full switch brings the two surfaces back together.
 - **Insights** — the weekly burn (each account's current week as a band on one
   shared timeline, its recorded burn inside, one line marking now — hover for values,
   hover a name for its email and provider) and the model mix (see

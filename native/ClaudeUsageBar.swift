@@ -474,11 +474,6 @@ final class Model: ObservableObject {
 
     var desktop: Desktop? { payload?.desktop }
 
-    /// Whether the desktop app has any captured accounts here. When it does, it is the surface
-    /// that defines which account you are on — someone who set it up works in the app, and the
-    /// CLI follows. With nothing captured, the CLI is the only surface and answers by itself.
-    var desktopOnboarded: Bool { !(payload?.desktop?.stashes.isEmpty ?? true) }
-
     var claude: [Account] { payload?.accounts.filter { !$0.isCodex } ?? [] }
     var codex: [Account] { payload?.accounts.filter { $0.isCodex } ?? [] }
     var multiProvider: Bool { !claude.isEmpty && !codex.isEmpty }
@@ -1113,6 +1108,17 @@ struct SectionHeader: View {
 // the badge sits in a card header, the notice in a confirm sheet. The badge skips the row
 // whose account the desktop app is on: that stash can't be switched to, and the next switch
 // away recaptures it from the live session — there is nothing for the user to do or avoid.
+// The capsule status chip every card wears — the plan tag, the desktop-location marker, a
+// stash's captured state — one dress so they read as one vocabulary.
+private func chip(_ text: String) -> some View {
+    Text(text)
+        .font(.system(size: 10, weight: .semibold))
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 7)
+        .padding(.vertical, 1)
+        .background(Capsule().fill(Color.primary.opacity(0.07)))
+}
+
 private func mismatchBadge() -> some View {
     Text("app updated since capture")
         .font(.system(size: 10))
@@ -1135,18 +1141,14 @@ struct AccountCard: View {
     private var confirming: Bool { model.confirmTarget == account.uuid }
     private var stash: DisplayDesktop? { account.display?.desktop }
 
-    /// The account you are on, and the only card that lights up. Exactly one surface answers
-    /// this: the desktop app when it has been set up, the CLI otherwise. Two lit cards would ask
-    /// the reader to work out which one counts, and drift is not what this indicator is for.
+    /// The account you are on, and the only card that lights up: the one the CLI is signed
+    /// into — the same account the title gauge draws, so the panel and the gauge never name
+    /// different accounts. The desktop app's location is the chips' job, not this border's.
     private var isCurrent: Bool {
         // Alone in its section there is no question of which account you are on, so lighting the
         // only card states the obvious in the loudest available color.
         guard (account.isCodex ? model.codex : model.claude).count > 1 else { return false }
-        // Codex has no desktop surface, so its own active flag is the whole answer. Letting the
-        // desktop rule reach these rows would leave the Codex section with nothing lit as soon as
-        // any desktop account was captured.
-        if account.isCodex { return account.active == true }
-        return model.desktopOnboarded ? (stash?.active == true) : (account.active == true)
+        return account.active == true
     }
     private var cliSwitchable: Bool { account.display?.can_switch == true }
     private var desktopSwitchable: Bool {
@@ -1350,21 +1352,23 @@ struct AccountCard: View {
                 mismatchBadge()
             }
             Spacer(minLength: 4)
+            // Where the desktop app is signed in when that isn't the lit card — after a
+            // "CLI only" switch the two surfaces differ, and without this chip the desktop's
+            // account would be shown nowhere.
+            if stash?.active == true, account.active != true {
+                chip("desktop")
+            }
             if let plan = account.display?.plan, !plan.isEmpty {
-                Text(plan)
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 1)
-                    .background(Capsule().fill(Color.primary.opacity(0.07)))
+                chip(plan)
             }
         }
     }
 }
 
 // A stash the tool holds that pairs with no account above, usually because its label matches no
-// email. Same card grammar as an account: one control, lit when it is the one installed, ⇄ on
-// hover. A click can close live sessions, so with the app open it asks first.
+// email. Same card grammar as an account: one control, ⇄ on hover, a desktop chip when the
+// desktop app is signed in here — the lit border stays reserved for the account the CLI is on.
+// A click can close live sessions, so with the app open it asks first.
 struct StashCard: View {
     @EnvironmentObject var model: Model
     let stash: Stash
@@ -1456,22 +1460,13 @@ struct StashCard: View {
                     .foregroundStyle(sevColor(70))
             }
             Spacer(minLength: 4)
-            Text(stash.active == true ? "in use" : "captured")
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 7).padding(.vertical, 1)
-                .background(Capsule().fill(Color.primary.opacity(0.07)))
+            chip(stash.active == true ? "desktop" : "captured")
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
         .background(
             RoundedRectangle(cornerRadius: 8)
-                .fill(stash.active == true ? AnyShapeStyle(Color.accentColor.opacity(0.12))
-                                       : AnyShapeStyle(Color.primary.opacity(hovered ? 0.08 : 0.03)))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .strokeBorder(Color.accentColor.opacity(stash.active == true ? 0.55 : 0), lineWidth: 1)
+                .fill(Color.primary.opacity(hovered ? 0.08 : 0.03))
         )
         .onHover { hovered = $0 }
     }
@@ -1528,10 +1523,6 @@ struct FooterView: View {
             }
             if let err = model.lastError {
                 Text("⚠ \(err)").font(.system(size: 10.5)).foregroundStyle(sevColor(70)).lineLimit(2)
-            }
-            if let old = model.desktop?.stashes.first(where: { $0.stale == true && $0.active == true }) {
-                Text("⚠ the desktop app's saved sign-in for \(old.label) is old; if it stops working, re-add it")
-                    .font(.system(size: 10.5)).foregroundStyle(sevColor(70)).lineLimit(2)
             }
             if model.payload?.accounts.contains(where: { $0.stale == true }) == true {
                 Text("⚠ last known values — rate-limited; updates on the next refresh")
