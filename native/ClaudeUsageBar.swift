@@ -43,6 +43,9 @@ struct Account: Decodable, Identifiable {
     // so the card owes the user the sign-in rather than another error to wait out.
     var needs_login: Bool?
     var stale: Bool?
+    // Why this card is showing its previous numbers. The backend words it, for the same reason
+    // `error` is worded there: one phrasing, so the panel and the table can never disagree.
+    var stale_reason: String?
     var display: Display?
     var id: String { uuid }
     var isCodex: Bool { provider == "codex" }
@@ -1201,8 +1204,8 @@ struct FooterView: View {
             if let err = model.lastError {
                 warnRow("⚠ \(err)")
             }
-            if model.payload?.accounts.contains(where: { $0.stale == true }) == true {
-                warnRow("⚠ last known values — rate-limited; updates on the next refresh")
+            if let stale = model.payload?.accounts.filter({ $0.stale == true }), !stale.isEmpty {
+                warnRow("⚠ \(staleText(stale))")
             }
             HStack(spacing: 10) {
                 TimelineView(.periodic(from: .now, by: 10)) { ctx in
@@ -1257,6 +1260,15 @@ struct FooterView: View {
     // One dress for the footer's warning rows, so their styling can't drift apart.
     private func warnRow(_ text: String) -> some View {
         Text(text).font(.system(size: 10.5)).foregroundStyle(sevColor(70)).lineLimit(2)
+    }
+
+    /// What the stale banner says. The account is named because staleness is now per-account:
+    /// an unnamed warning next to three healthy cards reads as being about all of them.
+    private func staleText(_ stale: [Account]) -> String {
+        let who = stale.compactMap { $0.label ?? $0.email }.joined(separator: ", ")
+        let reasons = Array(Set(stale.compactMap { $0.stale_reason })).sorted()
+        let why = reasons.isEmpty ? "the last refresh failed" : reasons.joined(separator: "; ")
+        return "last known values for \(who) — \(why)"
     }
 
     private func updatedText(now: Date) -> String {

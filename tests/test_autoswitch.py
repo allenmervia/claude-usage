@@ -60,6 +60,14 @@ class TestAutoPick(unittest.TestCase):
         got = [r["label"] for r in cu.auto_pick(rows, creds_all)]
         self.assertEqual(got, ["ok"])
 
+    def test_excludes_stale_rows(self):
+        """A stale row carries last-known numbers with no error on it. Switching onto cached
+        headroom is how you land on an account that filled up while it was unreadable."""
+        rows = [row("stale", fh=10), row("ok", fh=10)]
+        rows[0]["stale"] = True
+        got = [r["label"] for r in cu.auto_pick(rows, creds_all)]
+        self.assertEqual(got, ["ok"])
+
     def test_excludes_rows_missing_window_numbers(self):
         r = row("nofh")
         r["five_hour"] = {"pct": None, "resets_at": None}

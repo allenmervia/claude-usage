@@ -16,10 +16,13 @@ Account registration is automatic: every run ingests whichever account is
 currently active in Claude Code. Rotate through your accounts once (the switching
 you already do) and all of them become visible from then on.
 
-Safety: the active account is always read live from Claude Code's own Keychain
-item and is never independently refreshed, so this tool cannot desync the session
-you're logged into. Only parked accounts get refreshed, and rotated refresh
-tokens are written straight back to the Keychain.
+Safety: the active account is read live from Claude Code's own Keychain item, and
+renewed only once its access token has already expired. Claude Code renews its own
+credential before it lapses, and a desktop-hosted session authenticates through the
+app instead of touching that item at all, so a token found past its expiry is one
+nothing else is maintaining — there is no refresh to race and no working session to
+desync. Rotated refresh tokens are written straight back to the Keychain, Claude
+Code's copy first.
 
 Codex: identity is read from ~/.codex/auth.json and usage from the newest Codex
 session rollout that records a rate limit — no API call. Each row shows how old
@@ -247,10 +250,15 @@ def load_secret(uuid):
 # wherever it isn't the one within reach.
 NEEDS_LOGIN = "signed out by the server"
 
-def token_for_parked(uuid, force=False):
+def token_for_parked(uuid, force=False, min_life_ms=60_000):
     """Valid access token for a parked account, refreshing + rotating if needed.
     force=True skips the cached access token (used to recover from a 401 on a token that
-    looked unexpired but was invalidated server-side)."""
+    looked unexpired but was invalidated server-side).
+
+    min_life_ms is how much life a cached token must have left to be handed back. A read
+    needs only enough to finish the call it is about to make; a caller that gives the token
+    away — `switch`, writing it into the live credential — has to ask for enough that the
+    account is still usable long after this process is gone."""
     sec = load_secret(uuid)
     if not sec: return None, "not captured — sign into it once and re-run"
     if sec.get("needsLogin"):
@@ -259,7 +267,7 @@ def token_for_parked(uuid, force=False):
         # since a retry with the same dead token can never come back different
         return None, NEEDS_LOGIN
     now_ms = time.time() * 1000
-    if not force and sec.get("accessToken") and (sec.get("expiresAt") or 0) > now_ms + 60_000:
+    if not force and sec.get("accessToken") and (sec.get("expiresAt") or 0) > now_ms + min_life_ms:
         return sec["accessToken"], None
     if not sec.get("refreshToken"):
         return None, "no refresh token — sign into it once and re-run"
@@ -295,6 +303,77 @@ def token_for_parked(uuid, force=False):
         # hand back a token that works once and leaves the account unrefreshable afterwards
         return access, "couldn't save the rotated token to the Keychain — unlock it and re-run"
     return access, None
+
+# How much life the live credential must have left for `switch` to hand it over. A read only has
+# to outlive its own call, but this token is written into Claude Code's item and then left there,
+# so it has to carry the account until something renews it — which, on a machine where the CLI
+# never runs, is the next expiry-triggered renewal below.
+SWITCH_MIN_LIFE_MS = 60 * 60 * 1000
+
+def refresh_live(uuid, live):
+    """Renew the live credential in place. Returns (access token, error).
+
+    Called only once the live access token has expired or been rejected. That is what makes
+    renewing it safe: Claude Code renews its own credential ahead of expiry, and a session
+    hosted by the desktop app never writes that item at all, so a lapsed token belongs to
+    nobody — there is no concurrent refresh to lose a race with, and no session still running
+    on it to break.
+
+    The rotated pair goes to Claude Code's item first, because that is the copy a session
+    reads. Our own record follows: for the active account the two name one grant, and a
+    rotation that landed in only one of them would leave the other holding a dead token.
+    """
+    ref = (live or {}).get("refreshToken")
+    if not ref:
+        return None, "the live credential has no refresh token — sign in again with the claude CLI"
+    sec = load_secret(uuid) or {}
+    try:
+        data, host = refresh_token(ref, sec.get("tokenHost"))
+    except GrantRevoked:
+        # same terminal state a parked account latches into: only a real sign-in can mint a
+        # replacement, so record it rather than spend a call every tick rediscovering it
+        cur = load_secret(uuid) or {}
+        if cur.get("refreshToken") and cur["refreshToken"] != ref:
+            # our copy names a different grant than the one that was just refused: latching it
+            # would write the dead token over a live one, and store_secret would read the changed
+            # token as a new grant and drop the latch in the same breath
+            return None, "the live credential is out of step with its stored copy — re-run `switch`"
+        if not store_secret(uuid, ref, None, None, sec.get("tokenHost"), meta={"needsLogin": True}):
+            # unlatched, so the next tick re-checks; the distinct string keeps the row from
+            # claiming the paused state every surface reads a bare NEEDS_LOGIN as
+            return None, (NEEDS_LOGIN + " — unlock the Keychain, then sign it back in "
+                          "with `claude-usage relogin`")
+        return None, NEEDS_LOGIN
+    except Exception as ex:
+        return None, f"couldn't renew the live credential ({ex}) — try again in a moment"
+    blob = dict(live)
+    blob["accessToken"]  = data["access_token"]
+    blob["refreshToken"] = data.get("refresh_token", ref)
+    blob["expiresAt"]    = int((time.time() + data.get("expires_in", 3600)) * 1000)
+    if not write_live(blob):
+        # the server may already have rotated the grant, which makes the token we are holding
+        # the only copy of it: handing it back would work for one call and strand the account
+        return None, "couldn't save the renewed live credential — unlock the Keychain and re-run"
+    if not store_secret(uuid, blob["refreshToken"], blob["accessToken"], blob["expiresAt"], host):
+        # the session is fine — its copy landed — but ours now names a grant the server has
+        # rotated away, and the next `switch` to this account would refresh with a dead token
+        # and strand it behind a sign-in
+        return blob["accessToken"], "couldn't save the renewed token to our own Keychain item — unlock it and re-run"
+    return blob["accessToken"], None
+
+def token_for_live(uuid, live):
+    """Usable access token for the active account, renewing the credential if it has lapsed.
+
+    A token still inside its lifetime is handed back untouched. A blob carrying no expiry at
+    all is taken at face value — we can't prove it dead, and a needless rotation costs more
+    than the 401 that would catch it (see fetch_usage).
+    """
+    token, exp = live.get("accessToken"), live.get("expiresAt")
+    if token and (exp is None or exp > time.time() * 1000):
+        return token, None
+    if not token and not live.get("refreshToken"):
+        return None, "live credential has no access token — run `claude` once"
+    return refresh_live(uuid, live)
 
 def is_team_entry(e):
     return bool(e.get("seat_tier")) or e.get("org_type") in ("claude_team", "claude_enterprise")
@@ -419,26 +498,59 @@ def apply_weekly_anchor(wk, entry):
         wk["resets_at"], wk["projected"] = projected, True
     return False
 
-def fetch_usage(uuid, token, active):
-    """Return (usage_json, error). On a 401 for a parked account, force a token refresh and retry once."""
+def retry_after_ts(headers):
+    """When the server's Retry-After says a rate limit clears, as an epoch — or None.
+
+    Seconds form only. The HTTP-date form is legal but not what this API sends, and a
+    deadline guessed from a shape we have never seen would be worse than no deadline.
+    """
     try:
-        return api_get(USAGE_URL, token), None
+        secs = int((headers or {}).get("Retry-After", ""))
+    except (TypeError, ValueError):
+        return None
+    return time.time() + secs if secs > 0 else None
+
+def rate_limited_msg(until):
+    """What a 429 says: the limit, and the server's own deadline for it. The deadline is the
+    only part of it the user can act on."""
+    # comma, not a dash: the table's stale banner quotes this sentence after a dash of its own,
+    # and two in one line read as two separate thoughts
+    if not until:
+        return "rate-limited by the usage API, try again shortly"
+    return f"rate-limited by the usage API, clears at {clock_short(datetime.fromtimestamp(until, timezone.utc))}"
+
+def fetch_usage(uuid, token, active, live=None):
+    """Return (usage_json, error, retry_until).
+
+    A 401 buys one renewal and one retry: a parked account from its stored refresh token, the
+    active one in place. retry_until carries a 429's deadline back to the caller so the next
+    sweep can wait it out instead of spending a call that cannot succeed.
+    """
+    try:
+        return api_get(USAGE_URL, token), None, None
     except urllib.error.HTTPError as ex:
-        if ex.code == 401 and not active:
-            token2, err2 = token_for_parked(uuid, force=True)   # cached token was invalidated early
-            if err2: return None, err2
+        if ex.code == 401:
+            # the token looked usable and was not: invalidated server-side, or spent so close to
+            # its expiry that it lapsed in flight
+            token2, err2 = (refresh_live(uuid, live or {}) if active
+                            else token_for_parked(uuid, force=True))
+            if err2: return None, err2, None
             try:
-                return api_get(USAGE_URL, token2), None
+                return api_get(USAGE_URL, token2), None, None
             except urllib.error.HTTPError as ex2:
-                return None, ("session expired — sign into it again"
-                              if ex2.code == 401 else f"usage HTTP {ex2.code}")
+                if ex2.code == 401:
+                    return None, "session expired — sign into it again", None
+                until2 = retry_after_ts(ex2.headers) if ex2.code == 429 else None
+                return None, (rate_limited_msg(until2) if ex2.code == 429
+                              else f"usage HTTP {ex2.code}"), until2
             except Exception as ex2:
-                return None, type(ex2).__name__
+                return None, type(ex2).__name__, None
         if ex.code == 429:
-            return None, "rate-limited — refreshing too fast, wait a moment"
-        return None, f"usage HTTP {ex.code}"
+            until = retry_after_ts(ex.headers)
+            return None, rate_limited_msg(until), until
+        return None, f"usage HTTP {ex.code}", None
     except Exception as ex:
-        return None, type(ex).__name__
+        return None, type(ex).__name__, None
 
 def load_cache():
     try:
@@ -544,8 +656,36 @@ def weekly_series(hist, uuid):
             pts.append((s["ts"], e["wk"]))
     return pts
 
+def merge_last_known(claude, cache):
+    """Each account's best current answer: this sweep's reading where it succeeded, its own
+    last-known numbers where it didn't.
+
+    Per account, because a failed read is a fact about the account it failed on and about no
+    other: one account's rate limit says nothing about the three beside it that answered, and
+    trading its gauges for an error row on their account would be the panel agreeing with it.
+
+    A latched needs-login row is exempt: it is a definitive answer about the account, and the
+    numbers that would stand in for it date from before the grant was revoked.
+    """
+    prev = {r.get("uuid"): r for r in (cache or {}).get("rows") or []
+            if r.get("provider", "claude") == "claude"}
+    out = []
+    for r in claude:
+        old = prev.get(r.get("uuid"))
+        if not r.get("error") or r.get("needs_login") or not old or old.get("error"):
+            out.append(r)
+            continue
+        keep = dict(old)
+        keep["stale"], keep["stale_reason"] = True, r["error"]
+        # the numbers are the old sweep's, but which account is live and how long this one has
+        # to wait are facts about this one
+        keep["active"], keep["retry_after"] = r.get("active"), r.get("retry_after")
+        out.append(keep)
+    return out
+
 def collect(ingest=True, act=None):
-    """Cached wrapper: debounce rapid refreshes, and fall back to last-known values on a rate-limit.
+    """Cached wrapper: debounce rapid refreshes, and hold each account's last-known values
+    through a read that fails on it.
 
     ingest=False reports on the accounts already known without registering the live one — for
     diagnostics, which should describe the current state rather than change it. act says whether
@@ -561,29 +701,41 @@ def collect(ingest=True, act=None):
     cache = load_cache()
     if cache and 0 <= now - cache.get("ts", 0) < COOLDOWN:
         return cache["rows"]                                  # rapid re-refresh → reuse, don't hit the API
-    rows = _collect_live(ingest)
-    # Freshness is judged on Claude alone: only Claude hits the network, and a retained Codex snapshot
-    # (never an error) must not mask a Claude 429 storm and clobber the last-known Claude values.
+    rows = _collect_live(ingest, cache=cache)
+    # Freshness is judged on Claude alone: only Claude hits the network, and a retained Codex
+    # snapshot (never an error) must not make a sweep that read nothing look like it read something.
     claude = [r for r in rows if r.get("provider", "claude") == "claude"]
     codex  = [r for r in rows if r.get("provider") == "codex"]
-    # A latched needs-login row is a definitive answer, not a failed read: when the only
-    # "errors" are latches, the fallback below would hide the sign-in state behind cached
-    # pre-revocation numbers forever, since the cache only refreshes on a fresh save.
+    out = merge_last_known(claude, cache) + codex
     fresh_ok    = any(not r.get("error") for r in claude)
     all_latched = all(r.get("needs_login") for r in claude if r.get("error"))
-    if not claude or fresh_ok or all_latched:                 # got fresh Claude data (or none to fetch)
-        save_cache(rows, now)
-        append_history(rows, now)
+    fetched     = not claude or fresh_ok or all_latched       # read something (or had nothing to read)
+    # The rows are always kept, so the next sweep can still hand back last-known numbers and the
+    # deadlines it has to wait out. The timestamp is not: it dates the last real reading, and a
+    # sweep that read nothing must not advance it into a claim of freshness it didn't earn.
+    # `is None`, not `or`: a cache stamped at epoch 0 is a timestamp, and the oldest one there is.
+    prev_ts = (cache or {}).get("ts")
+    save_cache(out, now if fetched else (now - COOLDOWN if prev_ts is None else prev_ts))
+    if fetched:
+        append_history(out, now)                              # skips stale and errored rows itself
         if act:
-            rows = maybe_auto_switch(rows)
-        return rows
-    if cache and cache.get("rows"):                           # every Claude read errored → last known Claude
-        stale = [r for r in cache["rows"] if r.get("provider", "claude") == "claude"]
-        for r in stale: r["stale"] = True
-        return stale + codex                                  # keep this run's fresh Codex rows
-    return rows
+            out = maybe_auto_switch(out)
+    return out
 
-def _collect_live(ingest=True):
+def rate_limit_holds(cache):
+    """uuid → when the usage API said its rate limit clears, from the last sweep's rows.
+
+    A 429 answers with its own deadline, and a call made before that passes cannot succeed.
+    Sitting the window out costs a stale reading; spending the calls anyway costs the same
+    reading and, against a limiter that re-arms on each attempt, a wait that never ends.
+    """
+    now = time.time()
+    return {r["uuid"]: r["retry_after"] for r in (cache or {}).get("rows") or []
+            if r.get("uuid") and isinstance(r.get("retry_after"), (int, float))
+            and r["retry_after"] > now}
+
+def _collect_live(ingest=True, cache=None):
+    holds = rate_limit_holds(cache)
     idx = load_index()
     active_uuid = ingest_live(idx) if ingest else active_uuid_only()
     if active_uuid is None:
@@ -597,20 +749,23 @@ def _collect_live(ingest=True):
     for e in idx:
         uuid = e["uuid"]
         if uuid == active_uuid and live:
-            # .get: a live blob can carry only a refreshToken (mid-write file, partial
-            # blob) and still be identified via match_live_uuid — that must degrade to an
-            # error row, not a KeyError that kills the whole render
-            token = live.get("accessToken")
-            err = None if token else "live credential has no access token — run `claude` once"
+            # token_for_live takes every shape a live blob arrives in, down to the partial one
+            # (refresh token only, from a mid-write file) that match_live_uuid still identifies
+            token, err = token_for_live(uuid, live)
         else:
             token, err = token_for_parked(uuid)
         row = {"provider": "claude", "uuid": uuid, "email": e["email"], "label": e["label"],
                "tier": e.get("tier"), "org_type": e.get("org_type"), "is_team": is_team_entry(e),
                "active": uuid == active_uuid, "error": err}
-        if token and not err:
-            u, uerr = fetch_usage(uuid, token, row["active"])
+        hold = holds.get(uuid)
+        if token and not err and hold:
+            row["error"], row["retry_after"] = rate_limited_msg(hold), hold
+        elif token and not err:
+            u, uerr, until = fetch_usage(uuid, token, row["active"], live)
             if uerr:
                 row["error"] = uerr
+            if until:
+                row["retry_after"] = until
             if u is not None:
                 # every window is `or {}`-guarded: these are undocumented endpoints, and a null or
                 # absent window must degrade to an error row rather than crash the whole render
@@ -1106,11 +1261,15 @@ def rel(dt):
     if h: return f"{h}h {m}m"
     return f"{m}m"
 
-def local_short(dt):
-    """Compact local time: 'Tue 5pm', 'Mon 6:59am' (drops :00 on the hour, lowercase am/pm)."""
+def clock_short(dt):
+    """Compact local clock time: '5pm', '6:59am' (drops :00 on the hour, lowercase am/pm)."""
     d = dt.astimezone()
     mins = f":{d.strftime('%M')}" if d.minute else ""
-    return f"{d.strftime('%a')} {d.strftime('%-I')}{mins}{d.strftime('%p').lower()}"
+    return f"{d.strftime('%-I')}{mins}{d.strftime('%p').lower()}"
+
+def local_short(dt):
+    """Compact local time: 'Tue 5pm', 'Mon 6:59am'."""
+    return f"{dt.astimezone().strftime('%a')} {clock_short(dt)}"
 
 def resets_phrase(resets_at, style="week"):
     """Reset text. style='short' (5-hour): countdown only. style='week': 'Tue 5pm · 2d 11h left'.
@@ -1271,8 +1430,13 @@ def render_table(rows):
             for r in grp: _table_codex_row(r, w)
         else:
             for r in grp: _table_claude_row(r, w)
-    if any(r.get("stale") for r in rows if is_claude(r)):
-        print(f"{C['y']}⚠ Showing last known values — the usage API rate-limited this refresh.{C['x']}\n")
+    stale = [r for r in rows if is_claude(r) and r.get("stale")]
+    if stale:
+        # the reason belongs with the rows it explains, and one shared reason is the common case
+        # (a sweep that failed the same way for everything it touched)
+        reasons = sorted({r.get("stale_reason") or "the last refresh failed" for r in stale})
+        who = ", ".join(r["email"] for r in stale)
+        print(f"{C['y']}⚠ Showing last known values for {who} — {'; '.join(reasons)}.{C['x']}\n")
     latched = [r for r in rows if is_claude(r) and r.get("needs_login")]
     if latched:
         # the row states the condition; here is the only place in this surface that can carry
@@ -1768,7 +1932,9 @@ def _switch_claude(e):
     if gap:
         return False, f"{e['email']} {gap}", ""
 
-    token, err = token_for_parked(e["uuid"])          # refreshes if the cached token is stale
+    # a full-life token, not merely an unexpired one: this is written into Claude Code's item and
+    # left there, and a token with minutes left would strand the account as soon as they ran out
+    token, err = token_for_parked(e["uuid"], min_life_ms=SWITCH_MIN_LIFE_MS)
     if err:
         return False, f"can't switch to {e['email']}: {err}", ""
     sec = load_secret(e["uuid"]) or sec               # re-read: the refresh may have rotated it;
@@ -2074,7 +2240,10 @@ def auto_pick(rows, has_full_creds, scoped=False):
     roomy, thin = [], []
     for r in rows:
         if not is_claude(r): continue
-        if r.get("active") or r.get("error") or r.get("is_team"): continue
+        # stale as well as errored: a row holding last-known numbers is not-known-bad, and the
+        # bar here is verifiably usable — switching onto cached headroom is how you land on an
+        # account that filled up while it was unreadable
+        if r.get("active") or r.get("error") or r.get("stale") or r.get("is_team"): continue
         fh, wk = _win_pct(r, "five_hour"), _win_pct(r, "seven_day")
         if fh is None or wk is None: continue
         if any(pct is not None and pct >= cap for _n, pct, _ra, cap in _limit_windows(r, scoped)):
@@ -2102,7 +2271,7 @@ def earliest_relief(rows, scoped=False):
     """The soonest moment any personal account frees up, or None."""
     times = []
     for r in rows:
-        if not is_claude(r) or r.get("error") or r.get("is_team"): continue
+        if not is_claude(r) or r.get("error") or r.get("stale") or r.get("is_team"): continue
         t = _usable_at(r, scoped)
         if t is not None: times.append(t)
     return min(times) if times else None

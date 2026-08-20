@@ -154,7 +154,7 @@ class TestRowFlag(Patched):
         self._patch("match_live_uuid", lambda: None)
         self._patch("read_live", lambda: None)
         self._patch("collect_codex", lambda persist=True: [])
-        self._patch("token_for_parked", lambda uuid, force=False:
+        self._patch("token_for_parked", lambda uuid, **kw:
                     (None, cu.NEEDS_LOGIN if uuid == "latched"
                      else "refresh failed (HTTP 500 at h) — sign into it once and re-run"))
 
@@ -175,24 +175,34 @@ class TestCollectFreshness(Patched):
         self._patch("append_history", lambda rows, ts: None)
         self._patch("maybe_auto_switch", lambda rows: rows)
         self.saved = []
-        self._patch("save_cache", lambda rows, ts: self.saved.append(rows))
+        self._patch("save_cache", lambda rows, ts: self.saved.append((rows, ts)))
         self._patch("load_cache", lambda: {"ts": 0, "rows": [
-            {"provider": "claude", "uuid": "u1", "error": None}]})
+            {"provider": "claude", "uuid": "u1", "error": None, "five_hour": {"pct": 7.0}}]})
 
     def test_all_latched_rows_render_fresh_not_stale(self):
         latched = [{"provider": "claude", "uuid": "u1",
                     "error": cu.NEEDS_LOGIN, "needs_login": True}]
-        self._patch("_collect_live", lambda ingest=True: list(latched))
+        self._patch("_collect_live", lambda ingest=True, cache=None: list(latched))
         rows = cu.collect()
         self.assertEqual(rows, latched)
         self.assertTrue(self.saved)
 
     def test_all_transient_errors_still_fall_back_to_cache(self):
         erry = [{"provider": "claude", "uuid": "u1", "error": "refresh failed (x)"}]
-        self._patch("_collect_live", lambda ingest=True: erry)
+        self._patch("_collect_live", lambda ingest=True, cache=None: erry)
         rows = cu.collect()
         self.assertTrue(rows and all(r.get("stale") for r in rows))
-        self.assertFalse(self.saved)
+        self.assertEqual(rows[0]["stale_reason"], "refresh failed (x)")
+
+    def test_a_sweep_that_read_nothing_keeps_the_rows_but_not_the_timestamp(self):
+        """The values have to survive for the next sweep to hand back; the timestamp must not,
+        or `Updated just now` would date a reading that never happened."""
+        self._patch("_collect_live", lambda ingest=True, cache=None:
+                    [{"provider": "claude", "uuid": "u1", "error": "refresh failed (x)"}])
+        cu.collect()
+        (saved, ts), = self.saved
+        self.assertEqual(ts, 0)                               # the cached sweep's own timestamp
+        self.assertEqual(saved[0]["five_hour"], {"pct": 7.0})
 
 
 if __name__ == "__main__":
